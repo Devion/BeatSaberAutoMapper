@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "BeatSaber.AutoMapper.Cli": {
+      "commandName": "Project",
+      "commandLineArgs": "train --dataset D:\\bsamLib --artifacts D:\\bsamartifacts --epochs 500 --validation-songs 80 --early-stop 50"
+    }
+  }
+}

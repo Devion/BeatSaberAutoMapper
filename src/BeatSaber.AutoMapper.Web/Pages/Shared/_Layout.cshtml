@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>@ViewData["Title"] – BeatSaber AutoMapper</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Rajdhani:wght@400;500;600;700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="~/css/site.css" />
+</head>
+<body>
+    <header class="site-header">
+        <div class="header-inner">
+            <a href="/" class="logo">
+                <span class="logo-saber logo-red">▶</span><span class="logo-saber logo-blue">◀</span>
+                <span class="logo-text">BeatSaber <strong>AutoMapper</strong></span>
+            </a>
+            <span class="header-tag">AI Map Generator</span>
+        </div>
+    </header>
+
+    <main class="site-main">
+        @RenderBody()
+    </main>
+
+    <footer class="site-footer">
+        <p>AI-driven Beat Saber map generation &nbsp;·&nbsp; <a href="https://github.com/AllPoland/ArcViewer" target="_blank" rel="noopener">ArcViewer</a> for preview</p>
+    </footer>
+
+    @await RenderSectionAsync("Scripts", required: false)
+</body>
+</html>

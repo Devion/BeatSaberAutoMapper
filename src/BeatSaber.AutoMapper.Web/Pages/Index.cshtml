@@ -1,0 +1,91 @@
+@page
+@model IndexModel
+@{
+    ViewData["Title"] = "Generate Map";
+}
+
+<div class="page-wrap">
+    <h1 class="page-title">Generate a Beat Saber Map</h1>
+    <p class="page-subtitle">Upload an audio track and the AI will craft a playable map.</p>
+
+    @if (Model.Error is not null)
+    {
+        <div class="alert alert-error">⚠️ @Model.Error</div>
+    }
+
+    <form method="post" enctype="multipart/form-data" class="gen-form" id="genForm">
+        <div asp-validation-summary="All" class="alert alert-error"></div>
+
+        <div class="form-section">
+            <h2>Song Info</h2>
+            <div class="form-row two-col">
+                <div class="form-group">
+                    <label asp-for="Title">Song Title</label>
+                    <input asp-for="Title" type="text" placeholder="My Favourite Song" />
+                </div>
+                <div class="form-group">
+                    <label asp-for="Artist">Artist</label>
+                    <input asp-for="Artist" type="text" placeholder="Artist Name" />
+                </div>
+            </div>
+        </div>
+
+        <div class="form-section">
+            <h2>Audio File</h2>
+            <div class="form-group">
+                <label asp-for="AudioFile">Audio file <span class="hint">(MP3, OGG, EGG, WAV – max 200 MB)</span></label>
+                <input asp-for="AudioFile" type="file" accept=".mp3,.ogg,.egg,.wav" required class="file-input" id="audioFileInput" />
+                <div class="file-preview" id="filePreview"></div>
+            </div>
+        </div>
+
+        <div class="form-section">
+            <h2>Difficulties</h2>
+            <p class="hint">Select one or more difficulties to generate.</p>
+            <div class="difficulty-grid">
+                @foreach (var d in new[] { "Easy", "Normal", "Hard", "Expert", "ExpertPlus" })
+                {
+                    var isChecked = Model.Difficulties.Contains(d);
+                    <label class="diff-chip diff-@d.ToLower()">
+                        <input type="checkbox" name="Difficulties" value="@d" @(isChecked ? "checked" : "") />
+                        @(d == "ExpertPlus" ? "Expert+" : d)
+                    </label>
+                }
+            </div>
+        </div>
+
+        <div class="form-section">
+            <h2>Model (optional)</h2>
+            <div class="form-group">
+                <label asp-for="ArtifactsPath">Trained artifacts folder <span class="hint">(leave blank to use heuristics)</span></label>
+                <input asp-for="ArtifactsPath" type="text" placeholder="e.g. D:\bsamartifacts" />
+            </div>
+        </div>
+
+        <button type="submit" class="btn btn-primary" id="submitBtn">
+            <span class="btn-icon">🎮</span> Generate Map
+        </button>
+    </form>
+</div>
+
+@section Scripts {
+<script>
+    const input = document.getElementById('audioFileInput');
+    const preview = document.getElementById('filePreview');
+    const form = document.getElementById('genForm');
+    const btn = document.getElementById('submitBtn');
+
+    input.addEventListener('change', () => {
+        const file = input.files[0];
+        if (file) {
+            const mb = (file.size / 1024 / 1024).toFixed(1);
+            preview.textContent = `📁 ${file.name}  (${mb} MB)`;
+        }
+    });
+
+    form.addEventListener('submit', () => {
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner"></span> Generating…';
+    });
+</script>
+}

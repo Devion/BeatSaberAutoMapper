@@ -1,0 +1,10 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/BeatSaber.AutoMapper.Cli/BeatSaber.AutoMapper.Cli.csproj" />
+    <Project Path="src/BeatSaber.AutoMapper/BeatSaber.AutoMapper.csproj" />
+    <Project Path="src/BeatSaber.AutoMapper.Web/BeatSaber.AutoMapper.Web.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/BeatSaber.AutoMapper.Tests/BeatSaber.AutoMapper.Tests.csproj" />
+  </Folder>
+</Solution>
