@@ -192,6 +192,12 @@ public sealed class SelfSupervisedExampleGenerator
         double songFraction  = songDurationBeats > 0
             ? Math.Clamp(beat / songDurationBeats, 0.0, 1.0) : 0.0;
 
+        // Lookahead audio (1 beat ahead)
+        double lookaheadTime   = Math.Min(timeSeconds + MathHelpers.BeatToSeconds(1.0, bpm),
+                                          audio.DurationSeconds);
+        double lookaheadEnergy = audio.GetEnergy(lookaheadTime);
+        double lookaheadOnset  = GetOnsetStrength(lookaheadTime, audio);
+
         return new TrainingExample(
             Beat:                   beat,
             SubdivisionDenominator: subdiv,
@@ -219,6 +225,8 @@ public sealed class SelfSupervisedExampleGenerator
             HighBandDelta:          highBandDelta,
             TimeSinceAnyNote:       0.5,   // prior-note context unavailable in self-supervised pass
             SongFraction:           songFraction,
+            LookaheadEnergy:        lookaheadEnergy,
+            LookaheadOnset:         lookaheadOnset,
             HasNote:                hasNote,
             NoteHand:               noteHand,
             NoteLane:               noteLane,

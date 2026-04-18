@@ -1,4 +1,5 @@
 using BeatSaber.AutoMapper.Audio.Features;
+using BeatSaber.AutoMapper.Canonical.Derived;
 
 namespace BeatSaber.AutoMapper.Generation;
 
@@ -16,14 +17,21 @@ public sealed class CandidateEventProposer
     {
         Guard.NotNull(ctx, nameof(ctx));
 
-        // Pre-compute the most-recent note per hand from already-placed notes.
-        // This sequential state is passed to the neural context so the network
-        // can learn phrasing patterns (e.g., left follows right, direction flow).
+        // Pre-compute the most-recent and second-most-recent note per hand from already-placed notes.
+        // Both are passed to the neural context so the network can learn phrasing patterns
+        // (e.g., left follows right, direction flow, 2-note alternating patterns).
         CanonicalNote? lastLeft = null, lastRight = null;
+        CanonicalNote? prev2Left = null, prev2Right = null;
         foreach (var n in ctx.PlacedNotes)
         {
-            if (n.Hand == NoteHand.Left  && (lastLeft  == null || n.Beat > lastLeft.Beat))  lastLeft  = n;
-            if (n.Hand == NoteHand.Right && (lastRight == null || n.Beat > lastRight.Beat)) lastRight = n;
+            if (n.Hand == NoteHand.Left)
+            {
+                if (lastLeft == null || n.Beat > lastLeft.Beat) { prev2Left  = lastLeft;  lastLeft  = n; }
+            }
+            else
+            {
+                if (lastRight == null || n.Beat > lastRight.Beat) { prev2Right = lastRight; lastRight = n; }
+            }
         }
 
         var proposed  = new List<ProposedEvent>();
@@ -45,7 +53,7 @@ public sealed class CandidateEventProposer
 
         foreach (var candidate in ctx.CandidateGrid)
         {
-            double score = ScoreCandidate(candidate, ctx, lastLeft, lastRight,
+            double score = ScoreCandidate(candidate, ctx, lastLeft, lastRight, prev2Left, prev2Right,
                                           out var neuralPred);
             if (score < threshold) continue;
 
@@ -60,6 +68,7 @@ public sealed class CandidateEventProposer
 
     private double ScoreCandidate(TimingCandidate candidate, GenerationContext ctx,
                                   CanonicalNote? lastLeft, CanonicalNote? lastRight,
+                                  CanonicalNote? prev2Left, CanonicalNote? prev2Right,
                                   out NeuralMapPrediction? neuralPred)
     {
         double localNps  = EstimateLocalNps(candidate.Beat, ctx);
@@ -85,6 +94,17 @@ public sealed class CandidateEventProposer
             double timeSinceAny  = Math.Clamp(Math.Min(
                 lastLeft  != null ? candidate.Beat - lastLeft.Beat  : 999.0,
                 lastRight != null ? candidate.Beat - lastRight.Beat : 999.0) / 8.0, 0.0, 1.0);
+
+            // Parity state: read the current parity from the swing contexts
+            double leftParity  = ParityStateFromSwingContext(ctx.LeftHandContext);
+            double rightParity = ParityStateFromSwingContext(ctx.RightHandContext);
+
+            // Lookahead audio (1 beat ahead) for readability context
+            double lookaheadBeat  = Math.Min(candidate.Beat + 1.0, totalBeats);
+            double lookaheadSec   = MathHelpers.BeatToSeconds(lookaheadBeat, ctx.Song.BeatsPerMinute);
+            double lookaheadEnergy = ctx.AudioAnalysis.GetEnergy(lookaheadSec);
+            double lookaheadOnset  = ctx.AudioAnalysis.OnsetTimesSeconds
+                .Any(o => Math.Abs(o - lookaheadSec) < 0.05) ? 1.0 : 0.0;
 
             var nctx = new NeuralPlacementContext
             {
@@ -113,6 +133,12 @@ public sealed class CandidateEventProposer
                 HighBandDelta    = highBandDelta,
                 TimeSinceAnyNote = timeSinceAny,
                 SongFraction     = songFraction,
+                LeftParityState  = leftParity,
+                RightParityState = rightParity,
+                Prev2LeftCutDir  = prev2Left  != null ? (int)prev2Left.CutDirection  : -1,
+                Prev2RightCutDir = prev2Right != null ? (int)prev2Right.CutDirection : -1,
+                LookaheadEnergy  = lookaheadEnergy,
+                LookaheadOnset   = lookaheadOnset,
             };
 
             double score;
@@ -178,6 +204,14 @@ public sealed class CandidateEventProposer
         if (phase > 0.01) strength *= 0.5;
         return strength;
     }
+
+    /// <summary>
+    /// Converts the current parity from a swing context to the scalar used as a model feature.
+    /// Forehand position (forehand expected next) → 0.0; Backhand position → 1.0; unknown → 0.5.
+    /// </summary>
+    private static double ParityStateFromSwingContext(SwingContext swingCtx) =>
+        swingCtx.LastCutDirection is null ? 0.5
+        : swingCtx.CurrentParity == ParityClass.Backhand ? 1.0 : 0.0;
 
     private static double EstimateLocalNps(double beat, GenerationContext ctx)
     {

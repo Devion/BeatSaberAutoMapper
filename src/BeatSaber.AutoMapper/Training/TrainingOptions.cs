@@ -10,6 +10,12 @@ public sealed record TrainingOptions(
     double TestFraction,
     long RandomSeed,
     int ValidationSongsPerEpoch,
+    /// <summary>
+    /// How many songs to pre-analyse and cache. Must be ≥ ValidationSongsPerEpoch.
+    /// Each training run randomly picks ValidationSongsPerEpoch from this pool.
+    /// Grow the pool once (e.g. --validation-cache-size 200) then reuse across restarts.
+    /// </summary>
+    int ValidationCachePoolSize,
     double InitialLearningRate,
     int EarlyStopPatience,
     // Self-supervised feedback options
@@ -31,6 +37,7 @@ public sealed record TrainingOptions(
         TestFraction: 0.1,
         RandomSeed: 42,
         ValidationSongsPerEpoch: 3,
+        ValidationCachePoolSize: 3,
         InitialLearningRate: 0.001,
         EarlyStopPatience: 20,
         SelfSupervisedWarmupEpochs: 5,

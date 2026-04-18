@@ -357,6 +357,14 @@ public sealed class TorchPlacementTrainer : IPlacementScorer, IDisposable
         arr[offset + 24] = (float)Math.Clamp(ex.HighBandDelta,    -1.0, 1.0);
         arr[offset + 25] = (float)Math.Clamp(ex.TimeSinceAnyNote,  0.0, 1.0);
         arr[offset + 26] = (float)Math.Clamp(ex.SongFraction,      0.0, 1.0);
+        arr[offset + 27] = (float)Math.Clamp(ex.LeftParityState,   0.0, 1.0);
+        arr[offset + 28] = (float)Math.Clamp(ex.RightParityState,  0.0, 1.0);
+        arr[offset + 29] = ex.Prev2LeftCutDir  >= 0 ? 1f : 0f;
+        arr[offset + 30] = ex.Prev2LeftCutDir  >= 0 ? (float)(ex.Prev2LeftCutDir  / 8.0) : 0f;
+        arr[offset + 31] = ex.Prev2RightCutDir >= 0 ? 1f : 0f;
+        arr[offset + 32] = ex.Prev2RightCutDir >= 0 ? (float)(ex.Prev2RightCutDir / 8.0) : 0f;
+        arr[offset + 33] = (float)Math.Clamp(ex.LookaheadEnergy, 0.0, 1.0);
+        arr[offset + 34] = (float)Math.Clamp(ex.LookaheadOnset,  0.0, 1.0);
     }
 
     public void Dispose()

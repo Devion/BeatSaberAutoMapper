@@ -41,6 +41,22 @@ public readonly struct NeuralPlacementContext
     public double TimeSinceAnyNote { get; init; }  // min(L,R) beats-since-last / 8 [0,1]
     public double SongFraction     { get; init; }  // beat / totalBeats [0,1]
 
+    // ── parity / flow features ──
+    // Arm state after last swing: 0=forehand next, 1=backhand next, 0.5=unknown
+    public double LeftParityState  { get; init; } = 0.5;
+    public double RightParityState { get; init; } = 0.5;
+
+    // ── second-previous cut direction per hand (pattern context) ──
+    // -1 = no second-previous note
+    public int Prev2LeftCutDir  { get; init; } = -1;
+    public int Prev2RightCutDir { get; init; } = -1;
+
+    // ── lookahead audio (1 beat ahead) ──
+    public double LookaheadEnergy { get; init; }  // energy 1 beat ahead [0,1]
+    public double LookaheadOnset  { get; init; }  // onset strength 1 beat ahead [0,1]
+
+    public NeuralPlacementContext() { }
+
     /// <summary>
     /// Fills <paramref name="f"/> with 27 normalised feature values.
     /// The caller must supply an array of length ≥ 27.
@@ -75,6 +91,14 @@ public readonly struct NeuralPlacementContext
         f[24] = (float)Math.Clamp(HighBandDelta,     -1.0, 1.0);
         f[25] = (float)Math.Clamp(TimeSinceAnyNote,   0.0, 1.0);
         f[26] = (float)Math.Clamp(SongFraction,        0.0, 1.0);
+        f[27] = (float)Math.Clamp(LeftParityState,     0.0, 1.0);
+        f[28] = (float)Math.Clamp(RightParityState,    0.0, 1.0);
+        f[29] = Prev2LeftCutDir  >= 0 ? 1f : 0f;
+        f[30] = Prev2LeftCutDir  >= 0 ? (float)(Prev2LeftCutDir  / 8.0) : 0f;
+        f[31] = Prev2RightCutDir >= 0 ? 1f : 0f;
+        f[32] = Prev2RightCutDir >= 0 ? (float)(Prev2RightCutDir / 8.0) : 0f;
+        f[33] = (float)Math.Clamp(LookaheadEnergy, 0.0, 1.0);
+        f[34] = (float)Math.Clamp(LookaheadOnset,  0.0, 1.0);
     }
 
     internal void FillFeatures(double[] f)
@@ -106,5 +130,13 @@ public readonly struct NeuralPlacementContext
         f[24] = Math.Clamp(HighBandDelta,     -1.0, 1.0);
         f[25] = Math.Clamp(TimeSinceAnyNote,   0.0, 1.0);
         f[26] = Math.Clamp(SongFraction,        0.0, 1.0);
+        f[27] = Math.Clamp(LeftParityState,     0.0, 1.0);
+        f[28] = Math.Clamp(RightParityState,    0.0, 1.0);
+        f[29] = Prev2LeftCutDir  >= 0 ? 1.0 : 0.0;
+        f[30] = Prev2LeftCutDir  >= 0 ? Prev2LeftCutDir  / 8.0 : 0.0;
+        f[31] = Prev2RightCutDir >= 0 ? 1.0 : 0.0;
+        f[32] = Prev2RightCutDir >= 0 ? Prev2RightCutDir / 8.0 : 0.0;
+        f[33] = Math.Clamp(LookaheadEnergy, 0.0, 1.0);
+        f[34] = Math.Clamp(LookaheadOnset,  0.0, 1.0);
     }
 }

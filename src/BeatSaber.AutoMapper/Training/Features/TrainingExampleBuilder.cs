@@ -15,7 +15,7 @@ public sealed record TrainingExample(
     int    MeasureBeat,
     // Difficulty context (0=Easy … 4=ExpertPlus)
     int    DifficultyLevel,
-    // Previous note context
+    // Previous note context (most recent per hand)
     int PreviousLeftLane,
     int PreviousLeftRow,
     int PreviousLeftCutDir,
@@ -34,6 +34,18 @@ public sealed record TrainingExample(
     double HighBandDelta    = 0.0,  // hi-hat/cymbal delta since 100 ms ago [-1,1]
     double TimeSinceAnyNote = 0.5,  // min(L,R) beats-since-last-note / 8, [0,1]
     double SongFraction     = 0.0,  // beat / totalBeats [0,1]
+    // Parity / flow features — arm state after the last swing per hand.
+    // 0 = forehand expected next, 1 = backhand expected next, 0.5 = unknown.
+    double LeftParityState  = 0.5,
+    double RightParityState = 0.5,
+    // Second-previous cut direction per hand (has-flag + normalised value).
+    // Lets the model learn 2-note pattern context (alternating, streams, etc.)
+    int    Prev2LeftCutDir  = -1,   // -1 = no second-previous note
+    int    Prev2RightCutDir = -1,
+    // Lookahead audio: energy and onset 1 beat ahead.
+    // Helps the model plan for readability and upcoming density.
+    double LookaheadEnergy  = 0.0,
+    double LookaheadOnset   = 0.0,
     // Labels
     bool HasNote   = false,
     int NoteHand   = -1,   // 0=left, 1=right, -1=none
@@ -71,6 +83,7 @@ public sealed class TrainingExampleBuilder
 
         var examples  = new List<TrainingExample>((int)(songDurationBeats * 4) + 8);
         CanonicalNote? lastLeft = null, lastRight = null;
+        CanonicalNote? prev2Left = null, prev2Right = null;
 
         for (double beat = 0; beat < songDurationBeats; beat += 0.25)
         {
@@ -110,6 +123,16 @@ public sealed class TrainingExampleBuilder
             double songFraction  = songDurationBeats > 0
                 ? Math.Clamp(beat / songDurationBeats, 0.0, 1.0) : 0.0;
 
+            // ---- Parity state: 0=forehand next, 1=backhand next, 0.5=unknown ----
+            double leftParity  = ParityStateFromCutDir(lastLeft?.CutDirection);
+            double rightParity = ParityStateFromCutDir(lastRight?.CutDirection);
+
+            // ---- Lookahead audio (1 beat ahead) for readability planning ----
+            double lookaheadTime  = MathHelpers.BeatToSeconds(
+                Math.Min(beat + 1.0, songDurationBeats), bpm);
+            double lookaheadEnergy = audio.GetEnergy(lookaheadTime);
+            double lookaheadOnset  = GetOnsetStrength(lookaheadTime, audio);
+
             // ---- Find the note nearest to this beat (within ±0.13 beats) ----
             var note    = beatmap.Notes.FirstOrDefault(n => Math.Abs(n.Beat - beat) < 0.13);
             bool hasNote = note is not null;
@@ -143,6 +166,12 @@ public sealed class TrainingExampleBuilder
                 HighBandDelta:         highBandDelta,
                 TimeSinceAnyNote:      timeSinceAny,
                 SongFraction:          songFraction,
+                LeftParityState:       leftParity,
+                RightParityState:      rightParity,
+                Prev2LeftCutDir:       prev2Left  is not null ? (int)prev2Left.CutDirection  : -1,
+                Prev2RightCutDir:      prev2Right is not null ? (int)prev2Right.CutDirection : -1,
+                LookaheadEnergy:       lookaheadEnergy,
+                LookaheadOnset:        lookaheadOnset,
                 HasNote:               hasNote,
                 NoteHand:              noteHand,
                 NoteLane:              note?.Lane ?? -1,
@@ -152,8 +181,8 @@ public sealed class TrainingExampleBuilder
 
             if (note is not null)
             {
-                if (note.Hand == NoteHand.Left)  lastLeft  = note;
-                else                             lastRight = note;
+                if (note.Hand == NoteHand.Left)  { prev2Left  = lastLeft;  lastLeft  = note; }
+                else                             { prev2Right = lastRight; lastRight = note; }
             }
         }
 
@@ -210,4 +239,23 @@ public sealed class TrainingExampleBuilder
         double span = end - start;
         return span > 0 ? (timeSeconds - start) / span : 0;
     }
+
+    /// <summary>
+    /// Encodes arm parity state as a scalar.
+    /// After a Forehand cut (Down/DownLeft/DownRight) the arm is in Backhand position → 1.0.
+    /// After a Backhand cut (Up/UpLeft/UpRight/Left/Right) the arm is in Forehand position → 0.0.
+    /// Dot or unknown → 0.5 (neutral).
+    /// </summary>
+    private static double ParityStateFromCutDir(CutDirection? dir) => dir switch
+    {
+        CutDirection.Down      or
+        CutDirection.DownLeft  or
+        CutDirection.DownRight => 1.0,   // forehand cut → backhand position after
+        CutDirection.Up        or
+        CutDirection.UpLeft    or
+        CutDirection.UpRight   or
+        CutDirection.Left      or
+        CutDirection.Right     => 0.0,   // backhand cut → forehand position after
+        _                      => 0.5,   // Dot or no previous note
+    };
 }

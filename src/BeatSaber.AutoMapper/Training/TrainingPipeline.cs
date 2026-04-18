@@ -143,28 +143,50 @@ public sealed class TrainingPipeline : IDisposable
 
         // ----------------------------------------------------------------
         // 3. Pre-cache audio analysis for validation songs (runs ONCE, reused every epoch)
+        //
+        // Pool model:
+        //   poolSize = max(ValidationSongsPerEpoch, ValidationCachePoolSize)
+        //   → find 'poolSize' candidate pairs and cache all of them
+        //   → randomly pick 'songsPerEpoch' from the loaded pool for this run
+        //
+        // On the first run the cache is empty — all poolSize songs are analysed and saved.
+        // On subsequent restarts only new / invalidated entries are re-analysed.
         // ----------------------------------------------------------------
         int songsPerEpoch = Math.Max(1, options.ValidationSongsPerEpoch);
-        var validationPairs = new ValidationSongFinder()
-            .Find(mapFolders, songsPerEpoch, options.RandomSeed);
+        int poolSize      = Math.Max(songsPerEpoch,
+            options.ValidationCachePoolSize > 0 ? options.ValidationCachePoolSize : songsPerEpoch);
+
+        var poolPairs = new ValidationSongFinder()
+            .Find(mapFolders, poolSize, options.RandomSeed);
 
         CachedPair[] cachedPairs = [];
-        if (validationPairs.Count > 0)
+        if (poolPairs.Count > 0)
         {
-            Console.WriteLine(
-                $"[Training] Pre-analysing {validationPairs.Count} validation song(s) in parallel...");
+            var audioCache   = new ValidationAudioCache(options.ArtifactsOutputPath);
+            var poolTmp      = new CachedPair?[poolPairs.Count];
+            int cacheHits    = 0;
+            int cacheMisses  = 0;
 
-            var tmp = new CachedPair?[validationPairs.Count];
-            Parallel.For(0, validationPairs.Count,
+            Parallel.For(0, poolPairs.Count,
                 new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount },
                 i =>
                 {
-                    var pair = validationPairs[i];
+                    var pair = poolPairs[i];
                     try
                     {
-                        // New extractor per thread — AudioFeatureExtractor has mutable inner state
-                        var audio = new AudioFeatureExtractor().Extract(pair.AudioPath);
-                        tmp[i] = new CachedPair(pair, audio);
+                        var audio = audioCache.TryLoad(pair.AudioPath);
+                        if (audio is not null)
+                        {
+                            Interlocked.Increment(ref cacheHits);
+                        }
+                        else
+                        {
+                            // New extractor per thread — AudioFeatureExtractor has mutable inner state
+                            audio = new AudioFeatureExtractor().Extract(pair.AudioPath);
+                            audioCache.Store(pair.AudioPath, audio);
+                            Interlocked.Increment(ref cacheMisses);
+                        }
+                        poolTmp[i] = new CachedPair(pair, audio);
                     }
                     catch (Exception ex)
                     {
@@ -174,8 +196,22 @@ public sealed class TrainingPipeline : IDisposable
                     }
                 });
 
-            cachedPairs = tmp.Where(p => p is not null).Select(p => p!).ToArray();
-            Console.WriteLine($"[Training] {cachedPairs.Length} validation song(s) ready.");
+            var pool = poolTmp.Where(p => p is not null).Select(p => p!).ToArray();
+            Console.WriteLine(
+                $"[Training] Validation pool: {pool.Length}/{poolPairs.Count} ready " +
+                $"({cacheHits} from cache, {cacheMisses} freshly analysed).");
+
+            // Randomly sample songsPerEpoch from the pool (without replacement).
+            // Uses a seeded shuffle so the sample is reproducible but different from
+            // the pool-discovery seed, giving variety across training runs if you
+            // change the seed via CLI.
+            cachedPairs = pool.Length <= songsPerEpoch
+                ? pool
+                : FisherYatesSample(pool, songsPerEpoch, new Random((int)(options.RandomSeed >> 1)));
+
+            Console.WriteLine(
+                $"[Training] Using {cachedPairs.Length} validation song(s) this run " +
+                $"(pool size {pool.Length}).");
         }
 
         // ----------------------------------------------------------------
@@ -390,6 +426,23 @@ public sealed class TrainingPipeline : IDisposable
             (copy[i], copy[j]) = (copy[j], copy[i]);
         }
         return copy;
+    }
+
+    /// <summary>
+    /// Returns a random sample of <paramref name="k"/> items from <paramref name="source"/>
+    /// using a partial Fisher-Yates shuffle (no full copy needed).
+    /// </summary>
+    private static CachedPair[] FisherYatesSample(CachedPair[] source, int k, Random rng)
+    {
+        var arr = (CachedPair[])source.Clone();
+        int n   = arr.Length;
+        k       = Math.Min(k, n);
+        for (int i = 0; i < k; i++)
+        {
+            int j = rng.Next(i, n);
+            (arr[i], arr[j]) = (arr[j], arr[i]);
+        }
+        return arr[..k];
     }
 
     /// <summary>

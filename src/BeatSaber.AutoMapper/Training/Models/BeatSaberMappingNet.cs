@@ -7,7 +7,7 @@ namespace BeatSaber.AutoMapper.Training.Models;
 
 /// <summary>
 /// Multi-task neural network for Beat Saber note generation.
-/// Architecture: 27 → 1024 → 512 → 256 → 128 trunk (BatchNorm + Dropout) → 5 heads.
+/// Architecture: 35 → 1024 → 512 → 256 → 128 trunk (BatchNorm + Dropout) → 5 heads.
 ///
 /// Forward output is a [B, 18] tensor:
 ///   [B, 0]      placement logit  (sigmoid → P(note here))
@@ -16,19 +16,27 @@ namespace BeatSaber.AutoMapper.Training.Models;
 ///   [B, 11..14] lane logits      (softmax → 4 lanes)
 ///   [B, 15..17] row logits       (softmax → 3 rows)
 ///
-/// Feature layout (27 inputs):
+/// Feature layout (35 inputs):
 ///   [0-22]  original 23 features (rhythm + spectral + sequential note state)
 ///   [23]    EnergyDelta      — normalised rising/falling energy
 ///   [24]    HighBandDelta    — hi-hat/cymbal delta (onset sharpness)
 ///   [25]    TimeSinceAnyNote — min(L,R) beats since last note / 8
 ///   [26]    SongFraction     — beat / totalBeats (song position context)
+///   [27]    LeftParityState  — arm state after last left swing  (0=FH,1=BH,0.5=unknown)
+///   [28]    RightParityState — arm state after last right swing (0=FH,1=BH,0.5=unknown)
+///   [29]    Prev2LeftHas     — has second-previous left note (0/1)
+///   [30]    Prev2LeftDir     — second-previous left cut direction / 8
+///   [31]    Prev2RightHas    — has second-previous right note (0/1)
+///   [32]    Prev2RightDir    — second-previous right cut direction / 8
+///   [33]    LookaheadEnergy  — audio energy 1 beat ahead
+///   [34]    LookaheadOnset   — onset strength 1 beat ahead
 ///
-/// ~725K parameters; float32 .pt file ~2.8 MB.
-/// NOTE: architecture change from 23-input v1 — existing v1 .pt files are NOT compatible.
+/// ~740K parameters; float32 .pt file ~2.9 MB.
+/// NOTE: architecture change from 27-input v2 — existing v2 .pt files are NOT compatible.
 /// </summary>
 internal sealed class BeatSaberMappingNet : Module<Tensor, Tensor>
 {
-    internal const int InputDim = 27;
+    internal const int InputDim = 35;
     internal const int OutDim   = 18;  // 1+1+9+4+3
 
     private const long H1 = 1024, H2 = 512, H3 = 256, H4 = 128;

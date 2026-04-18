@@ -115,7 +115,8 @@ var trainDatasetOpt = new Option<string>("--dataset") { Description = "Path to d
 var trainProfileOpt = new Option<string>("--profile") { Description = "Training profile name", DefaultValueFactory = _ => "baseline" };
 var trainArtifactsOpt = new Option<string>("--artifacts") { Description = "Artifacts output directory", DefaultValueFactory = _ => "artifacts" };
 var trainEpochsOpt = new Option<int>("--epochs") { Description = "Max training epochs", DefaultValueFactory = _ => 100 };
-var trainValSongsOpt = new Option<int>("--validation-songs") { Description = "Map folders with audio to use for per-epoch generation quality check", DefaultValueFactory = _ => 3 };
+var trainValSongsOpt = new Option<int>("--validation-songs") { Description = "Validation songs to use per epoch (randomly sampled from cache pool)", DefaultValueFactory = _ => 3 };
+var trainValCacheSizeOpt = new Option<int>("--validation-cache-size") { Description = "Max validation songs to pre-analyse and cache (≥ --validation-songs). Grow once, reuse across restarts.", DefaultValueFactory = _ => 0 };
 var trainLrOpt = new Option<double>("--learning-rate") { Description = "Adam initial learning rate", DefaultValueFactory = _ => 0.001 };
 var trainEarlyStopOpt = new Option<int>("--early-stop") { Description = "Stop after N epochs without improvement (0 = disabled)", DefaultValueFactory = _ => 20 };
 var trainSsWarmupOpt = new Option<int>("--ss-warmup") { Description = "Epochs before self-supervised examples start being injected", DefaultValueFactory = _ => 5 };
@@ -128,6 +129,7 @@ trainCmd.Add(trainProfileOpt);
 trainCmd.Add(trainArtifactsOpt);
 trainCmd.Add(trainEpochsOpt);
 trainCmd.Add(trainValSongsOpt);
+trainCmd.Add(trainValCacheSizeOpt);
 trainCmd.Add(trainLrOpt);
 trainCmd.Add(trainEarlyStopOpt);
 trainCmd.Add(trainSsWarmupOpt);
@@ -150,6 +152,7 @@ trainCmd.SetAction((ParseResult pr) =>
             TestFraction: 0.1,
             RandomSeed: 42,
             ValidationSongsPerEpoch: pr.GetValue(trainValSongsOpt),
+            ValidationCachePoolSize: pr.GetValue(trainValCacheSizeOpt),
             InitialLearningRate: pr.GetValue(trainLrOpt),
             EarlyStopPatience: pr.GetValue(trainEarlyStopOpt),
             SelfSupervisedWarmupEpochs: pr.GetValue(trainSsWarmupOpt),
