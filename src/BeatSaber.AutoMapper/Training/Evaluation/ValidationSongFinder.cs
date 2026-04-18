@@ -4,9 +4,13 @@ namespace BeatSaber.AutoMapper.Training.Evaluation;
 
 /// <summary>
 /// Finds map folders in the library that have an accessible audio file,
-/// returning validation pairs suitable for generation-quality validation during training.
-/// Each pair carries one specific difficulty so generated maps are always compared
-/// difficulty-to-difficulty (Hard→Hard, Expert→Expert, etc.).
+/// returning song groups suitable for generation-quality validation during training.
+/// <para>
+/// A <see cref="SongGroup"/> contains ONE unique audio file plus ALL of its valid
+/// difficulties (≥ 20 notes). <paramref name="maxSongs"/> limits the number of unique
+/// songs (== unique audio cache entries). The total validation pairs across the epoch
+/// is typically 2–4× that, since most songs have multiple difficulties.
+/// </para>
 /// </summary>
 public sealed class ValidationSongFinder
 {
@@ -15,23 +19,30 @@ public sealed class ValidationSongFinder
         string AudioPath,
         CanonicalBeatmap ReferenceMap);
 
+    /// <summary>Groups all valid difficulties for a single audio file.</summary>
+    public sealed record SongGroup(
+        string FolderPath,
+        string AudioPath,
+        IReadOnlyList<CanonicalBeatmap> Difficulties);
+
     /// <summary>
-    /// Find up to <paramref name="maxCount"/> validation pairs from a random sample of folders.
-    /// Returns ONE pair per available difficulty per selected folder, so if a folder has Hard
-    /// and Expert the evaluator will generate and compare both separately.
+    /// Find up to <paramref name="maxSongs"/> song groups (unique audio files).
+    /// All difficulties with ≥ 20 notes are included per folder, ordered hardest-first.
+    /// <paramref name="maxSongs"/> == unique audio files cached/analysed.
+    /// Total validation pairs may exceed <paramref name="maxSongs"/> proportionally.
     /// </summary>
-    public IReadOnlyList<ValidationPair> Find(
+    public IReadOnlyList<SongGroup> Find(
         IReadOnlyList<string> mapFolders,
-        int  maxCount = 5,
+        int  maxSongs = 5,
         long seed     = 42)
     {
-        var result   = new List<ValidationPair>();
+        var result   = new List<SongGroup>();
         var rng      = new Random((int)seed);
         var shuffled = mapFolders.OrderBy(_ => rng.Next()).ToList();
 
         foreach (string folder in shuffled)
         {
-            if (result.Count >= maxCount) break;
+            if (result.Count >= maxSongs) break;
 
             string? audioPath = FindAudio(folder);
             if (audioPath is null) continue;
@@ -40,18 +51,15 @@ public sealed class ValidationSongFinder
             {
                 var maps = BeatmapImporter.Import(folder);
 
-                // Add one pair for EACH difficulty that has enough notes,
-                // so generated maps are compared at the matching difficulty level.
-                var validDiffs = maps
+                // Collect ALL valid difficulties from this folder, ordered hardest-first.
+                // maxSongs limits unique songs; total pairs may be 2-4× higher.
+                var diffs = maps
                     .Where(m => m.Notes.Count >= 20)
                     .OrderByDescending(m => (int)m.Difficulty.Difficulty)
                     .ToList();
 
-                foreach (var map in validDiffs)
-                {
-                    if (result.Count >= maxCount) break;
-                    result.Add(new ValidationPair(folder, audioPath, map));
-                }
+                if (diffs.Count > 0)
+                    result.Add(new SongGroup(folder, audioPath, diffs));
             }
             catch { /* skip un-parseable maps */ }
         }

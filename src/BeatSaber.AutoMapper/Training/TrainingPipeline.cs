@@ -27,6 +27,11 @@ public sealed class TrainingPipeline : IDisposable
         ValidationSongFinder.ValidationPair Pair,
         AudioAnalysisResult Audio);
 
+    // One entry per unique song in the pool; flattened to CachedPair[] per epoch
+    private sealed record CachedSong(
+        ValidationSongFinder.SongGroup Group,
+        AudioAnalysisResult Audio);
+
     public void Run(TrainingOptions options)
     {
         Guard.NotNull(options, nameof(options));
@@ -146,8 +151,10 @@ public sealed class TrainingPipeline : IDisposable
         //
         // Pool model:
         //   poolSize = max(ValidationSongsPerEpoch, ValidationCachePoolSize)
-        //   → find 'poolSize' candidate pairs and cache all of them
-        //   → randomly pick 'songsPerEpoch' from the loaded pool for this run
+        //   → find 'poolSize' unique songs and cache one audio entry per song
+        //   → each song contributes ALL its valid difficulties as separate pairs
+        //   → randomly sample 'songsPerEpoch' songs from the pool each run;
+        //     total pairs per epoch ≈ songsPerEpoch × avg_difficulties_per_song
         //
         // On the first run the cache is empty — all poolSize songs are analysed and saved.
         // On subsequent restarts only new / invalidated entries are re-analysed.
@@ -156,25 +163,26 @@ public sealed class TrainingPipeline : IDisposable
         int poolSize      = Math.Max(songsPerEpoch,
             options.ValidationCachePoolSize > 0 ? options.ValidationCachePoolSize : songsPerEpoch);
 
-        var poolPairs = new ValidationSongFinder()
+        var poolGroups = new ValidationSongFinder()
             .Find(mapFolders, poolSize, options.RandomSeed);
 
         CachedPair[] cachedPairs = [];
-        if (poolPairs.Count > 0)
+        if (poolGroups.Count > 0)
         {
-            var audioCache   = new ValidationAudioCache(options.ArtifactsOutputPath);
-            var poolTmp      = new CachedPair?[poolPairs.Count];
-            int cacheHits    = 0;
-            int cacheMisses  = 0;
+            var audioCache  = new ValidationAudioCache(options.ArtifactsOutputPath);
+            var poolTmp     = new CachedSong?[poolGroups.Count];
+            int cacheHits   = 0;
+            int cacheMisses = 0;
 
-            Parallel.For(0, poolPairs.Count,
+            Parallel.For(0, poolGroups.Count,
                 new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount },
                 i =>
                 {
-                    var pair = poolPairs[i];
+                    var group = poolGroups[i];
                     try
                     {
-                        var audio = audioCache.TryLoad(pair.AudioPath);
+                        // One audio cache entry per unique song (shared across all its difficulties)
+                        var audio = audioCache.TryLoad(group.AudioPath);
                         if (audio is not null)
                         {
                             Interlocked.Increment(ref cacheHits);
@@ -182,36 +190,45 @@ public sealed class TrainingPipeline : IDisposable
                         else
                         {
                             // New extractor per thread — AudioFeatureExtractor has mutable inner state
-                            audio = new AudioFeatureExtractor().Extract(pair.AudioPath);
-                            audioCache.Store(pair.AudioPath, audio);
+                            audio = new AudioFeatureExtractor().Extract(group.AudioPath);
+                            audioCache.Store(group.AudioPath, audio);
                             Interlocked.Increment(ref cacheMisses);
                         }
-                        poolTmp[i] = new CachedPair(pair, audio);
+                        poolTmp[i] = new CachedSong(group, audio);
                     }
                     catch (Exception ex)
                     {
                         lock (printLock)
                             Console.WriteLine(
-                                $"[Training] Warning: could not analyse '{pair.AudioPath}': {ex.Message}");
+                                $"[Training] Warning: could not analyse '{group.AudioPath}': {ex.Message}");
                     }
                 });
 
-            var pool = poolTmp.Where(p => p is not null).Select(p => p!).ToArray();
+            var pool = poolTmp.Where(s => s is not null).Select(s => s!).ToArray();
+            int poolPairCount = pool.Sum(s => s.Group.Difficulties.Count);
             Console.WriteLine(
-                $"[Training] Validation pool: {pool.Length}/{poolPairs.Count} ready " +
-                $"({cacheHits} from cache, {cacheMisses} freshly analysed).");
+                $"[Training] Validation pool: {pool.Length}/{poolGroups.Count} unique songs ready " +
+                $"({poolPairCount} total pairs, {cacheHits} from cache, {cacheMisses} freshly analysed).");
 
-            // Randomly sample songsPerEpoch from the pool (without replacement).
-            // Uses a seeded shuffle so the sample is reproducible but different from
-            // the pool-discovery seed, giving variety across training runs if you
-            // change the seed via CLI.
-            cachedPairs = pool.Length <= songsPerEpoch
+            // Randomly sample songsPerEpoch unique songs from the pool (without replacement).
+            // Each sampled song contributes all its difficulties, so total pairs per epoch
+            // is typically 2–4× songsPerEpoch.
+            var sampledSongs = pool.Length <= songsPerEpoch
                 ? pool
                 : FisherYatesSample(pool, songsPerEpoch, new Random((int)(options.RandomSeed >> 1)));
 
+            // Flatten: one CachedPair per (song, difficulty) combination.
+            cachedPairs = sampledSongs
+                .SelectMany(cs => cs.Group.Difficulties.Select(diff =>
+                    new CachedPair(
+                        new ValidationSongFinder.ValidationPair(
+                            cs.Group.FolderPath, cs.Group.AudioPath, diff),
+                        cs.Audio)))
+                .ToArray();
+
             Console.WriteLine(
-                $"[Training] Using {cachedPairs.Length} validation song(s) this run " +
-                $"(pool size {pool.Length}).");
+                $"[Training] Using {cachedPairs.Length} validation pair(s) across " +
+                $"{sampledSongs.Length} song(s) this run (pool size {pool.Length}).");
         }
 
         // ----------------------------------------------------------------
@@ -432,9 +449,9 @@ public sealed class TrainingPipeline : IDisposable
     /// Returns a random sample of <paramref name="k"/> items from <paramref name="source"/>
     /// using a partial Fisher-Yates shuffle (no full copy needed).
     /// </summary>
-    private static CachedPair[] FisherYatesSample(CachedPair[] source, int k, Random rng)
+    private static T[] FisherYatesSample<T>(T[] source, int k, Random rng)
     {
-        var arr = (CachedPair[])source.Clone();
+        var arr = (T[])source.Clone();
         int n   = arr.Length;
         k       = Math.Min(k, n);
         for (int i = 0; i < k; i++)
