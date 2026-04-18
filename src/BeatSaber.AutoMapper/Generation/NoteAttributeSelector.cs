@@ -64,11 +64,13 @@ public sealed class NoteAttributeSelector
         NoteHand hand, CutDirection dir,
         ProposedEvent proposed, GenerationContext ctx)
     {
-        // Neural model: sample lane/row from learned distributions
+        // Neural model: sample lane/row from learned distributions with temperature scaling.
+        // Temperature > 1 flattens the softmax so the model explores more positions
+        // rather than always collapsing to the highest-probability lane/row.
         if (proposed.NeuralPrediction.HasValue)
         {
-            int lane = SampleFromProbs(proposed.NeuralPrediction.Value.LaneProbs, ctx.Rng);
-            int row  = SampleFromProbs(proposed.NeuralPrediction.Value.RowProbs,  ctx.Rng);
+            int lane = SampleFromProbs(proposed.NeuralPrediction.Value.LaneProbs, ctx.Rng, temperature: 1.4);
+            int row  = SampleFromProbs(proposed.NeuralPrediction.Value.RowProbs,  ctx.Rng, temperature: 1.3);
             return (lane, row);
         }
 
@@ -106,8 +108,22 @@ public sealed class NoteAttributeSelector
     // -----------------------------------------------------------------------
 
 
-    private static int SampleFromProbs(double[] probs, Random rng)
+    private static int SampleFromProbs(double[] probs, Random rng, double temperature = 1.0)
     {
+        if (temperature != 1.0)
+        {
+            // Apply temperature: p_i ∝ p_i^(1/T)  — T>1 flattens, T<1 sharpens
+            var scaled = new double[probs.Length];
+            double sum = 0;
+            for (int i = 0; i < probs.Length; i++)
+            {
+                scaled[i] = Math.Pow(Math.Max(probs[i], 1e-10), 1.0 / temperature);
+                sum += scaled[i];
+            }
+            for (int i = 0; i < scaled.Length; i++) scaled[i] /= sum;
+            probs = scaled;
+        }
+
         double r = rng.NextDouble(), cum = 0;
         for (int i = 0; i < probs.Length; i++) { cum += probs[i]; if (r < cum) return i; }
         return probs.Length - 1;

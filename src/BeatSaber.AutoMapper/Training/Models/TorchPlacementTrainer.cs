@@ -185,23 +185,33 @@ public sealed class TorchPlacementTrainer : IPlacementScorer, IDisposable
             }
 
             // Lane head — only examples with a real lane label (NOT self-supervised)
+            // Entropy regularisation (-α·H) penalises overconfident predictions and
+            // prevents the head collapsing to always output lane 0.
             using var lnMaskIdx = (lnMaskB > 0.5f).nonzero().squeeze(1);
             if (lnMaskIdx.shape[0] > 0)
             {
-                using var lnSelLgt = lnLgt.index_select(0, lnMaskIdx);
-                using var lnSelY   = yLnB.index_select(0, lnMaskIdx);
-                using var lnRaw    = functional.cross_entropy(lnSelLgt, lnSelY);
-                lossTerms.Add(1.2 * lnRaw);
+                using var lnSelLgt  = lnLgt.index_select(0, lnMaskIdx);
+                using var lnSelY    = yLnB.index_select(0, lnMaskIdx);
+                using var lnCE      = functional.cross_entropy(lnSelLgt, lnSelY);
+                using var lnLogProb = functional.log_softmax(lnSelLgt, dim: 1);
+                using var lnProb    = softmax(lnSelLgt, dim: 1);
+                using var lnEntr    = -(lnProb * lnLogProb).sum(1).mean();
+                var lnLoss          = 1.2 * lnCE - 0.10 * lnEntr;   // owned by lossTerms
+                lossTerms.Add(lnLoss);
             }
 
             // Row head — only examples with a real row label (NOT self-supervised)
             using var rwMaskIdx = (rwMaskB > 0.5f).nonzero().squeeze(1);
             if (rwMaskIdx.shape[0] > 0)
             {
-                using var rwSelLgt = rwLgt.index_select(0, rwMaskIdx);
-                using var rwSelY   = yRwB.index_select(0, rwMaskIdx);
-                using var rwRaw    = functional.cross_entropy(rwSelLgt, rwSelY);
-                lossTerms.Add(0.8 * rwRaw);
+                using var rwSelLgt  = rwLgt.index_select(0, rwMaskIdx);
+                using var rwSelY    = yRwB.index_select(0, rwMaskIdx);
+                using var rwCE      = functional.cross_entropy(rwSelLgt, rwSelY);
+                using var rwLogProb = functional.log_softmax(rwSelLgt, dim: 1);
+                using var rwProb    = softmax(rwSelLgt, dim: 1);
+                using var rwEntr    = -(rwProb * rwLogProb).sum(1).mean();
+                var rwLoss          = 0.8 * rwCE - 0.08 * rwEntr;   // owned by lossTerms
+                lossTerms.Add(rwLoss);
             }
 
             // Sum all loss terms
