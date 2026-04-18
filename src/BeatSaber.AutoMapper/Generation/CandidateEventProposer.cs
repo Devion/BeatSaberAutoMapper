@@ -54,7 +54,7 @@ public sealed class CandidateEventProposer
         foreach (var candidate in ctx.CandidateGrid)
         {
             double score = ScoreCandidate(candidate, ctx, lastLeft, lastRight, prev2Left, prev2Right,
-                                          out var neuralPred);
+                                          nextLeft, out var neuralPred);
             if (score < threshold) continue;
 
             var hand = nextLeft ? NoteHand.Left : NoteHand.Right;
@@ -69,6 +69,7 @@ public sealed class CandidateEventProposer
     private double ScoreCandidate(TimingCandidate candidate, GenerationContext ctx,
                                   CanonicalNote? lastLeft, CanonicalNote? lastRight,
                                   CanonicalNote? prev2Left, CanonicalNote? prev2Right,
+                                  bool isNextLeft,
                                   out NeuralMapPrediction? neuralPred)
     {
         double localNps  = EstimateLocalNps(candidate.Beat, ctx);
@@ -139,6 +140,7 @@ public sealed class CandidateEventProposer
                 Prev2RightCutDir = prev2Right != null ? (int)prev2Right.CutDirection : -1,
                 LookaheadEnergy  = lookaheadEnergy,
                 LookaheadOnset   = lookaheadOnset,
+                NoteHandHint     = isNextLeft ? 0.0 : 1.0,
             };
 
             double score;

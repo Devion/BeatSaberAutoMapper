@@ -58,7 +58,7 @@ public sealed class TorchPlacementTrainer : IPlacementScorer, IDisposable
 
     // ── Epoch training ────────────────────────────────────────────────────────
 
-    public (double Loss, double Accuracy) TrainEpoch(
+    public (double Loss, double PlaceBce) TrainEpoch(
         IReadOnlyList<TrainingExample> examples, double lr)
     {
         int n = examples.Count;
@@ -131,8 +131,8 @@ public sealed class TorchPlacementTrainer : IPlacementScorer, IDisposable
 
         const int batchSize = 4096;
         int numBatches = Math.Max(1, (n + batchSize - 1) / batchSize);
-        double totalLoss    = 0;
-        long   totalCorrect = 0;
+        double totalLoss     = 0;
+        double totalPlaceBce = 0;  // placement-head BCE component (meaningful regardless of class imbalance)
 
         for (int b = 0; b < numBatches; b++)
         {
@@ -159,10 +159,9 @@ public sealed class TorchPlacementTrainer : IPlacementScorer, IDisposable
             using var rwLgt = outB.narrow(1, 15, 3);  // [B, 3]
 
             // ── Multi-task loss ────────────────────────────────────────────────
-            var lossTerms = new List<Tensor>
-            {
-                functional.binary_cross_entropy_with_logits(plLgt, yPlB, null, Reduction.Mean, posWtT)
-            };
+            var plBceTens = functional.binary_cross_entropy_with_logits(plLgt, yPlB, null, Reduction.Mean, posWtT);
+            totalPlaceBce += plBceTens.item<float>();
+            var lossTerms = new List<Tensor> { plBceTens };
 
             // Hand head — only examples with a real hand label
             using var haMaskIdx = (haMaskB > 0.5f).nonzero().squeeze(1);
@@ -234,14 +233,11 @@ public sealed class TorchPlacementTrainer : IPlacementScorer, IDisposable
             _optimizer.step();
             loss.Dispose();
 
-            // Accuracy on placement head
-            using var preds   = sigmoid(plLgt) > 0.5f;
-            using var targets = yPlB > 0.5f;
-            totalCorrect += preds.eq(targets).sum().item<long>();
+            // Note-placement F1: track TP/FP/FN on the placement head only.
         }
 
         SyncCpuShadow();
-        return (totalLoss / numBatches, (double)totalCorrect / n);
+        return (totalLoss / numBatches, totalPlaceBce / numBatches);
     }
 
     // ── Best-epoch snapshot ───────────────────────────────────────────────────
@@ -365,6 +361,8 @@ public sealed class TorchPlacementTrainer : IPlacementScorer, IDisposable
         arr[offset + 32] = ex.Prev2RightCutDir >= 0 ? (float)(ex.Prev2RightCutDir / 8.0) : 0f;
         arr[offset + 33] = (float)Math.Clamp(ex.LookaheadEnergy, 0.0, 1.0);
         arr[offset + 34] = (float)Math.Clamp(ex.LookaheadOnset,  0.0, 1.0);
+        // Hand hint: 0=left, 1=right, 0.5=unknown (no note or hand undetermined)
+        arr[offset + 35] = ex.NoteHand == 0 ? 0f : ex.NoteHand == 1 ? 1f : 0.5f;
     }
 
     public void Dispose()

@@ -17,7 +17,6 @@ public sealed class TrainingPipeline : IDisposable
     private readonly TrainingExampleBuilder _exampleBuilder   = new();
     private readonly DatasetManifestBuilder _manifestBuilder  = new();
     private readonly TorchPlacementTrainer   _placementTrainer = new();
-    private readonly AttributeModelTrainer  _attributeTrainer = new();
     private readonly EvaluationRunner       _evaluator        = new();
 
     public void Dispose() => _placementTrainer.Dispose();
@@ -232,29 +231,30 @@ public sealed class TrainingPipeline : IDisposable
         }
 
         // ----------------------------------------------------------------
-        // 4. Attribute model — one-shot parallel frequency counting
-        // ----------------------------------------------------------------
-        Console.WriteLine("[Training] Building attribute model...");
-        _attributeTrainer.Train(trainEx);
-
-        // ----------------------------------------------------------------
-        // 5. Placement model — epoch loop with shuffle + parallel mini-batch GD
+        // 4. Placement model — epoch loop with shuffle + parallel mini-batch GD
         // ----------------------------------------------------------------
         double lr = warmStarted ? options.InitialLearningRate * 0.3 : options.InitialLearningRate;
-        const double MinLr      = 1e-5;
-        const double LrDecay    = 0.5;   // multiply LR by this when plateaued
-        // Reduce LR after this many no-improvement epochs (before full early-stop)
+        const double MinLr   = 1e-5;
+        const double LrDecay = 0.5;
+        // Reduce LR after this many consecutive stagnation epochs.
+        // patience/3 → 3 LR reductions across the full patience window.
         int lrPatience = Math.Max(1, options.EarlyStopPatience / 3);
 
         Console.WriteLine(
-            $"[Training] Training neural placement model 27→1024→512→256→128 ({options.Epochs} epochs max, " +
+            $"[Training] Training neural placement model {BeatSaberMappingNet.InputDim}→1024→512→256→128 ({options.Epochs} epochs max, " +
             $"Adam lr={lr:G4}, patience={options.EarlyStopPatience}, lr-patience={lrPatience})...[warmStart={warmStarted}]");
-        double bestQuality         = -1.0;
-        double bestSmoothedQuality = -1.0;   // EMA-smoothed, used for LR/early-stop
-        double smoothedQuality     = -1.0;
-        const double EmaAlpha      = 0.4;    // weight of current epoch vs history
-        int    epochsNoImprovement = 0;
-        int    lrReductions        = 0;
+
+        double bestQuality     = -1.0;
+        double smoothedQuality = -1.0;
+        const double EmaAlpha  = 0.4;   // for display only
+        int    stagnationEpochs = 0;    // trend-based; only increments when both loss+genQ are flat
+        int    lrReductions     = 0;
+
+        // Sliding window for trend detection (last SlopeWindow epochs)
+        const int SlopeWindow = 10;
+        var lossHistory = new List<double>(SlopeWindow + 1);
+        var genQHistory = new List<double>(SlopeWindow + 1);
+
         _placementTrainer.SaveBestWeights();
 
         var epochRng = new Random((int)(options.RandomSeed & int.MaxValue));
@@ -270,7 +270,7 @@ public sealed class TrainingPipeline : IDisposable
             if (currentSynthetics.Count > 0 && epoch >= options.SelfSupervisedWarmupEpochs)
                 shuffled = MergeWithSynthetics(shuffled, currentSynthetics, epochRng.Next());
 
-            var (loss, acc) = _placementTrainer.TrainEpoch(shuffled, lr);
+            var (loss, plBce) = _placementTrainer.TrainEpoch(shuffled, lr);
 
             double qualityScore = 0;
             if (cachedPairs.Length > 0)
@@ -284,62 +284,82 @@ public sealed class TrainingPipeline : IDisposable
                     currentSynthetics = new List<TrainingExample>(newSynthetics);
             }
 
-            // EMA smoothing — stabilises LR/early-stop signals across noisy epochs
-            smoothedQuality = smoothedQuality < 0
-                ? qualityScore
-                : EmaAlpha * qualityScore + (1 - EmaAlpha) * smoothedQuality;
-
-            Console.WriteLine(
-                $"[Training] Epoch {epoch + 1}/{options.Epochs}: " +
-                $"loss={loss:F4}  acc={acc:P2}  genQuality={qualityScore:F3}  lr={lr:G4}" +
-                (currentSynthetics.Count > 0
-                    ? $"  synthEx={currentSynthetics.Count}"
-                    : string.Empty));
-
-            // Save best weights on RAW quality peaks (catches genuine highs even in noisy epochs)
-            if (qualityScore > bestQuality + 1e-4)
+            // ── Improvement check (raw quality) ──────────────────────────────────
+            // neural_placement.pt is ONLY written when a new best is reached.
+            bool isNewBest = qualityScore > bestQuality + 1e-4;
+            if (isNewBest)
             {
                 bestQuality = qualityScore;
                 _placementTrainer.SaveBestWeights();
                 _placementTrainer.SaveWeights(options.ArtifactsOutputPath);
-                _attributeTrainer.SaveModel(options.ArtifactsOutputPath);
             }
 
-            // Use EMA-smoothed quality for plateau/early-stop decisions
-            if (smoothedQuality > bestSmoothedQuality + 1e-4)
-            {
-                bestSmoothedQuality = smoothedQuality;
-                epochsNoImprovement = 0;
-            }
+            // EMA for display only (no longer drives LR/stop decisions)
+            smoothedQuality = smoothedQuality < 0
+                ? qualityScore
+                : EmaAlpha * qualityScore + (1 - EmaAlpha) * smoothedQuality;
+
+            // ── Trend detection — linear regression over last SlopeWindow epochs ─
+            lossHistory.Add(loss);
+            if (lossHistory.Count > SlopeWindow) lossHistory.RemoveAt(0);
+            genQHistory.Add(qualityScore);
+            if (genQHistory.Count > SlopeWindow) genQHistory.RemoveAt(0);
+
+            double lossSlope = ComputeLinearSlope(lossHistory); // negative = loss improving
+            double genQSlope = ComputeLinearSlope(genQHistory);  // positive = quality improving
+
+            // Stagnation: neither loss nor quality is trending in the right direction.
+            // lossSlope < -0.003 → loss still declining >0.003/epoch (cold-start / active learning)
+            // genQSlope > 0.001  → quality genuinely trending upward
+            bool isLossImproving = lossSlope < -0.003;
+            bool isGenQImproving = genQSlope > 0.001;
+            bool isStagnating    = !isLossImproving && !isGenQImproving;
+
+            if (isStagnating)
+                stagnationEpochs++;
             else
-            {
-                epochsNoImprovement++;
+                stagnationEpochs = Math.Max(0, stagnationEpochs - 1);
 
-                // Periodic checkpoint (even if not a new best)
+            // ── Epoch log ────────────────────────────────────────────────────────
+            string statusTag = isNewBest
+                ? "  ** NEW BEST **"
+                : stagnationEpochs > 0
+                    ? $"  [stag: {stagnationEpochs}/{options.EarlyStopPatience}]"
+                    : string.Empty;
+
+            Console.WriteLine(
+                $"[Training] Epoch {epoch + 1}/{options.Epochs}: " +
+                $"loss={loss:F4}  plBCE={plBce:F4}  " +
+                $"genQ={qualityScore:F3}  best={bestQuality:F3}  sm={smoothedQuality:F3}  lr={lr:G4}" +
+                $"  lSlp={lossSlope:+0.0000;-0.0000}  qSlp={genQSlope:+0.0000;-0.0000}" +
+                (currentSynthetics.Count > 0 ? $"  synthEx={currentSynthetics.Count}" : string.Empty) +
+                statusTag);
+
+            // ── Stagnation-driven LR reduction and early stop ────────────────────
+            if (stagnationEpochs > 0)
+            {
+                // Periodic checkpoint marker (no file write)
                 if (options.CheckpointEveryNEpochs > 0
                     && (epoch + 1) % options.CheckpointEveryNEpochs == 0)
                 {
-                    _placementTrainer.SaveWeights(options.ArtifactsOutputPath);
-                    _attributeTrainer.SaveModel(options.ArtifactsOutputPath);
                     Console.WriteLine(
-                        $"[Training] Checkpoint saved at epoch {epoch + 1} (bestQuality={bestQuality:F3})");
+                        $"[Training] Checkpoint epoch {epoch + 1} — best so far: {bestQuality:F3}");
                 }
 
-                // Reduce LR on plateau before triggering full early stop
-                if (epochsNoImprovement > 0 && epochsNoImprovement % lrPatience == 0
-                    && lr > MinLr * 1.1)
+                // Reduce LR when stagnation counter hits the lr-patience threshold
+                if (stagnationEpochs % lrPatience == 0 && lr > MinLr * 1.1)
                 {
                     lr = Math.Max(lr * LrDecay, MinLr);
                     lrReductions++;
                     Console.WriteLine(
-                        $"[Training] Plateau detected — reducing lr to {lr:G4} (reduction #{lrReductions})");
+                        $"[Training] Stagnation plateau — reducing lr to {lr:G4} (reduction #{lrReductions})");
                 }
 
-                if (options.EarlyStopPatience > 0 && epochsNoImprovement >= options.EarlyStopPatience)
+                if (options.EarlyStopPatience > 0 && stagnationEpochs >= options.EarlyStopPatience)
                 {
                     Console.WriteLine(
                         $"[Training] Early stopping at epoch {epoch + 1} " +
-                        $"(no improvement for {options.EarlyStopPatience} epochs). " +
+                        $"(stagnation for {options.EarlyStopPatience} epochs). " +
                         $"Best genQuality={bestQuality:F3}");
                     break;
                 }
@@ -349,13 +369,12 @@ public sealed class TrainingPipeline : IDisposable
         _placementTrainer.RestoreBestWeights();
 
         // ----------------------------------------------------------------
-        // 6. Save artifacts
+        // 5. Save artifacts
         // ----------------------------------------------------------------
         _placementTrainer.SaveWeights(options.ArtifactsOutputPath);
-        _attributeTrainer.SaveModel(options.ArtifactsOutputPath);
 
         // ----------------------------------------------------------------
-        // 7. Final test-set evaluation
+        // 6. Final test-set evaluation
         // ----------------------------------------------------------------
         if (testEx.Count > 0)
         {
@@ -405,8 +424,7 @@ public sealed class TrainingPipeline : IDisposable
                         cached.Audio,
                         cached.Pair.ReferenceMap.Song,
                         settings,
-                        placementScorer: _placementTrainer,
-                        attributeModel:  _attributeTrainer);
+                        placementScorer: _placementTrainer);
 
                     scores[i] = eval.Evaluate(result.Beatmap, cached.Pair.ReferenceMap).OverallScore;
 
@@ -494,4 +512,26 @@ public sealed class TrainingPipeline : IDisposable
     private static bool ContainsUnpackedMaps(string path) =>
         Directory.Exists(path) &&
         Directory.GetDirectories(path).Any(IsMapFolder);
+
+    /// <summary>
+    /// Ordinary-least-squares slope of a small value series.
+    /// Returns 0 if fewer than 2 points are available.
+    /// Negative slope = values are decreasing (good for loss).
+    /// Positive slope = values are increasing (good for genQ).
+    /// </summary>
+    private static double ComputeLinearSlope(List<double> values)
+    {
+        int n = values.Count;
+        if (n < 2) return 0.0;
+        double sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
+        for (int i = 0; i < n; i++)
+        {
+            sumX  += i;
+            sumY  += values[i];
+            sumXY += i * values[i];
+            sumXX += i * i;
+        }
+        double denom = n * sumXX - sumX * sumX;
+        return denom == 0.0 ? 0.0 : (n * sumXY - sumX * sumY) / denom;
+    }
 }

@@ -29,14 +29,13 @@ public sealed class MapGenerationService
         string audioPath,
         SongMetadata song,
         GenerationSettings settings,
-        IPlacementScorer? placementScorer = null,
-        IAttributeModel?  attributeModel  = null)
+        IPlacementScorer? placementScorer = null)
     {
         Guard.NotNullOrEmpty(audioPath, nameof(audioPath));
         Guard.NotNull(song,     nameof(song));
         Guard.NotNull(settings, nameof(settings));
         var audio = _audioExtractor.Extract(audioPath);
-        return Generate(audio, song, settings, placementScorer, attributeModel);
+        return Generate(audio, song, settings, placementScorer);
     }
 
     /// <summary>
@@ -48,8 +47,7 @@ public sealed class MapGenerationService
         SongMetadata song,
         IReadOnlyList<DifficultyLevel> difficulties,
         GenerationSettings templateSettings,
-        IPlacementScorer? placementScorer = null,
-        IAttributeModel?  attributeModel  = null)
+        IPlacementScorer? placementScorer = null)
     {
         Guard.NotNullOrEmpty(audioPath, nameof(audioPath));
         Guard.NotNull(song, nameof(song));
@@ -61,8 +59,7 @@ public sealed class MapGenerationService
         if (audio.EstimatedBpm > 0)
             song = song with { BeatsPerMinute = audio.EstimatedBpm };
 
-        return GenerateAll(audio, song, difficulties, templateSettings,
-                           placementScorer, attributeModel);
+        return GenerateAll(audio, song, difficulties, templateSettings, placementScorer);
     }
 
     /// <summary>
@@ -74,8 +71,7 @@ public sealed class MapGenerationService
         SongMetadata song,
         IReadOnlyList<DifficultyLevel> difficulties,
         GenerationSettings templateSettings,
-        IPlacementScorer? placementScorer = null,
-        IAttributeModel?  attributeModel  = null)
+        IPlacementScorer? placementScorer = null)
     {
         Guard.NotNull(audio, nameof(audio));
         Guard.NotNull(song, nameof(song));
@@ -87,8 +83,7 @@ public sealed class MapGenerationService
                 audio,
                 song,
                 templateSettings with { TargetDifficulty = diff },
-                placementScorer,
-                attributeModel))
+                placementScorer))
             .ToList();
     }
 
@@ -100,8 +95,7 @@ public sealed class MapGenerationService
         AudioAnalysisResult audio,
         SongMetadata song,
         GenerationSettings settings,
-        IPlacementScorer? placementScorer = null,
-        IAttributeModel?  attributeModel  = null)
+        IPlacementScorer? placementScorer = null)
     {
         Guard.NotNull(audio,    nameof(audio));
         Guard.NotNull(song,     nameof(song));
@@ -111,10 +105,8 @@ public sealed class MapGenerationService
         if (settings.UseLearned && settings.ArtifactsPath is not null)
         {
             neuralModel = NeuralPlacementModel.TryLoad(settings.ArtifactsPath);
-            // Multi-task model covers all roles; only fall back to legacy models if absent
             placementScorer ??= neuralModel
                              ?? (IPlacementScorer?)PlacementModel.TryLoad(settings.ArtifactsPath);
-            attributeModel  ??= neuralModel ?? (IAttributeModel?)AttributeModel.TryLoad(settings.ArtifactsPath);
         }
 
         var grid = _gridBuilder.Build(
@@ -135,7 +127,6 @@ public sealed class MapGenerationService
             Profile         = profile,
             CandidateGrid   = grid,
             PlacementScorer = placementScorer,
-            AttributeModel  = attributeModel,
             NeuralModel     = neuralModel,
             Rng             = new Random((int)settings.RandomSeed)
         };

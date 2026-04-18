@@ -55,6 +55,10 @@ public readonly struct NeuralPlacementContext
     public double LookaheadEnergy { get; init; }  // energy 1 beat ahead [0,1]
     public double LookaheadOnset  { get; init; }  // onset strength 1 beat ahead [0,1]
 
+    // ── hand hint (which hand this note is for) ──
+    // 0.0=left, 1.0=right, 0.5=unknown (default — used when scoring placement before hand assignment)
+    public double NoteHandHint { get; init; } = 0.5;
+
     public NeuralPlacementContext() { }
 
     /// <summary>
@@ -99,6 +103,7 @@ public readonly struct NeuralPlacementContext
         f[32] = Prev2RightCutDir >= 0 ? (float)(Prev2RightCutDir / 8.0) : 0f;
         f[33] = (float)Math.Clamp(LookaheadEnergy, 0.0, 1.0);
         f[34] = (float)Math.Clamp(LookaheadOnset,  0.0, 1.0);
+        f[35] = (float)Math.Clamp(NoteHandHint,    0.0, 1.0);
     }
 
     internal void FillFeatures(double[] f)
@@ -138,5 +143,6 @@ public readonly struct NeuralPlacementContext
         f[32] = Prev2RightCutDir >= 0 ? Prev2RightCutDir / 8.0 : 0.0;
         f[33] = Math.Clamp(LookaheadEnergy, 0.0, 1.0);
         f[34] = Math.Clamp(LookaheadOnset,  0.0, 1.0);
+        f[35] = Math.Clamp(NoteHandHint,    0.0, 1.0);
     }
 }

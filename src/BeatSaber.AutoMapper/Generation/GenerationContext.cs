@@ -13,11 +13,10 @@ public sealed class GenerationContext
     public required TimingCandidate[] CandidateGrid { get; init; }
 
     // Optional learned models — null = fall back to heuristics
-    public IPlacementScorer?    PlacementScorer { get; init; }
-    public IAttributeModel?     AttributeModel  { get; init; }
+    public IPlacementScorer?     PlacementScorer { get; init; }
     /// <summary>
-    /// When a multi-task neural model is available it serves as both placement scorer
-    /// and attribute model. Cached per-beat predictions are stored in ProposedEvent.
+    /// Multi-task neural model — serves as placement scorer and provides cut-direction,
+    /// lane and row distributions. Cached per-beat predictions are stored in ProposedEvent.
     /// </summary>
     public NeuralPlacementModel? NeuralModel { get; init; }
 

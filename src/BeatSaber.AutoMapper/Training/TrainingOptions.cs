@@ -39,7 +39,7 @@ public sealed record TrainingOptions(
         ValidationSongsPerEpoch: 3,
         ValidationCachePoolSize: 3,
         InitialLearningRate: 0.001,
-        EarlyStopPatience: 20,
+        EarlyStopPatience: 50,
         SelfSupervisedWarmupEpochs: 5,
         SelfSupervisedEveryNEpochs: 1,
         SelfSupervisedPositiveWeight: 4.0,

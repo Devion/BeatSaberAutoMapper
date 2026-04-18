@@ -28,35 +28,20 @@ public sealed class NoteAttributeSelector
     private CutDirection SelectCutDirection(
         NoteHand hand, ProposedEvent proposed, GenerationContext ctx)
     {
-        var handCtx = ctx.GetContext(hand);
-        int prevDir = handCtx.LastCutDirection.HasValue ? (int)handCtx.LastCutDirection.Value : -1;
-        int handIdx = hand == NoteHand.Left ? 0 : 1;
-        double beatStrength = ComputeBeatStrength(proposed.Timing.Beat);
-
         // Neural model: sample from learned cut-direction distribution
         if (proposed.NeuralPrediction.HasValue)
         {
             var probs = proposed.NeuralPrediction.Value.CutDirProbs;
             var dir   = (CutDirection)SampleFromProbs(probs, ctx.Rng);
-            if (dir == CutDirection.Dot || IsParityValid(dir, handCtx))
+            if (dir == CutDirection.Dot || IsParityValid(dir, ctx.GetContext(hand)))
                 return dir;
-            // Fallback within neural: find best parity-valid direction
-            var valid = CutDirectionsByParity(handCtx.CurrentParity);
+            // Find best parity-valid direction from neural distribution
+            var valid = CutDirectionsByParity(ctx.GetContext(hand).CurrentParity);
             return valid.OrderByDescending(d => probs[(int)d]).First();
         }
 
-        if (ctx.AttributeModel is not null)
-        {
-            int difficultyLevel = (int)ctx.Profile.Difficulty;
-            var dir = ctx.AttributeModel.SampleCutDirection(prevDir, beatStrength, handIdx,
-                                                            difficultyLevel, ctx.Rng);
-            // Only accept if parity is valid (or it's a dot — always valid)
-            if (dir == CutDirection.Dot || IsParityValid(dir, handCtx))
-                return dir;
-        }
-
-        // Parity-based fallback
-        var candidates = CutDirectionsByParity(handCtx.CurrentParity);
+        // Parity-based fallback (pre-training or no model loaded)
+        var candidates = CutDirectionsByParity(ctx.GetContext(hand).CurrentParity);
         return candidates[ctx.Rng.Next(candidates.Length)];
     }
 
@@ -65,22 +50,11 @@ public sealed class NoteAttributeSelector
         ProposedEvent proposed, GenerationContext ctx)
     {
         // Neural model: sample lane/row from learned distributions with temperature scaling.
-        // Temperature > 1 flattens the softmax so the model explores more positions
-        // rather than always collapsing to the highest-probability lane/row.
         if (proposed.NeuralPrediction.HasValue)
         {
             int lane = SampleFromProbs(proposed.NeuralPrediction.Value.LaneProbs, ctx.Rng, temperature: 1.4);
             int row  = SampleFromProbs(proposed.NeuralPrediction.Value.RowProbs,  ctx.Rng, temperature: 1.3);
             return (lane, row);
-        }
-
-        if (ctx.AttributeModel is not null)
-        {
-            double beatStrength = ComputeBeatStrength(proposed.Timing.Beat);
-            double centroid     = ctx.AudioAnalysis.GetCentroid(proposed.Timing.TimeSeconds);
-            int    handIdx      = hand == NoteHand.Left ? 0 : 1;
-            int    diffLevel    = (int)ctx.Profile.Difficulty;
-            return ctx.AttributeModel.SamplePosition((int)dir, handIdx, beatStrength, centroid, diffLevel, ctx.Rng);
         }
 
         return HeuristicPosition(hand, dir, proposed.Timing, ctx);
@@ -135,13 +109,4 @@ public sealed class NoteAttributeSelector
         parity == ParityClass.Forehand
             ? [CutDirection.Down, CutDirection.DownLeft, CutDirection.DownRight]
             : [CutDirection.Up,   CutDirection.UpLeft,   CutDirection.UpRight, CutDirection.Left, CutDirection.Right];
-
-    private static double ComputeBeatStrength(double beat)
-    {
-        double phase    = beat - Math.Floor(beat);
-        int measure     = ((int)Math.Floor(beat) % 4) + 1;
-        double strength = measure switch { 1 => 1.00, 3 => 0.75, _ => 0.50 };
-        if (phase > 0.01) strength *= 0.5;
-        return strength;
-    }
 }

@@ -18,10 +18,9 @@ public readonly struct NeuralMapPrediction
 
 /// <summary>
 /// Inference-only multi-task neural model backed by <c>neural_placement.pt</c>.
-/// Implements both <see cref="IPlacementScorer"/> and <see cref="IAttributeModel"/>
-/// for use by the generation pipeline on CPU.
+/// Implements <see cref="IPlacementScorer"/> for use by the generation pipeline on CPU.
 /// </summary>
-public sealed class NeuralPlacementModel : IPlacementScorer, IAttributeModel, IDisposable
+public sealed class NeuralPlacementModel : IPlacementScorer, IDisposable
 {
     private readonly BeatSaberMappingNet _net;
 
@@ -96,39 +95,6 @@ public sealed class NeuralPlacementModel : IPlacementScorer, IAttributeModel, ID
             LaneProbs      = ToDoubleArray(lnSm.squeeze(0)),
             RowProbs       = ToDoubleArray(rwSm.squeeze(0)),
         };
-    }
-
-    // ── IAttributeModel ───────────────────────────────────────────────────────
-
-    public CutDirection SampleCutDirection(int prevCutDir, double beatStrength, int hand,
-                                           int difficultyLevel, Random rng)
-    {
-        var ctx = new NeuralPlacementContext
-        {
-            BeatStrength = beatStrength, DifficultyLevel = difficultyLevel,
-            PrevLeftCutDir  = hand == 0 ? prevCutDir : -1,
-            PrevRightCutDir = hand == 1 ? prevCutDir : -1,
-            PrevLeftLane = 1, PrevLeftRow = 1,
-            PrevRightLane = 2, PrevRightRow = 1,
-            BeatsSinceLastLeft = 1, BeatsSinceLastRight = 1,
-            SpectralCentroid = 0.5, SectionProgress = 0.5,
-        };
-        return (CutDirection)SampleFromProbs(PredictAll(in ctx).CutDirProbs, rng);
-    }
-
-    public (int Lane, int Row) SamplePosition(int cutDir, int hand, double beatStrength,
-                                              double spectralCentroid, int difficultyLevel, Random rng)
-    {
-        var ctx = new NeuralPlacementContext
-        {
-            BeatStrength = beatStrength, DifficultyLevel = difficultyLevel,
-            SpectralCentroid = spectralCentroid, SectionProgress = 0.5,
-            PrevLeftLane = 1, PrevLeftRow = 1, PrevLeftCutDir = -1,
-            PrevRightLane = 2, PrevRightRow = 1, PrevRightCutDir = cutDir,
-            BeatsSinceLastLeft = 1, BeatsSinceLastRight = 1,
-        };
-        var pred = PredictAll(in ctx);
-        return (SampleFromProbs(pred.LaneProbs, rng), SampleFromProbs(pred.RowProbs, rng));
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

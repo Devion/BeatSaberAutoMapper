@@ -95,7 +95,6 @@ public sealed class ConstrainedDecoder
             Profile         = original.Profile,
             CandidateGrid   = original.CandidateGrid,
             PlacementScorer = original.PlacementScorer,
-            AttributeModel  = original.AttributeModel,
             Rng             = original.Rng
         };
         clone.PlacedNotes.AddRange(state.Notes);

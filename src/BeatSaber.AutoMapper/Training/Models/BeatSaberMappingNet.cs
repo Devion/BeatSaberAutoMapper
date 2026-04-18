@@ -7,7 +7,7 @@ namespace BeatSaber.AutoMapper.Training.Models;
 
 /// <summary>
 /// Multi-task neural network for Beat Saber note generation.
-/// Architecture: 35 → 1024 → 512 → 256 → 128 trunk (BatchNorm + Dropout) → 5 heads.
+/// Architecture: 36 → 1024 → 512 → 256 → 128 trunk (BatchNorm + Dropout) → 5 heads.
 ///
 /// Forward output is a [B, 18] tensor:
 ///   [B, 0]      placement logit  (sigmoid → P(note here))
@@ -16,7 +16,7 @@ namespace BeatSaber.AutoMapper.Training.Models;
 ///   [B, 11..14] lane logits      (softmax → 4 lanes)
 ///   [B, 15..17] row logits       (softmax → 3 rows)
 ///
-/// Feature layout (35 inputs):
+/// Feature layout (36 inputs):
 ///   [0-22]  original 23 features (rhythm + spectral + sequential note state)
 ///   [23]    EnergyDelta      — normalised rising/falling energy
 ///   [24]    HighBandDelta    — hi-hat/cymbal delta (onset sharpness)
@@ -30,13 +30,14 @@ namespace BeatSaber.AutoMapper.Training.Models;
 ///   [32]    Prev2RightDir    — second-previous right cut direction / 8
 ///   [33]    LookaheadEnergy  — audio energy 1 beat ahead
 ///   [34]    LookaheadOnset   — onset strength 1 beat ahead
+///   [35]    NoteHandHint     — which hand: 0=left, 1=right, 0.5=unknown
 ///
 /// ~740K parameters; float32 .pt file ~2.9 MB.
-/// NOTE: architecture change from 27-input v2 — existing v2 .pt files are NOT compatible.
+/// NOTE: architecture change from 35-input — existing 35-input .pt files are NOT compatible.
 /// </summary>
 internal sealed class BeatSaberMappingNet : Module<Tensor, Tensor>
 {
-    internal const int InputDim = 35;
+    internal const int InputDim = 36;
     internal const int OutDim   = 18;  // 1+1+9+4+3
 
     private const long H1 = 1024, H2 = 512, H3 = 256, H4 = 128;
