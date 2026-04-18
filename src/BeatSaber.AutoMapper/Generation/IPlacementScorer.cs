@@ -14,9 +14,9 @@ public interface IPlacementScorer
     /// <summary>
     /// Extended scoring with full sequential context.
     /// The default implementation delegates to the 7-arg version.
-    /// Neural-network models override this to use all 18 features.
+    /// Neural-network models override this to use all 45 features.
     /// </summary>
     double ScorePlacement(in NeuralPlacementContext ctx) =>
-        ScorePlacement(ctx.Onset, ctx.Energy, ctx.Subdiv, ctx.LocalNps,
+        ScorePlacement(ctx.OnsetStrength, ctx.EnergyLevel, ctx.Subdiv, ctx.LocalNps,
                        ctx.BeatStrength, ctx.MeasureBeat, ctx.DifficultyLevel);
 }

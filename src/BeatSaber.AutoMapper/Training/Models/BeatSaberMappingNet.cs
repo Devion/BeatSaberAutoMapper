@@ -6,81 +6,90 @@ using static TorchSharp.torch.nn;
 namespace BeatSaber.AutoMapper.Training.Models;
 
 /// <summary>
-/// Multi-task neural network for Beat Saber note generation.
-/// Architecture: 36 → 1024 → 512 → 256 → 128 trunk (BatchNorm + Dropout) → 5 heads.
+/// GRU-based multi-task neural network for Beat Saber note generation.
 ///
-/// Forward output is a [B, 18] tensor:
-///   [B, 0]      placement logit  (sigmoid → P(note here))
-///   [B, 1]      hand logit       (sigmoid → P(right hand))
-///   [B, 2..10]  cut-dir logits   (softmax → 9 classes)
-///   [B, 11..14] lane logits      (softmax → 4 lanes)
-///   [B, 15..17] row logits       (softmax → 3 rows)
+/// Architecture: GRU(input=45, hidden=256, layers=2, causal) → MLP(256→128) → 5 heads
 ///
-/// Feature layout (36 inputs):
-///   [0-22]  original 23 features (rhythm + spectral + sequential note state)
-///   [23]    EnergyDelta      — normalised rising/falling energy
-///   [24]    HighBandDelta    — hi-hat/cymbal delta (onset sharpness)
-///   [25]    TimeSinceAnyNote — min(L,R) beats since last note / 8
-///   [26]    SongFraction     — beat / totalBeats (song position context)
-///   [27]    LeftParityState  — arm state after last left swing  (0=FH,1=BH,0.5=unknown)
-///   [28]    RightParityState — arm state after last right swing (0=FH,1=BH,0.5=unknown)
-///   [29]    Prev2LeftHas     — has second-previous left note (0/1)
-///   [30]    Prev2LeftDir     — second-previous left cut direction / 8
-///   [31]    Prev2RightHas    — has second-previous right note (0/1)
-///   [32]    Prev2RightDir    — second-previous right cut direction / 8
-///   [33]    LookaheadEnergy  — audio energy 1 beat ahead
-///   [34]    LookaheadOnset   — onset strength 1 beat ahead
-///   [35]    NoteHandHint     — which hand: 0=left, 1=right, 0.5=unknown
+/// Training: forward(x=[B, SeqLen, D]) → [B*SeqLen, OutDim]  (BPTT over W=16 windows)
+/// Inference: ForwardStep(x=[1,1,D], h=[L,1,H]) → ([1, OutDim], [L,1,H])
 ///
-/// ~740K parameters; float32 .pt file ~2.9 MB.
-/// NOTE: architecture change from 35-input — existing 35-input .pt files are NOT compatible.
+/// Output layout [B*SeqLen, 18]:
+///   [0]      placement logit  (sigmoid → P(note here))
+///   [1]      hand logit       (sigmoid → P(right hand))
+///   [2..10]  cut-dir logits   (softmax → 9 classes)
+///   [11..14] lane logits      (softmax → 4 lanes)
+///   [15..17] row logits       (softmax → 3 rows)
+///
+/// ~540K parameters; float32 .pt file ~2.1 MB.
 /// </summary>
 internal sealed class BeatSaberMappingNet : Module<Tensor, Tensor>
 {
-    internal const int InputDim = 36;
-    internal const int OutDim   = 18;  // 1+1+9+4+3
+    internal const int InputDim    = 45;
+    internal const int GruHiddenDim = 256;
+    internal const int GruLayers   = 2;
+    internal const int MlpHidden   = 128;
+    internal const int OutDim      = 18;   // 1+1+9+4+3
 
-    private const long H1 = 1024, H2 = 512, H3 = 256, H4 = 128;
-
-    private readonly Sequential _trunk;
+    private readonly GRU     _gru;
+    private readonly Linear  _mlpLin;
+    private readonly BatchNorm1d _mlpBn;
+    private readonly Dropout _mlpDrop;
     private readonly Linear _headPl, _headHa, _headCd, _headLn, _headRw;
 
     internal BeatSaberMappingNet() : base(nameof(BeatSaberMappingNet))
     {
-        // hasBias=false because BatchNorm absorbs the bias
-        _trunk = Sequential(
-            ("lin1",  Linear(InputDim, H1, hasBias: false)),
-            ("bn1",   BatchNorm1d(H1)),
-            ("relu1", ReLU()),
-            ("drop1", Dropout(0.20)),
-            ("lin2",  Linear(H1, H2, hasBias: false)),
-            ("bn2",   BatchNorm1d(H2)),
-            ("relu2", ReLU()),
-            ("drop2", Dropout(0.20)),
-            ("lin3",  Linear(H2, H3, hasBias: false)),
-            ("bn3",   BatchNorm1d(H3)),
-            ("relu3", ReLU()),
-            ("drop3", Dropout(0.20)),
-            ("lin4",  Linear(H3, H4, hasBias: false)),
-            ("bn4",   BatchNorm1d(H4)),
-            ("relu4", ReLU())
-        );
-        _headPl = Linear(H4, 1);
-        _headHa = Linear(H4, 1);
-        _headCd = Linear(H4, 9);
-        _headLn = Linear(H4, 4);
-        _headRw = Linear(H4, 3);
+        _gru     = GRU(InputDim, GruHiddenDim, numLayers: GruLayers,
+                       batchFirst: false, dropout: 0.10);
+        _mlpLin  = Linear(GruHiddenDim, MlpHidden, hasBias: false);
+        _mlpBn   = BatchNorm1d(MlpHidden);
+        _mlpDrop = Dropout(0.15);
+        _headPl  = Linear(MlpHidden, 1);
+        _headHa  = Linear(MlpHidden, 1);
+        _headCd  = Linear(MlpHidden, 9);
+        _headLn  = Linear(MlpHidden, 4);
+        _headRw  = Linear(MlpHidden, 3);
         RegisterComponents();
     }
 
+    /// <summary>
+    /// Training forward pass.
+    /// Input x: [B, SeqLen, D]. GRU h0 = zeros.
+    /// Returns: [B*SeqLen, OutDim]
+    /// </summary>
     public override Tensor forward(Tensor x)
     {
-        using var h  = _trunk.forward(x);
-        using var pl = _headPl.forward(h);   // [B, 1]
-        using var ha = _headHa.forward(h);   // [B, 1]
-        using var cd = _headCd.forward(h);   // [B, 9]
-        using var ln = _headLn.forward(h);   // [B, 4]
-        using var rw = _headRw.forward(h);   // [B, 3]
-        return cat(new[] { pl, ha, cd, ln, rw }, dim: 1);  // [B, 18]
+        long B = x.shape[0], S = x.shape[1];
+        // GRU expects [SeqLen, Batch, D] when batchFirst=false
+        using var xT = x.permute(1, 0, 2);           // [S, B, D]
+        var (gruOut, _) = _gru.forward(xT, null);    // gruOut: [S, B, H]
+        using var gruT = gruOut.permute(1, 0, 2);    // [B, S, H]
+        using var flat = gruT.reshape(B * S, GruHiddenDim);  // [B*S, H]
+        return ApplyMlpAndHeads(flat);
+    }
+
+    /// <summary>
+    /// Single-step inference. Input x: [1, 1, D], h: [GruLayers, 1, H].
+    /// Returns (output: [1, OutDim], newHidden: [GruLayers, 1, H]).
+    /// </summary>
+    internal (Tensor output, Tensor newHidden) ForwardStep(Tensor x, Tensor h)
+    {
+        // x is [1, 1, D] in [B=1, S=1, D] format → need [S=1, B=1, D] for GRU
+        using var xT = x.permute(1, 0, 2);         // [1, 1, D]
+        var (gruOut, hn) = _gru.forward(xT, h);    // gruOut: [1, 1, H], hn: [L, 1, H]
+        using var flat = gruOut.squeeze(0);         // [1, H]
+        var output = ApplyMlpAndHeads(flat);        // [1, OutDim]
+        return (output, hn);
+    }
+
+    private Tensor ApplyMlpAndHeads(Tensor flat)
+    {
+        using var h   = _mlpDrop.forward(functional.relu(_mlpBn.forward(_mlpLin.forward(flat))));
+        using var pl  = _headPl.forward(h);   // [N, 1]
+        using var ha  = _headHa.forward(h);   // [N, 1]
+        using var cd  = _headCd.forward(h);   // [N, 9]
+        using var ln  = _headLn.forward(h);   // [N, 4]
+        using var rw  = _headRw.forward(h);   // [N, 3]
+        return cat(new[] { pl, ha, cd, ln, rw }, dim: 1);  // [N, 18]
     }
 }
+

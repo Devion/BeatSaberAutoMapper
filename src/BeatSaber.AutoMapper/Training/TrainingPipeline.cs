@@ -113,12 +113,13 @@ public sealed class TrainingPipeline : IDisposable
 
         // ----------------------------------------------------------------
         // 3. Build training examples — parallel across trainFolders only
+        // Each (folder, difficulty) pair becomes one sequence (beat-ordered).
         // ----------------------------------------------------------------
         Console.WriteLine(
             $"[Training] Building examples from {trainFolders.Length} train folders " +
             $"using {Environment.ProcessorCount} threads...");
 
-        var allExamples  = new List<TrainingExample>();
+        var allSequences = new List<List<TrainingExample>>();
         var printLock    = new object();
         int doneCount    = 0;
         var listLock     = new object();
@@ -126,8 +127,8 @@ public sealed class TrainingPipeline : IDisposable
         Parallel.ForEach(
             trainFolders,
             new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount },
-            () => new List<TrainingExample>(),       // thread-local list
-            (folder, _, localList) =>
+            () => new List<List<TrainingExample>>(),
+            (folder, _, localSeqs) =>
             {
                 try
                 {
@@ -138,22 +139,23 @@ public sealed class TrainingPipeline : IDisposable
                         double bpm      = map.Song.BeatsPerMinute > 0 ? map.Song.BeatsPerMinute : 120.0;
                         double lastBeat = map.Notes.Count > 0 ? map.Notes[^1].Beat : 0;
 
-                        // Synthesise pseudo-onsets from note positions so wOnset receives a
-                        // meaningful gradient: beats where notes exist ≈ musical events.
                         double[] onsets = map.Notes
                             .Select(n => MathHelpers.BeatToSeconds(n.Beat, bpm))
                             .Distinct()
                             .OrderBy(t => t)
                             .ToArray();
 
-                        localList.AddRange(builder.Build(map, new AudioAnalysisResult
+                        var examples = builder.Build(map, new AudioAnalysisResult
                         {
                             EstimatedBpm      = bpm,
                             DurationSeconds   = MathHelpers.BeatToSeconds(lastBeat + 4.0, bpm),
                             FrameRateHz       = 43.0,
                             SampleRate        = 22050,
-                            OnsetTimesSeconds = onsets   // pseudo-onsets from note positions
-                        }));
+                            OnsetTimesSeconds = onsets
+                        });
+
+                        if (examples.Count > 0)
+                            localSeqs.Add(new List<TrainingExample>(examples));
                     }
                 }
                 catch (Exception ex)
@@ -167,17 +169,19 @@ public sealed class TrainingPipeline : IDisposable
                     lock (printLock)
                         Console.WriteLine($"[Training]   {n}/{trainFolders.Length} folders processed...");
 
-                return localList;
+                return localSeqs;
             },
-            localList =>
+            localSeqs =>
             {
-                lock (listLock) allExamples.AddRange(localList);
+                lock (listLock) allSequences.AddRange(localSeqs);
             });
 
-        Console.WriteLine($"[Training] Built {allExamples.Count} training examples.");
-        if (allExamples.Count == 0) return;
+        int totalExamples = allSequences.Sum(s => s.Count);
+        Console.WriteLine(
+            $"[Training] Built {totalExamples} training examples in {allSequences.Count} sequences.");
+        if (allSequences.Count == 0) return;
 
-        var trainEx = allExamples;
+        var trainSeqs = allSequences;
 
         // Build test examples from held-out test folders (used only for final evaluation)
         var testEx = testFolders.Length > 0
@@ -273,16 +277,15 @@ public sealed class TrainingPipeline : IDisposable
             : Math.Max(1, options.EarlyStopPatience / 5);
 
         Console.WriteLine(
-            $"[Training] Training neural placement model {BeatSaberMappingNet.InputDim}→1024→512→256→128 ({options.Epochs} epochs max, " +
-            $"Adam lr={lr:G4}, patience={options.EarlyStopPatience}, lr-patience={lrPatience})...[warmStart={warmStarted}]");
+            $"[Training] Training GRU placement model {BeatSaberMappingNet.InputDim}→GRU({BeatSaberMappingNet.GruHiddenDim}×{BeatSaberMappingNet.GruLayers})→{BeatSaberMappingNet.MlpHidden} " +
+            $"({options.Epochs} epochs max, Adam lr={lr:G4}, patience={options.EarlyStopPatience}, lr-patience={lrPatience})...[warmStart={warmStarted}]");
 
         double bestQuality     = -1.0;
         double smoothedQuality = -1.0;
-        const double EmaAlpha  = 0.4;   // for display only
-        int    stagnationEpochs = 0;    // trend-based; only increments when both loss+genQ are flat
+        const double EmaAlpha  = 0.4;
+        int    stagnationEpochs = 0;
         int    lrReductions     = 0;
 
-        // Sliding window for trend detection (last SlopeWindow epochs)
         const int SlopeWindow = 10;
         var lossHistory = new List<double>(SlopeWindow + 1);
         var genQHistory = new List<double>(SlopeWindow + 1);
@@ -291,18 +294,19 @@ public sealed class TrainingPipeline : IDisposable
 
         var epochRng = new Random((int)(options.RandomSeed & int.MaxValue));
 
-        // Self-supervised synthetic examples — refreshed each epoch after warmup
-        var currentSynthetics = new List<TrainingExample>();
+        // Self-supervised synthetic examples — refreshed each epoch after warmup.
+        // Stored as single-step sequences (sorted by beat within each synthetic batch).
+        var currentSyntheticSeqs = new List<List<TrainingExample>>();
 
         for (int epoch = 0; epoch < options.Epochs; epoch++)
         {
-            // Shuffle real examples and optionally merge with synthetic pool
-            var shuffled = FisherYatesShuffle(trainEx, epochRng.Next());
+            // Shuffle sequences (not individual examples) each epoch
+            var shuffledSeqs = FisherYatesShuffleSeqs(trainSeqs, epochRng.Next());
 
-            if (currentSynthetics.Count > 0 && epoch >= options.SelfSupervisedWarmupEpochs)
-                shuffled = MergeWithSynthetics(shuffled, currentSynthetics, epochRng.Next());
+            if (currentSyntheticSeqs.Count > 0 && epoch >= options.SelfSupervisedWarmupEpochs)
+                shuffledSeqs = MergeSequences(shuffledSeqs, currentSyntheticSeqs, epochRng.Next());
 
-            var (loss, plBce) = _placementTrainer.TrainEpoch(shuffled, lr);
+            var (loss, plBce) = _placementTrainer.TrainEpoch(shuffledSeqs, lr);
 
             double qualityScore = 0;
             if (cachedPairs.Length > 0)
@@ -320,9 +324,10 @@ public sealed class TrainingPipeline : IDisposable
                     Console.WriteLine($"[Training]   genQ by diff: {string.Join("  ", parts)}");
                 }
 
-                // Refresh synthetic pool on the configured cadence
+                // Refresh synthetic pool on the configured cadence.
+                // Each batch from a generated map becomes one sequence (sorted by beat).
                 if ((epoch + 1) % Math.Max(1, options.SelfSupervisedEveryNEpochs) == 0)
-                    currentSynthetics = new List<TrainingExample>(newSynthetics);
+                    currentSyntheticSeqs = WrapAsSingleSequences(newSynthetics);
             }
 
             // ── Improvement check (raw quality) ──────────────────────────────────
@@ -373,7 +378,7 @@ public sealed class TrainingPipeline : IDisposable
                 $"loss={loss:F4}  plBCE={plBce:F4}  " +
                 $"genQ={qualityScore:F3}  best={bestQuality:F3}  sm={smoothedQuality:F3}  lr={lr:G4}" +
                 $"  lSlp={lossSlope:+0.0000;-0.0000}  qSlp={genQSlope:+0.0000;-0.0000}" +
-                (currentSynthetics.Count > 0 ? $"  synthEx={currentSynthetics.Count}" : string.Empty) +
+                (currentSyntheticSeqs.Count > 0 ? $"  synthEx={currentSyntheticSeqs.Sum(s => s.Count)}" : string.Empty) +
                 statusTag);
 
             // ── Stagnation-driven LR reduction and early stop ────────────────────
@@ -500,6 +505,50 @@ public sealed class TrainingPipeline : IDisposable
     // Helpers
     // ----------------------------------------------------------------
 
+    /// <summary>Fisher-Yates in-place shuffle of sequences (not individual examples).</summary>
+    private static List<List<TrainingExample>> FisherYatesShuffleSeqs(
+        List<List<TrainingExample>> source, int seed)
+    {
+        var copy = new List<List<TrainingExample>>(source);
+        var rng  = new Random(seed);
+        for (int i = copy.Count - 1; i > 0; i--)
+        {
+            int j = rng.Next(i + 1);
+            (copy[i], copy[j]) = (copy[j], copy[i]);
+        }
+        return copy;
+    }
+
+    /// <summary>Merge real sequences with synthetic sequences and shuffle the combined list.</summary>
+    private static List<List<TrainingExample>> MergeSequences(
+        List<List<TrainingExample>> real,
+        List<List<TrainingExample>> synthetics,
+        int seed)
+    {
+        var merged = new List<List<TrainingExample>>(real.Count + synthetics.Count);
+        merged.AddRange(real);
+        merged.AddRange(synthetics);
+        var rng = new Random(seed);
+        for (int i = merged.Count - 1; i > 0; i--)
+        {
+            int j = rng.Next(i + 1);
+            (merged[i], merged[j]) = (merged[j], merged[i]);
+        }
+        return merged;
+    }
+
+    /// <summary>
+    /// Wraps a flat list of self-supervised examples into sequences (one sequence,
+    /// sorted by beat, so GRU has sensible ordering even without song partitioning).
+    /// </summary>
+    private static List<List<TrainingExample>> WrapAsSingleSequences(
+        IReadOnlyList<TrainingExample> examples)
+    {
+        if (examples.Count == 0) return [];
+        var sorted = examples.OrderBy(e => e.Beat).ToList();
+        return [sorted];
+    }
+
     /// <summary>Fisher-Yates in-place shuffle of a copy, using the given seed.</summary>
     private static List<TrainingExample> FisherYatesShuffle(List<TrainingExample> source, int seed)
     {
@@ -589,30 +638,6 @@ public sealed class TrainingPipeline : IDisposable
             (arr[i], arr[j]) = (arr[j], arr[i]);
         }
         return arr[..k];
-    }
-
-    /// <summary>
-    /// Merge real and synthetic examples into a single shuffled list.
-    /// Synthetic examples carry elevated Weight, so interleaving ensures
-    /// their gradients are spread across all batches rather than concentrated
-    /// at the end.
-    /// </summary>
-    private static List<TrainingExample> MergeWithSynthetics(
-        List<TrainingExample> real,
-        IReadOnlyList<TrainingExample> synthetics,
-        int seed)
-    {
-        var merged = new List<TrainingExample>(real.Count + synthetics.Count);
-        merged.AddRange(real);
-        merged.AddRange(synthetics);
-
-        var rng = new Random(seed);
-        for (int i = merged.Count - 1; i > 0; i--)
-        {
-            int j = rng.Next(i + 1);
-            (merged[i], merged[j]) = (merged[j], merged[i]);
-        }
-        return merged;
     }
 
     private static bool IsMapFolder(string path) =>

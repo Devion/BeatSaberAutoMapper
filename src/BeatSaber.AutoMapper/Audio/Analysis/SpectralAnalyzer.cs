@@ -23,6 +23,22 @@ public sealed class SpectralAnalyzer
         public float[] HighBandEnergy { get; init; } = [];
         /// <summary>Normalised spectral centroid 0-1 (0=bass, 1=treble).</summary>
         public float[] SpectralCentroid { get; init; } = [];
+        /// <summary>
+        /// Normalised spectral flux: sum of positive spectral magnitude differences
+        /// between consecutive frames. High = rapid spectral change / onset transient.
+        /// </summary>
+        public float[] SpectralFlux { get; init; } = [];
+        /// <summary>
+        /// Normalised transient strength: high-frequency flux relative to total flux.
+        /// High = sharp percussive attack (kick, snare, hi-hat hit).
+        /// </summary>
+        public float[] TransientStrength { get; init; } = [];
+        /// <summary>
+        /// Continuous onset strength envelope: smoothed sum of positive spectral flux,
+        /// equivalent to a standard half-wave rectified flux onset function.
+        /// Higher resolution than the binary OnsetTimesSeconds.
+        /// </summary>
+        public float[] OnsetStrengthEnvelope { get; init; } = [];
         public double FrameRateHz { get; init; }
     }
 
@@ -33,13 +49,18 @@ public sealed class SpectralAnalyzer
         var mid      = new float[numFrames];
         var high     = new float[numFrames];
         var centroid = new float[numFrames];
+        var flux     = new float[numFrames];
+        var transient= new float[numFrames];
+        var onsetEnv = new float[numFrames];
 
         int half = FrameSize / 2 + 1;
         int binLow  = FreqToBin(LowMaxHz,  sampleRate);
         int binMid  = FreqToBin(MidMaxHz,  sampleRate);
 
-        var re = new double[FrameSize];
-        var im = new double[FrameSize];
+        var re  = new double[FrameSize];
+        var im  = new double[FrameSize];
+        // Store previous frame magnitude spectrum for flux computation
+        var prevMag = new double[half];
 
         for (int f = 0; f < numFrames; f++)
         {
@@ -57,9 +78,10 @@ public sealed class SpectralAnalyzer
 
             Fft(re, im);
 
-            // Compute bands from magnitude spectrum
+            // Compute bands, centroid, and spectral flux from magnitude spectrum
             double sumLow = 0, sumMid = 0, sumHigh = 0;
             double sumMag = 0, sumWeighted = 0;
+            double fluxTotal = 0, fluxHigh = 0;
 
             for (int k = 1; k < half; k++)
             {
@@ -70,26 +92,44 @@ public sealed class SpectralAnalyzer
 
                 sumMag      += mag;
                 sumWeighted += k * mag;
+
+                // Half-wave rectified spectral flux: only positive increases
+                double diff = mag - prevMag[k];
+                if (diff > 0)
+                {
+                    fluxTotal += diff;
+                    if (k > binMid) fluxHigh += diff;  // high-freq transient component
+                }
+                prevMag[k] = mag;
             }
 
-            low[f]      = (float)sumLow;
-            mid[f]      = (float)sumMid;
-            high[f]     = (float)sumHigh;
-            centroid[f] = sumMag > 0 ? (float)(sumWeighted / (sumMag * half)) : 0f;
+            low[f]       = (float)sumLow;
+            mid[f]       = (float)sumMid;
+            high[f]      = (float)sumHigh;
+            centroid[f]  = sumMag > 0 ? (float)(sumWeighted / (sumMag * half)) : 0f;
+            flux[f]      = (float)fluxTotal;
+            transient[f] = fluxTotal > 0 ? (float)(fluxHigh / fluxTotal) : 0f;
+            onsetEnv[f]  = (float)fluxTotal;  // same as flux before normalisation, smoothed below
         }
 
         Normalize(low);
         Normalize(mid);
         Normalize(high);
         // centroid is already 0-1 by construction
+        // transient is already 0-1 (ratio)
+        Normalize(flux);
+        Normalize(onsetEnv);
 
         return new SpectralFrames
         {
-            LowBandEnergy   = low,
-            MidBandEnergy   = mid,
-            HighBandEnergy  = high,
-            SpectralCentroid = centroid,
-            FrameRateHz     = sampleRate / (double)HopSize
+            LowBandEnergy        = low,
+            MidBandEnergy        = mid,
+            HighBandEnergy       = high,
+            SpectralCentroid     = centroid,
+            SpectralFlux         = flux,
+            TransientStrength    = transient,
+            OnsetStrengthEnvelope = onsetEnv,
+            FrameRateHz          = sampleRate / (double)HopSize
         };
     }
 

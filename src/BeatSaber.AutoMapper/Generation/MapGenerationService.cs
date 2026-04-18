@@ -1,6 +1,7 @@
 using BeatSaber.AutoMapper.Audio;
 using BeatSaber.AutoMapper.Audio.Features;
 using BeatSaber.AutoMapper.Generation.Decoding;
+using BeatSaber.AutoMapper.Training.Models;
 using BeatSaber.AutoMapper.Utilities;
 using BeatSaber.AutoMapper.Validation;
 using BeatSaber.AutoMapper.Validation.Repair;
@@ -128,7 +129,10 @@ public sealed class MapGenerationService
             CandidateGrid   = grid,
             PlacementScorer = placementScorer,
             NeuralModel     = neuralModel,
-            Rng             = new Random((int)settings.RandomSeed)
+            Rng             = new Random((int)settings.RandomSeed),
+            GruHiddenState  = neuralModel is not null
+                ? new GruState(BeatSaberMappingNet.GruLayers, BeatSaberMappingNet.GruHiddenDim)
+                : null
         };
 
         var proposed = _proposer.ProposeEvents(ctx);

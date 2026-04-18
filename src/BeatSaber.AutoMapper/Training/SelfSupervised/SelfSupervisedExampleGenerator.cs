@@ -1,4 +1,5 @@
 using BeatSaber.AutoMapper.Audio;
+using BeatSaber.AutoMapper.Canonical;
 using BeatSaber.AutoMapper.Training.Features;
 using BeatSaber.AutoMapper.Utilities;
 
@@ -171,62 +172,71 @@ public sealed class SelfSupervisedExampleGenerator
         int noteHand = -1, int noteLane = -1, int noteRow = -1, int noteCutDir = -1)
     {
         double frac   = beat - Math.Floor(beat);
-        double subdiv = frac < 0.01 ? 1.0
-                      : Math.Abs(frac - 0.5) < 0.01 ? 0.5
-                      : 0.25;
+        double subdiv = frac < 0.01 ? 1.0 : Math.Abs(frac - 0.5) < 0.01 ? 0.5 : 0.25;
 
         int    mb       = ((int)Math.Floor(beat) % 4) + 1;
         double strength = mb switch { 1 => 1.00, 3 => 0.75, 2 or 4 => 0.50, _ => 0.50 };
         if (frac > 0.01) strength *= 0.5;
 
         double energy  = audio.GetEnergy(timeSeconds);
-        double onset   = GetOnsetStrength(timeSeconds, audio);
+        double onset   = audio.GetOnsetStrength(timeSeconds);
+        double flux    = audio.GetSpectralFlux(timeSeconds);
+        double trans   = audio.GetTransient(timeSeconds);
 
-        // Derived temporal features
         double prevTime      = Math.Max(0, timeSeconds - 0.1);
         double prevEnergy    = audio.GetEnergy(prevTime);
         double prevHighBand  = audio.GetHighBand(prevTime);
         double energyMax     = Math.Max(0.01, Math.Max(energy, prevEnergy));
         double energyDelta   = Math.Clamp((energy - prevEnergy) / energyMax, -1.0, 1.0);
         double highBandDelta = Math.Clamp(audio.GetHighBand(timeSeconds) - prevHighBand, -1.0, 1.0);
-        double songFraction  = songDurationBeats > 0
-            ? Math.Clamp(beat / songDurationBeats, 0.0, 1.0) : 0.0;
+        double energyTrend4  = audio.GetMeanEnergyBeforeBeats(timeSeconds, bpm, 4);
+        double energyTrend8  = audio.GetMeanEnergyBeforeBeats(timeSeconds, bpm, 8);
+        double songFraction  = songDurationBeats > 0 ? Math.Clamp(beat / songDurationBeats, 0.0, 1.0) : 0.0;
+        double barPosition   = (beat % 4) / 4.0;
 
-        // Lookahead audio (1 beat ahead)
-        double lookaheadTime   = Math.Min(timeSeconds + MathHelpers.BeatToSeconds(1.0, bpm),
-                                          audio.DurationSeconds);
+        double lookaheadTime   = Math.Min(timeSeconds + MathHelpers.BeatToSeconds(1.0, bpm), audio.DurationSeconds);
         double lookaheadEnergy = audio.GetEnergy(lookaheadTime);
-        double lookaheadOnset  = GetOnsetStrength(lookaheadTime, audio);
+        double lookaheadOnset  = audio.GetOnsetStrength(lookaheadTime);
+
+        int sectionTypeIdx     = GetSectionTypeIndex(timeSeconds, audio);
+        double sectionProgress = GetSectionProgress(timeSeconds, audio);
 
         return new TrainingExample(
             Beat:                   beat,
-            SubdivisionDenominator: subdiv,
             OnsetStrength:          onset,
             EnergyLevel:            energy,
-            LocalNps:               localNps,
-            SectionProgress:        GetSectionProgress(timeSeconds, audio),
-            BeatPhase:              frac,
-            BeatStrength:           strength,
-            MeasureBeat:            mb,
-            DifficultyLevel:        difficultyLevel,
-            PreviousLeftLane:       1,
-            PreviousLeftRow:        1,
-            PreviousLeftCutDir:     -1,
-            PreviousRightLane:      2,
-            PreviousRightRow:       1,
-            PreviousRightCutDir:    -1,
-            BeatsSinceLastLeft:     999,
-            BeatsSinceLastRight:    999,
+            SpectralFlux:           flux,
+            TransientStrength:      trans,
             LowBandEnergy:          audio.GetLowBand(timeSeconds),
             MidBandEnergy:          audio.GetMidBand(timeSeconds),
             HighBandEnergy:         audio.GetHighBand(timeSeconds),
             SpectralCentroid:       audio.GetCentroid(timeSeconds),
             EnergyDelta:            energyDelta,
             HighBandDelta:          highBandDelta,
-            TimeSinceAnyNote:       0.5,   // prior-note context unavailable in self-supervised pass
-            SongFraction:           songFraction,
+            EnergyTrend4:           energyTrend4,
+            EnergyTrend8:           energyTrend8,
             LookaheadEnergy:        lookaheadEnergy,
             LookaheadOnset:         lookaheadOnset,
+            BeatPhase:              frac,
+            SubdivisionDenominator: subdiv,
+            BeatStrength:           strength,
+            MeasureBeat:            mb,
+            SongFraction:           songFraction,
+            SectionProgress:        sectionProgress,
+            SectionTypeIndex:       sectionTypeIdx,
+            DifficultyLevel:        difficultyLevel,
+            LocalNps:               localNps,
+            BarPosition:            barPosition,
+            PreviousLeftLane:       1,
+            PreviousLeftRow:        1,
+            PreviousLeftCutDir:     -1,
+            PreviousRightLane:      2,
+            PreviousRightRow:       1,
+            PreviousRightCutDir:    -1,
+            LeftParityState:        0.5,
+            RightParityState:       0.5,
+            BeatsSinceLastLeft:     999,
+            BeatsSinceLastRight:    999,
             HasNote:                hasNote,
             NoteHand:               noteHand,
             NoteLane:               noteLane,
@@ -235,12 +245,24 @@ public sealed class SelfSupervisedExampleGenerator
             Weight:                 weight);
     }
 
-    private static double GetOnsetStrength(double timeSeconds, AudioAnalysisResult audio)
+    private static int GetSectionTypeIndex(double timeSeconds, AudioAnalysisResult audio)
     {
-        const double window = 0.05;
-        foreach (double o in audio.OnsetTimesSeconds)
-            if (Math.Abs(o - timeSeconds) < window) return 1.0;
-        return 0.0;
+        if (audio.Sections.Count == 0) return 7;
+        SectionMarker? current = null;
+        foreach (var s in audio.Sections)
+            if (s.TimeSeconds <= timeSeconds) current = s;
+        if (current is null) return 7;
+        return current.Type switch
+        {
+            SectionType.Intro   => 0,
+            SectionType.Verse   => 1,
+            SectionType.Chorus  => 2,
+            SectionType.Bridge  => 3,
+            SectionType.Buildup => 4,
+            SectionType.Drop    => 5,
+            SectionType.Outro   => 6,
+            _                   => 7
+        };
     }
 
     private static double GetSectionProgress(double timeSeconds, AudioAnalysisResult audio)

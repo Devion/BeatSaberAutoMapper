@@ -43,10 +43,13 @@ public sealed class AudioFeatureExtractor
             EnergyEnvelope   = energyRaw.Select(f => (double)f).ToArray(),
             Sections         = sections,
             FrameRateHz      = frameRate,
-            LowBandEnergy    = ResampleToLength(spectral.LowBandEnergy,   targetLen),
-            MidBandEnergy    = ResampleToLength(spectral.MidBandEnergy,   targetLen),
-            HighBandEnergy   = ResampleToLength(spectral.HighBandEnergy,  targetLen),
-            SpectralCentroid = ResampleToLength(spectral.SpectralCentroid, targetLen),
+            LowBandEnergy    = ResampleToLength(spectral.LowBandEnergy,          targetLen),
+            MidBandEnergy    = ResampleToLength(spectral.MidBandEnergy,          targetLen),
+            HighBandEnergy   = ResampleToLength(spectral.HighBandEnergy,         targetLen),
+            SpectralCentroid = ResampleToLength(spectral.SpectralCentroid,       targetLen),
+            SpectralFlux     = ResampleToLength(spectral.SpectralFlux,           targetLen),
+            TransientStrength = ResampleToLength(spectral.TransientStrength,     targetLen),
+            OnsetStrengthEnvelope = ResampleToLength(spectral.OnsetStrengthEnvelope, targetLen),
         };
     }
 

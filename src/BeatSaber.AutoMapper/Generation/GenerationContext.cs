@@ -25,6 +25,13 @@ public sealed class GenerationContext
     public SwingContext RightHandContext { get; } = new(NoteHand.Right);
     public Random Rng { get; init; } = new(42);
 
+    /// <summary>
+    /// GRU hidden state for the neural placement model.
+    /// Created before generation begins, updated at each beat step.
+    /// Null when running without a neural model.
+    /// </summary>
+    public GruState? GruHiddenState { get; set; }
+
     public SwingContext GetContext(NoteHand hand) =>
         hand == NoteHand.Left ? LeftHandContext : RightHandContext;
 }
