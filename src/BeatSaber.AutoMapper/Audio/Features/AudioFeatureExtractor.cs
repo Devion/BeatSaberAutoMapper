@@ -19,12 +19,22 @@ public sealed class AudioFeatureExtractor
         Guard.NotNullOrEmpty(audioFilePath, nameof(audioFilePath));
 
         var (samples, sampleRate, duration) = AudioDecoder.Decode(audioFilePath);
-        var (bpm, confidence) = _bpmEstimator.Estimate(samples, sampleRate);
-        double[] beatTimes  = _beatTracker.TrackBeats(samples, sampleRate, bpm);
-        double[] onsetTimes = _onsetDetector.DetectOnsets(samples, sampleRate);
-        float[] energyRaw   = ComputeEnergyEnvelope(samples, HopSize);
-        var sections        = _sectionSegmenter.Segment(samples, sampleRate, beatTimes, bpm);
-        var spectral        = _spectral.Analyze(samples, sampleRate);
+
+        // Phase 1: all steps that depend only on raw samples — run in parallel.
+        double bpm = 0, confidence = 0;
+        double[] onsetTimes = [];
+        float[] energyRaw = [];
+        SpectralAnalyzer.SpectralFrames spectral = null!;
+
+        Parallel.Invoke(
+            () => (bpm, confidence) = _bpmEstimator.Estimate(samples, sampleRate),
+            () => onsetTimes         = _onsetDetector.DetectOnsets(samples, sampleRate),
+            () => energyRaw          = ComputeEnergyEnvelope(samples, HopSize),
+            () => spectral           = _spectral.Analyze(samples, sampleRate));
+
+        // Phase 2: sequential — BeatTracker needs bpm, SectionSegmenter needs beatTimes.
+        double[] beatTimes = _beatTracker.TrackBeats(samples, sampleRate, bpm);
+        var sections       = _sectionSegmenter.Segment(samples, sampleRate, beatTimes, bpm);
 
         // Align spectral arrays to the energy-envelope length by resampling if needed
         double frameRate = sampleRate / (double)HopSize;

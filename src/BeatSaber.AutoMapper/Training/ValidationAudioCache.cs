@@ -6,10 +6,16 @@ namespace BeatSaber.AutoMapper.Training;
 /// <summary>
 /// Persists audio analysis results to disk so validation songs are not
 /// re-analysed on every training run restart. Cache entries are invalidated
-/// automatically when the source audio file's last-write time changes.
+/// automatically when the source audio file's last-write time changes,
+/// or when the schema version is bumped (e.g. after adding new feature arrays).
 /// </summary>
 internal sealed class ValidationAudioCache
 {
+    // Bump this string whenever the AudioAnalysisResult schema changes
+    // (new arrays added, serialization format changed, etc.).
+    // Any cache file whose Version != CacheVersion is automatically discarded.
+    private const string CacheVersion = "v3";
+
     private readonly string _cacheDir;
 
     public ValidationAudioCache(string artifactsPath)
@@ -29,6 +35,7 @@ internal sealed class ValidationAudioCache
             var envelope = JsonSerializer.Deserialize<CacheEnvelope>(
                 File.ReadAllText(cachePath), SerializerOptions);
             if (envelope?.Result is null) return null;
+            if (envelope.Version != CacheVersion) return null;
 
             long lastWrite = File.GetLastWriteTimeUtc(audioFilePath).Ticks;
             if (envelope.SourceLastWriteTicks != lastWrite) return null;
@@ -48,6 +55,7 @@ internal sealed class ValidationAudioCache
         {
             var envelope = new CacheEnvelope
             {
+                Version              = CacheVersion,
                 SourceLastWriteTicks = File.GetLastWriteTimeUtc(audioFilePath).Ticks,
                 Result               = result,
             };
@@ -74,6 +82,7 @@ internal sealed class ValidationAudioCache
 
     private sealed class CacheEnvelope
     {
+        public string?            Version              { get; set; }
         public long               SourceLastWriteTicks { get; set; }
         public AudioAnalysisResult? Result             { get; set; }
     }

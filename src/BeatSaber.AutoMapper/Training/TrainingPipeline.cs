@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using BeatSaber.AutoMapper.Audio;
 using BeatSaber.AutoMapper.Audio.Features;
 using BeatSaber.AutoMapper.Beatmap;
@@ -116,13 +117,18 @@ public sealed class TrainingPipeline : IDisposable
         // Each (folder, difficulty) pair becomes one sequence (beat-ordered).
         // ----------------------------------------------------------------
         Console.WriteLine(
-            $"[Training] Building examples from {trainFolders.Length} train folders " +
-            $"using {Environment.ProcessorCount} threads...");
+            $"[Training] Analysing audio + building examples from {trainFolders.Length} train folders " +
+            $"using {Environment.ProcessorCount} threads (audio cached to disk)...");
 
-        var allSequences = new List<List<TrainingExample>>();
-        var printLock    = new object();
-        int doneCount    = 0;
-        var listLock     = new object();
+        var allSequences   = new List<List<TrainingExample>>();
+        var printLock      = new object();
+        int doneCount      = 0;
+        var listLock       = new object();
+        var buildStopwatch = Stopwatch.StartNew();
+
+        // Separate cache directory for training audio (never touches the validation cache).
+        var trainAudioCache = new ValidationAudioCache(
+            Path.Combine(options.ArtifactsOutputPath, "training_audio_cache"));
 
         Parallel.ForEach(
             trainFolders,
@@ -132,28 +138,29 @@ public sealed class TrainingPipeline : IDisposable
             {
                 try
                 {
-                    var maps    = BeatmapImporter.Import(folder);
+                    var maps = BeatmapImporter.Import(folder);
+                    if (maps.Count == 0) return localSeqs;
+
+                    // Resolve and analyse the audio file (cached after first run).
+                    string? audioPath = FindAudioFile(folder);
+                    AudioAnalysisResult? audio = null;
+                    if (audioPath != null)
+                    {
+                        audio = trainAudioCache.TryLoad(audioPath);
+                        if (audio is null)
+                        {
+                            audio = new AudioFeatureExtractor().Extract(audioPath);
+                            trainAudioCache.Store(audioPath, audio);
+                        }
+                    }
+
                     var builder = new TrainingExampleBuilder();
                     foreach (var map in maps)
                     {
-                        double bpm      = map.Song.BeatsPerMinute > 0 ? map.Song.BeatsPerMinute : 120.0;
-                        double lastBeat = map.Notes.Count > 0 ? map.Notes[^1].Beat : 0;
-
-                        double[] onsets = map.Notes
-                            .Select(n => MathHelpers.BeatToSeconds(n.Beat, bpm))
-                            .Distinct()
-                            .OrderBy(t => t)
-                            .ToArray();
-
-                        var examples = builder.Build(map, new AudioAnalysisResult
-                        {
-                            EstimatedBpm      = bpm,
-                            DurationSeconds   = MathHelpers.BeatToSeconds(lastBeat + 4.0, bpm),
-                            FrameRateHz       = 43.0,
-                            SampleRate        = 22050,
-                            OnsetTimesSeconds = onsets
-                        });
-
+                        // Fall back to stub audio (zeros for spectral features) when the
+                        // audio file is missing — better than skipping the map entirely.
+                        var audioForMap = audio ?? MakeStubAudio(map);
+                        var examples    = builder.Build(map, audioForMap);
                         if (examples.Count > 0)
                             localSeqs.Add(new List<TrainingExample>(examples));
                     }
@@ -165,9 +172,18 @@ public sealed class TrainingPipeline : IDisposable
                 }
 
                 int n = Interlocked.Increment(ref doneCount);
-                if (n % 25 == 0 || n == trainFolders.Length)
+                if (n % 50 == 0 || n == trainFolders.Length)
+                {
+                    double elapsed = buildStopwatch.Elapsed.TotalSeconds;
+                    double eta     = n < trainFolders.Length && elapsed > 0
+                        ? elapsed / n * (trainFolders.Length - n) : 0;
                     lock (printLock)
-                        Console.WriteLine($"[Training]   {n}/{trainFolders.Length} folders processed...");
+                        Console.WriteLine(
+                            $"[Training]   {n}/{trainFolders.Length} folders " +
+                            $"({100.0 * n / trainFolders.Length:F0}%)" +
+                            $" — {elapsed:F0}s elapsed" +
+                            (eta > 1 ? $", ~{eta:F0}s remaining" : string.Empty));
+                }
 
                 return localSeqs;
             },
@@ -185,7 +201,7 @@ public sealed class TrainingPipeline : IDisposable
 
         // Build test examples from held-out test folders (used only for final evaluation)
         var testEx = testFolders.Length > 0
-            ? BuildExamplesFromFolders(testFolders, printLock)
+            ? BuildExamplesFromFolders(testFolders, printLock, trainAudioCache)
             : (IReadOnlyList<TrainingExample>)[];
 
         // ----------------------------------------------------------------
@@ -207,18 +223,26 @@ public sealed class TrainingPipeline : IDisposable
             var poolTmp     = new CachedSong?[poolGroups.Count];
             int cacheHits   = 0;
             int cacheMisses = 0;
+            int valDone     = 0;
+            var valStopwatch = Stopwatch.StartNew();
+
+            Console.WriteLine(
+                $"[Training] Analysing {poolGroups.Count} validation songs " +
+                $"(cached in '{options.ArtifactsOutputPath}')...");
 
             Parallel.For(0, poolGroups.Count,
                 new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount },
                 i =>
                 {
                     var group = poolGroups[i];
+                    bool hit = false;
                     try
                     {
                         // One audio cache entry per unique song (shared across all its difficulties)
                         var audio = audioCache.TryLoad(group.AudioPath);
                         if (audio is not null)
                         {
+                            hit = true;
                             Interlocked.Increment(ref cacheHits);
                         }
                         else
@@ -236,13 +260,29 @@ public sealed class TrainingPipeline : IDisposable
                             Console.WriteLine(
                                 $"[Training] Warning: could not analyse '{group.AudioPath}': {ex.Message}");
                     }
+
+                    int n = Interlocked.Increment(ref valDone);
+                    if (!hit || n % 25 == 0 || n == poolGroups.Count)
+                    {
+                        double elapsed = valStopwatch.Elapsed.TotalSeconds;
+                        double eta     = n < poolGroups.Count && elapsed > 0
+                            ? elapsed / n * (poolGroups.Count - n) : 0;
+                        lock (printLock)
+                            Console.WriteLine(
+                                $"[Training]   Val {n}/{poolGroups.Count}" +
+                                $" — {Path.GetFileName(group.AudioPath)}" +
+                                $" [{(hit ? "cache" : "fresh")}]" +
+                                $" {elapsed:F0}s elapsed" +
+                                (eta > 1 ? $" ~{eta:F0}s remaining" : string.Empty));
+                    }
                 });
 
             var pool = poolTmp.Where(s => s is not null).Select(s => s!).ToArray();
             int poolPairCount = pool.Sum(s => s.Group.Difficulties.Count);
             Console.WriteLine(
                 $"[Training] Validation pool: {pool.Length}/{poolGroups.Count} unique songs ready " +
-                $"({poolPairCount} total pairs, {cacheHits} from cache, {cacheMisses} freshly analysed).");
+                $"({poolPairCount} total pairs, {cacheHits} from cache, {cacheMisses} freshly analysed, " +
+                $"{valStopwatch.Elapsed.TotalSeconds:F0}s).");
 
             // Randomly sample songsPerEpoch unique songs from the pool (without replacement).
             // This sample is fixed for the entire run so genQ is comparable across epochs.
@@ -579,7 +619,7 @@ public sealed class TrainingPipeline : IDisposable
     /// Used to produce the held-out test set from test-split folders.
     /// </summary>
     private static IReadOnlyList<TrainingExample> BuildExamplesFromFolders(
-        string[] folders, object printLock)
+        string[] folders, object printLock, ValidationAudioCache? audioCache = null)
     {
         var result   = new List<TrainingExample>();
         var listLock = new object();
@@ -594,22 +634,21 @@ public sealed class TrainingPipeline : IDisposable
                 {
                     var maps    = BeatmapImporter.Import(folder);
                     var builder = new TrainingExampleBuilder();
-                    foreach (var map in maps)
+
+                    string? audioPath = FindAudioFile(folder);
+                    AudioAnalysisResult? audio = null;
+                    if (audioPath != null)
                     {
-                        double bpm      = map.Song.BeatsPerMinute > 0 ? map.Song.BeatsPerMinute : 120.0;
-                        double lastBeat = map.Notes.Count > 0 ? map.Notes[^1].Beat : 0;
-                        double[] onsets = map.Notes
-                            .Select(n => MathHelpers.BeatToSeconds(n.Beat, bpm))
-                            .Distinct().OrderBy(t => t).ToArray();
-                        localList.AddRange(builder.Build(map, new AudioAnalysisResult
+                        audio = audioCache?.TryLoad(audioPath);
+                        if (audio is null)
                         {
-                            EstimatedBpm      = bpm,
-                            DurationSeconds   = MathHelpers.BeatToSeconds(lastBeat + 4.0, bpm),
-                            FrameRateHz       = 43.0,
-                            SampleRate        = 22050,
-                            OnsetTimesSeconds = onsets
-                        }));
+                            audio = new AudioFeatureExtractor().Extract(audioPath);
+                            audioCache?.Store(audioPath, audio);
+                        }
                     }
+
+                    foreach (var map in maps)
+                        localList.AddRange(builder.Build(map, audio ?? MakeStubAudio(map)));
                 }
                 catch (Exception ex)
                 {
@@ -648,6 +687,64 @@ public sealed class TrainingPipeline : IDisposable
     private static bool ContainsUnpackedMaps(string path) =>
         Directory.Exists(path) &&
         Directory.GetDirectories(path).Any(IsMapFolder);
+
+    /// <summary>
+    /// Locate the audio file for a map folder.
+    /// Reads the declared filename from Info.dat, then falls back to a file-extension scan.
+    /// </summary>
+    private static string? FindAudioFile(string folder)
+    {
+        string? infoPath =
+            File.Exists(Path.Combine(folder, "Info.dat")) ? Path.Combine(folder, "Info.dat") :
+            File.Exists(Path.Combine(folder, "info.dat")) ? Path.Combine(folder, "info.dat") :
+            null;
+
+        if (infoPath is not null)
+        {
+            try
+            {
+                var root = JsonSerializer.Deserialize<JsonElement>(File.ReadAllText(infoPath));
+                // V1/V2 use _songFilename, V3 uses songFilename
+                string? fn = root.TryGetProperty("_songFilename", out var v2) ? v2.GetString()
+                           : root.TryGetProperty("songFilename",  out var v3) ? v3.GetString()
+                           : null;
+                if (!string.IsNullOrEmpty(fn))
+                {
+                    string candidate = Path.Combine(folder, fn);
+                    if (File.Exists(candidate)) return candidate;
+                }
+            }
+            catch { }
+        }
+
+        foreach (string pattern in new[] { "*.ogg", "*.egg", "*.mp3", "*.wav" })
+        {
+            var files = Directory.GetFiles(folder, pattern);
+            if (files.Length > 0) return files[0];
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Minimal stub used when the audio file is missing.
+    /// Produces zero audio features; only beat-position and placement context survive.
+    /// </summary>
+    private static AudioAnalysisResult MakeStubAudio(CanonicalBeatmap map)
+    {
+        double bpm      = map.Song.BeatsPerMinute > 0 ? map.Song.BeatsPerMinute : 120.0;
+        double lastBeat = map.Notes.Count > 0 ? map.Notes[^1].Beat : 0;
+        double[] onsets = map.Notes
+            .Select(n => MathHelpers.BeatToSeconds(n.Beat, bpm))
+            .Distinct().OrderBy(t => t).ToArray();
+        return new AudioAnalysisResult
+        {
+            EstimatedBpm      = bpm,
+            DurationSeconds   = MathHelpers.BeatToSeconds(lastBeat + 4.0, bpm),
+            FrameRateHz       = 43.0,
+            SampleRate        = 22050,
+            OnsetTimesSeconds = onsets
+        };
+    }
 
     /// <summary>
     /// Ordinary-least-squares slope of a small value series.
