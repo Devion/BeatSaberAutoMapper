@@ -51,6 +51,8 @@ public sealed class SelfSupervisedExampleGenerator
 
         var result = new List<TrainingExample>();
         double bpm = audio.EstimatedBpm > 0 ? audio.EstimatedBpm : 120.0;
+        double songDurationBeats = audio.DurationSeconds > 0
+            ? MathHelpers.SecondsToBeat(audio.DurationSeconds, bpm) : 1.0;
 
         // Sorted note times for fast "covered?" lookup
         var noteTimes = generated.Notes
@@ -67,15 +69,23 @@ public sealed class SelfSupervisedExampleGenerator
             double quality  = NoteQualityScorer.ScorePosition(noteTime, note.Beat, audio);
             double localNps = generated.LocalNps(note.Beat, 4.0);
 
+            // Use the actual note attributes (hand, lane, row, dir) for positive examples
+            int hand   = note.Color == NoteColor.Blue ? 1 : 0;
+            int lane   = note.Lane;
+            int row    = note.Row;
+            int cutDir = (int)note.CutDirection;
+
             if (quality >= StrongPositiveThreshold)
             {
                 result.Add(MakeExample(note.Beat, noteTime, audio, bpm, difficultyLevel,
-                    localNps, hasNote: true, weight: positiveWeight * quality));
+                    localNps, songDurationBeats, hasNote: true, weight: positiveWeight * quality,
+                    noteHand: hand, noteLane: lane, noteRow: row, noteCutDir: cutDir));
             }
             else if (quality >= WeakPositiveThreshold)
             {
                 result.Add(MakeExample(note.Beat, noteTime, audio, bpm, difficultyLevel,
-                    localNps, hasNote: true, weight: positiveWeight * 0.5));
+                    localNps, songDurationBeats, hasNote: true, weight: positiveWeight * 0.5,
+                    noteHand: hand, noteLane: lane, noteRow: row, noteCutDir: cutDir));
             }
             else if (quality <= NegativeThreshold)
             {
@@ -83,7 +93,7 @@ public sealed class SelfSupervisedExampleGenerator
                     ? negativeWeight * 1.5
                     : negativeWeight;
                 result.Add(MakeExample(note.Beat, noteTime, audio, bpm, difficultyLevel,
-                    localNps, hasNote: false, weight: w));
+                    localNps, songDurationBeats, hasNote: false, weight: w));
             }
             // Middle range (0.35–0.50): ambiguous, skip to avoid noisy signal
         }
@@ -113,7 +123,7 @@ public sealed class SelfSupervisedExampleGenerator
             if (score < MissedOnsetScoreMin) continue;
 
             result.Add(MakeExample(beat, onset, audio, bpm, difficultyLevel,
-                localNps: 0, hasNote: true, weight: positiveWeight));
+                localNps: 0, songDurationBeats, hasNote: true, weight: positiveWeight));
         }
 
         // ------------------------------------------------------------------
@@ -145,7 +155,7 @@ public sealed class SelfSupervisedExampleGenerator
                 if (covered) continue;
 
                 result.Add(MakeExample(beat, bt, audio, bpm, difficultyLevel,
-                    localNps: 0, hasNote: true, weight: positiveWeight * 0.7));
+                    localNps: 0, songDurationBeats, hasNote: true, weight: positiveWeight * 0.7));
             }
         }
 
@@ -157,7 +167,8 @@ public sealed class SelfSupervisedExampleGenerator
     private static TrainingExample MakeExample(
         double beat, double timeSeconds,
         AudioAnalysisResult audio, double bpm, int difficultyLevel,
-        double localNps, bool hasNote, double weight)
+        double localNps, double songDurationBeats, bool hasNote, double weight,
+        int noteHand = -1, int noteLane = -1, int noteRow = -1, int noteCutDir = -1)
     {
         double frac   = beat - Math.Floor(beat);
         double subdiv = frac < 0.01 ? 1.0
@@ -170,6 +181,16 @@ public sealed class SelfSupervisedExampleGenerator
 
         double energy  = audio.GetEnergy(timeSeconds);
         double onset   = GetOnsetStrength(timeSeconds, audio);
+
+        // Derived temporal features
+        double prevTime      = Math.Max(0, timeSeconds - 0.1);
+        double prevEnergy    = audio.GetEnergy(prevTime);
+        double prevHighBand  = audio.GetHighBand(prevTime);
+        double energyMax     = Math.Max(0.01, Math.Max(energy, prevEnergy));
+        double energyDelta   = Math.Clamp((energy - prevEnergy) / energyMax, -1.0, 1.0);
+        double highBandDelta = Math.Clamp(audio.GetHighBand(timeSeconds) - prevHighBand, -1.0, 1.0);
+        double songFraction  = songDurationBeats > 0
+            ? Math.Clamp(beat / songDurationBeats, 0.0, 1.0) : 0.0;
 
         return new TrainingExample(
             Beat:                   beat,
@@ -194,11 +215,15 @@ public sealed class SelfSupervisedExampleGenerator
             MidBandEnergy:          audio.GetMidBand(timeSeconds),
             HighBandEnergy:         audio.GetHighBand(timeSeconds),
             SpectralCentroid:       audio.GetCentroid(timeSeconds),
+            EnergyDelta:            energyDelta,
+            HighBandDelta:          highBandDelta,
+            TimeSinceAnyNote:       0.5,   // prior-note context unavailable in self-supervised pass
+            SongFraction:           songFraction,
             HasNote:                hasNote,
-            NoteHand:               -1,
-            NoteLane:               -1,
-            NoteRow:                -1,
-            NoteCutDir:             -1,
+            NoteHand:               noteHand,
+            NoteLane:               noteLane,
+            NoteRow:                noteRow,
+            NoteCutDir:             noteCutDir,
             Weight:                 weight);
     }
 

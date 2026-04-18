@@ -122,6 +122,7 @@ var trainSsWarmupOpt = new Option<int>("--ss-warmup") { Description = "Epochs be
 var trainSsEveryOpt = new Option<int>("--ss-every") { Description = "Refresh self-supervised pool every N epochs (1 = every epoch)", DefaultValueFactory = _ => 1 };
 var trainSsPosWOpt = new Option<double>("--ss-pos-weight") { Description = "Weight multiplier for reinforced positive synthetic examples", DefaultValueFactory = _ => 4.0 };
 var trainSsNegWOpt = new Option<double>("--ss-neg-weight") { Description = "Weight multiplier for penalised negative synthetic examples", DefaultValueFactory = _ => 3.0 };
+var trainCheckpointOpt = new Option<int>("--checkpoint-every") { Description = "Save model to artifacts every N epochs (0 = disabled, default 10)", DefaultValueFactory = _ => 10 };
 trainCmd.Add(trainDatasetOpt);
 trainCmd.Add(trainProfileOpt);
 trainCmd.Add(trainArtifactsOpt);
@@ -133,6 +134,7 @@ trainCmd.Add(trainSsWarmupOpt);
 trainCmd.Add(trainSsEveryOpt);
 trainCmd.Add(trainSsPosWOpt);
 trainCmd.Add(trainSsNegWOpt);
+trainCmd.Add(trainCheckpointOpt);
 
 trainCmd.SetAction((ParseResult pr) =>
 {
@@ -153,9 +155,11 @@ trainCmd.SetAction((ParseResult pr) =>
             SelfSupervisedWarmupEpochs: pr.GetValue(trainSsWarmupOpt),
             SelfSupervisedEveryNEpochs: pr.GetValue(trainSsEveryOpt),
             SelfSupervisedPositiveWeight: pr.GetValue(trainSsPosWOpt),
-            SelfSupervisedNegativeWeight: pr.GetValue(trainSsNegWOpt)
+            SelfSupervisedNegativeWeight: pr.GetValue(trainSsNegWOpt),
+            CheckpointEveryNEpochs: pr.GetValue(trainCheckpointOpt)
         );
-        new TrainingPipeline().Run(options);
+        using var pipeline = new TrainingPipeline();
+        pipeline.Run(options);
         return ExitSuccess;
     }
     catch (Exception ex)

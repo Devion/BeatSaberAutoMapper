@@ -2,6 +2,7 @@
 @model IndexModel
 @{
     ViewData["Title"] = "Generate Map";
+    Layout = "_Layout";
 }
 
 <div class="page-wrap">
@@ -51,14 +52,6 @@
                         @(d == "ExpertPlus" ? "Expert+" : d)
                     </label>
                 }
-            </div>
-        </div>
-
-        <div class="form-section">
-            <h2>Model (optional)</h2>
-            <div class="form-group">
-                <label asp-for="ArtifactsPath">Trained artifacts folder <span class="hint">(leave blank to use heuristics)</span></label>
-                <input asp-for="ArtifactsPath" type="text" placeholder="e.g. D:\bsamartifacts" />
             </div>
         </div>
 

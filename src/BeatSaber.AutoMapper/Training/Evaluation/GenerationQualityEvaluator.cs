@@ -23,16 +23,19 @@ public sealed class GenerationQualityEvaluator
         Guard.NotNull(generated,  nameof(generated));
         Guard.NotNull(reference,  nameof(reference));
 
-        double placementF1  = ComputePlacementF1(generated, reference);
-        double npsCorr      = ComputeNpsCorrelation(generated, reference);
-        double parityRate   = ComputeParityBreakRate(generated);
-        double valScore     = _validator.Validate(generated).Score / 100.0;
+        double placementF1    = ComputePlacementF1(generated, reference);
+        double npsCorr        = ComputeNpsCorrelation(generated, reference);
+        double parityRate     = ComputeParityBreakRate(generated);
+        double valScore       = _validator.Validate(generated).Score / 100.0;
+        double laneDiversity  = ComputeLaneDiversityScore(generated);
+        double rowDiversity   = ComputeRowDiversityScore(generated);
 
-        // Weighted combination
-        double overall = 0.50 * placementF1
-                       + 0.20 * Math.Max(0, npsCorr)
+        // Weighted combination — lane/row diversity now explicit (20%)
+        double overall = 0.35 * placementF1
+                       + 0.15 * Math.Max(0, npsCorr)
                        + 0.15 * (1.0 - parityRate)
-                       + 0.15 * valScore;
+                       + 0.15 * valScore
+                       + 0.20 * (laneDiversity * 0.6 + rowDiversity * 0.4);
 
         return new QualityMetrics(placementF1, npsCorr, parityRate, valScore,
                                   Math.Clamp(overall, 0, 1));
@@ -123,5 +126,39 @@ public sealed class GenerationQualityEvaluator
         double dx  = Math.Sqrt(x.Sum(v => (v - mx) * (v - mx)));
         double dy  = Math.Sqrt(y.Sum(v => (v - my) * (v - my)));
         return dx * dy > 0 ? num / (dx * dy) : 0;
+    }
+
+    /// <summary>Normalised entropy of lane usage (0 = all one lane, 1 = perfectly uniform).</summary>
+    private static double ComputeLaneDiversityScore(CanonicalBeatmap beatmap)
+    {
+        if (beatmap.Notes.Count == 0) return 0;
+        var counts = new int[4];
+        foreach (var n in beatmap.Notes)
+            if (n.Lane >= 0 && n.Lane < 4) counts[n.Lane]++;
+        double total = beatmap.Notes.Count;
+        double entropy = 0;
+        foreach (int c in counts)
+        {
+            double p = c / total;
+            if (p > 0) entropy -= p * Math.Log2(p);
+        }
+        return entropy / 2.0;  // max entropy for 4 uniform classes = log2(4) = 2
+    }
+
+    /// <summary>Normalised entropy of row usage (0 = all one row, 1 = perfectly uniform).</summary>
+    private static double ComputeRowDiversityScore(CanonicalBeatmap beatmap)
+    {
+        if (beatmap.Notes.Count == 0) return 0;
+        var counts = new int[3];
+        foreach (var n in beatmap.Notes)
+            if (n.Row >= 0 && n.Row < 3) counts[n.Row]++;
+        double total = beatmap.Notes.Count;
+        double entropy = 0;
+        foreach (int c in counts)
+        {
+            double p = c / total;
+            if (p > 0) entropy -= p * Math.Log2(p);
+        }
+        return entropy / Math.Log2(3);  // max entropy for 3 uniform classes = log2(3)
     }
 }

@@ -80,5 +80,13 @@ public sealed class EvaluationRunner
         PrevRightCutDir = ex.PreviousRightCutDir,
         BeatsSinceLastLeft  = ex.BeatsSinceLastLeft,
         BeatsSinceLastRight = ex.BeatsSinceLastRight,
+        LowBandEnergy    = ex.LowBandEnergy,
+        MidBandEnergy    = ex.MidBandEnergy,
+        HighBandEnergy   = ex.HighBandEnergy,
+        SpectralCentroid = ex.SpectralCentroid,
+        EnergyDelta      = ex.EnergyDelta,
+        HighBandDelta    = ex.HighBandDelta,
+        TimeSinceAnyNote = ex.TimeSinceAnyNote,
+        SongFraction     = ex.SongFraction,
     };
 }

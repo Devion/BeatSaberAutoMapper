@@ -48,13 +48,25 @@ internal sealed class V3DifficultyBeatmap
 internal sealed class V3Beatmap
 {
     [JsonPropertyName("version")] public string Version { get; set; } = "3.0.0";
+    [JsonPropertyName("bpmEvents")] public List<V3BpmChange> BpmEvents { get; set; } = [];
+    [JsonPropertyName("rotationEvents")] public List<JsonElement> RotationEvents { get; set; } = [];
     [JsonPropertyName("colorNotes")] public List<V3ColorNote> ColorNotes { get; set; } = [];
     [JsonPropertyName("bombNotes")] public List<V3BombNote> BombNotes { get; set; } = [];
     [JsonPropertyName("obstacles")] public List<V3Obstacle> Obstacles { get; set; } = [];
-    [JsonPropertyName("bpmEvents")] public List<V3BpmChange> BpmEvents { get; set; } = [];
     [JsonPropertyName("sliders")] public List<JsonElement> Sliders { get; set; } = [];
     [JsonPropertyName("burstSliders")] public List<JsonElement> BurstSliders { get; set; } = [];
+    [JsonPropertyName("waypoints")] public List<JsonElement> Waypoints { get; set; } = [];
     [JsonPropertyName("basicBeatmapEvents")] public List<JsonElement> BasicBeatmapEvents { get; set; } = [];
+    [JsonPropertyName("colorBoostBeatmapEvents")] public List<JsonElement> ColorBoostBeatmapEvents { get; set; } = [];
+    [JsonPropertyName("lightColorEventBoxGroups")] public List<JsonElement> LightColorEventBoxGroups { get; set; } = [];
+    [JsonPropertyName("lightRotationEventBoxGroups")] public List<JsonElement> LightRotationEventBoxGroups { get; set; } = [];
+    [JsonPropertyName("basicEventTypesWithKeywords")] public V3BasicEventTypesWithKeywords BasicEventTypesWithKeywords { get; set; } = new();
+    [JsonPropertyName("useNormalEventsAsCompatibleEvents")] public bool UseNormalEventsAsCompatibleEvents { get; set; } = false;
+}
+
+internal sealed class V3BasicEventTypesWithKeywords
+{
+    [JsonPropertyName("d")] public List<JsonElement> D { get; set; } = [];
 }
 
 internal sealed class V3ColorNote

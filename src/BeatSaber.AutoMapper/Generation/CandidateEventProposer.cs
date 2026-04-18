@@ -29,8 +29,19 @@ public sealed class CandidateEventProposer
         var proposed  = new List<ProposedEvent>();
         bool nextLeft = true;
 
-        // Learned model: sigmoid output centred at 0.5; heuristic: ~0.15 floor.
-        double threshold = ctx.PlacementScorer is not null ? 0.5 : 0.15;
+        // Difficulty-aware threshold: tighter for easy difficulties (fewer false-positives),
+        // looser for expert (high note density expected). Heuristic uses a much lower floor.
+        double threshold = ctx.PlacementScorer is not null
+            ? ctx.Profile.Difficulty switch
+            {
+                DifficultyLevel.Easy       => 0.68,
+                DifficultyLevel.Normal     => 0.62,
+                DifficultyLevel.Hard       => 0.56,
+                DifficultyLevel.Expert     => 0.50,
+                DifficultyLevel.ExpertPlus => 0.44,
+                _                          => 0.56
+            }
+            : 0.15;
 
         foreach (var candidate in ctx.CandidateGrid)
         {
@@ -62,6 +73,19 @@ public sealed class CandidateEventProposer
             double phase        = candidate.Beat - Math.Floor(candidate.Beat);
             double secProg      = GetSectionProgress(candidate.TimeSeconds, ctx);
 
+            // Derived temporal features
+            double prevTime      = Math.Max(0, candidate.TimeSeconds - 0.1);
+            double prevEnergy    = ctx.AudioAnalysis.GetEnergy(prevTime);
+            double prevHighBand  = ctx.AudioAnalysis.GetHighBand(prevTime);
+            double energyMax     = Math.Max(0.01, Math.Max(energy, prevEnergy));
+            double energyDelta   = Math.Clamp((energy - prevEnergy) / energyMax, -1.0, 1.0);
+            double highBandDelta = Math.Clamp(ctx.AudioAnalysis.GetHighBand(candidate.TimeSeconds) - prevHighBand, -1.0, 1.0);
+            double totalBeats    = MathHelpers.SecondsToBeat(ctx.AudioAnalysis.DurationSeconds, ctx.Song.BeatsPerMinute);
+            double songFraction  = totalBeats > 0 ? Math.Clamp(candidate.Beat / totalBeats, 0.0, 1.0) : 0.0;
+            double timeSinceAny  = Math.Clamp(Math.Min(
+                lastLeft  != null ? candidate.Beat - lastLeft.Beat  : 999.0,
+                lastRight != null ? candidate.Beat - lastRight.Beat : 999.0) / 8.0, 0.0, 1.0);
+
             var nctx = new NeuralPlacementContext
             {
                 Onset           = candidate.OnsetStrength,
@@ -85,6 +109,10 @@ public sealed class CandidateEventProposer
                 MidBandEnergy    = ctx.AudioAnalysis.GetMidBand(candidate.TimeSeconds),
                 HighBandEnergy   = ctx.AudioAnalysis.GetHighBand(candidate.TimeSeconds),
                 SpectralCentroid = ctx.AudioAnalysis.GetCentroid(candidate.TimeSeconds),
+                EnergyDelta      = energyDelta,
+                HighBandDelta    = highBandDelta,
+                TimeSinceAnyNote = timeSinceAny,
+                SongFraction     = songFraction,
             };
 
             double score;

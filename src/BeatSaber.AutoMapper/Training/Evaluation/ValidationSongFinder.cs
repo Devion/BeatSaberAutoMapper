@@ -4,7 +4,9 @@ namespace BeatSaber.AutoMapper.Training.Evaluation;
 
 /// <summary>
 /// Finds map folders in the library that have an accessible audio file,
-/// returning a sample suitable for generation-quality validation during training.
+/// returning validation pairs suitable for generation-quality validation during training.
+/// Each pair carries one specific difficulty so generated maps are always compared
+/// difficulty-to-difficulty (Hard→Hard, Expert→Expert, etc.).
 /// </summary>
 public sealed class ValidationSongFinder
 {
@@ -14,7 +16,9 @@ public sealed class ValidationSongFinder
         CanonicalBeatmap ReferenceMap);
 
     /// <summary>
-    /// Find up to <paramref name="maxCount"/> random map folders that have audio + parseable notes.
+    /// Find up to <paramref name="maxCount"/> validation pairs from a random sample of folders.
+    /// Returns ONE pair per available difficulty per selected folder, so if a folder has Hard
+    /// and Expert the evaluator will generate and compare both separately.
     /// </summary>
     public IReadOnlyList<ValidationPair> Find(
         IReadOnlyList<string> mapFolders,
@@ -35,13 +39,19 @@ public sealed class ValidationSongFinder
             try
             {
                 var maps = BeatmapImporter.Import(folder);
-                // Prefer the highest difficulty that has enough notes
-                var best = maps
-                    .Where(m => m.Notes.Count >= 20)
-                    .MaxBy(m => (int)m.Difficulty.Difficulty);
 
-                if (best is null) continue;
-                result.Add(new ValidationPair(folder, audioPath, best));
+                // Add one pair for EACH difficulty that has enough notes,
+                // so generated maps are compared at the matching difficulty level.
+                var validDiffs = maps
+                    .Where(m => m.Notes.Count >= 20)
+                    .OrderByDescending(m => (int)m.Difficulty.Difficulty)
+                    .ToList();
+
+                foreach (var map in validDiffs)
+                {
+                    if (result.Count >= maxCount) break;
+                    result.Add(new ValidationPair(folder, audioPath, map));
+                }
             }
             catch { /* skip un-parseable maps */ }
         }

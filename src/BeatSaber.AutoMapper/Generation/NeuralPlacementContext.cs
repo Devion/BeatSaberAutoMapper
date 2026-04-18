@@ -35,9 +35,15 @@ public readonly struct NeuralPlacementContext
     public double HighBandEnergy   { get; init; }  // 2000+ Hz — hi-hat / cymbal
     public double SpectralCentroid { get; init; }  // 0-1 brightness (0=bass, 1=treble)
 
+    // ── derived temporal features ──
+    public double EnergyDelta      { get; init; }  // normalised energy rise vs 100 ms ago [-1,1]
+    public double HighBandDelta    { get; init; }  // hi-hat/cymbal delta vs 100 ms ago  [-1,1]
+    public double TimeSinceAnyNote { get; init; }  // min(L,R) beats-since-last / 8 [0,1]
+    public double SongFraction     { get; init; }  // beat / totalBeats [0,1]
+
     /// <summary>
-    /// Fills <paramref name="f"/> with 23 normalised feature values.
-    /// The caller must supply an array of length ≥ 23.
+    /// Fills <paramref name="f"/> with 27 normalised feature values.
+    /// The caller must supply an array of length ≥ 27.
     /// </summary>
     /// <summary>Float32 version for TorchSharp tensor building.</summary>
     internal void FillFeaturesFloat(float[] f)
@@ -65,6 +71,10 @@ public readonly struct NeuralPlacementContext
         f[20] = (float)MidBandEnergy;
         f[21] = (float)HighBandEnergy;
         f[22] = (float)SpectralCentroid;
+        f[23] = (float)Math.Clamp(EnergyDelta,      -1.0, 1.0);
+        f[24] = (float)Math.Clamp(HighBandDelta,     -1.0, 1.0);
+        f[25] = (float)Math.Clamp(TimeSinceAnyNote,   0.0, 1.0);
+        f[26] = (float)Math.Clamp(SongFraction,        0.0, 1.0);
     }
 
     internal void FillFeatures(double[] f)
@@ -80,17 +90,21 @@ public readonly struct NeuralPlacementContext
         f[8]  = SectionProgress;
         f[9]  = PrevLeftLane  / 3.0;
         f[10] = PrevLeftRow   / 2.0;
-        f[11] = PrevLeftCutDir  >= 0 ? 1.0 : 0.0;            // has-prev-left flag
+        f[11] = PrevLeftCutDir  >= 0 ? 1.0 : 0.0;
         f[12] = PrevLeftCutDir  >= 0 ? PrevLeftCutDir  / 8.0 : 0.0;
         f[13] = PrevRightLane / 3.0;
         f[14] = PrevRightRow  / 2.0;
-        f[15] = PrevRightCutDir >= 0 ? 1.0 : 0.0;            // has-prev-right flag
-        f[16] = PrevRightCutDir >= 0 ? PrevRightCutDir / 8.0 : 0.0;  // value (was missing!)
+        f[15] = PrevRightCutDir >= 0 ? 1.0 : 0.0;
+        f[16] = PrevRightCutDir >= 0 ? PrevRightCutDir / 8.0 : 0.0;
         f[17] = Math.Min(BeatsSinceLastLeft  / 8.0, 1.0);
         f[18] = Math.Min(BeatsSinceLastRight / 8.0, 1.0);
         f[19] = LowBandEnergy;
         f[20] = MidBandEnergy;
         f[21] = HighBandEnergy;
         f[22] = SpectralCentroid;
+        f[23] = Math.Clamp(EnergyDelta,      -1.0, 1.0);
+        f[24] = Math.Clamp(HighBandDelta,     -1.0, 1.0);
+        f[25] = Math.Clamp(TimeSinceAnyNote,   0.0, 1.0);
+        f[26] = Math.Clamp(SongFraction,        0.0, 1.0);
     }
 }

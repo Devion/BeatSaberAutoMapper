@@ -13,5 +13,6 @@
   <ItemGroup>
     <PackageReference Include="TorchSharp-cuda-windows" Version="0.106.0" />
     <PackageReference Include="OggVorbisEncoder" Version="1.2.2" />
+    <PackageReference Include="TagLibSharp" Version="2.3.0" />
   </ItemGroup>
 </Project>

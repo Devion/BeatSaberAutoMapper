@@ -14,12 +14,15 @@ public sealed class BeatmapExporter
     // Info.dat uses v2 underscore keys; explicit attrs already set them – no naming policy needed.
     private static readonly JsonSerializerOptions _infoOpts = new() { WriteIndented = true };
 
+    // UTF-8 without BOM — BeatSaver and most JSON parsers reject the 0xEF BB BF preamble.
+    private static readonly Encoding _utf8NoBom = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
+
     public static void ExportV3(CanonicalBeatmap beatmap, string outputFilePath)
     {
         Guard.NotNull(beatmap, nameof(beatmap));
         Guard.NotNullOrEmpty(outputFilePath, nameof(outputFilePath));
         string json = SerialiseV3(beatmap);
-        File.WriteAllText(outputFilePath, json, Encoding.UTF8);
+        File.WriteAllText(outputFilePath, json, _utf8NoBom);
     }
 
     public static async Task ExportV3Async(CanonicalBeatmap beatmap, string outputFilePath)
@@ -27,7 +30,7 @@ public sealed class BeatmapExporter
         Guard.NotNull(beatmap, nameof(beatmap));
         Guard.NotNullOrEmpty(outputFilePath, nameof(outputFilePath));
         string json = SerialiseV3(beatmap);
-        await File.WriteAllTextAsync(outputFilePath, json, Encoding.UTF8).ConfigureAwait(false);
+        await File.WriteAllTextAsync(outputFilePath, json, _utf8NoBom).ConfigureAwait(false);
     }
 
     public static void ExportInfoDat(
@@ -70,7 +73,7 @@ public sealed class BeatmapExporter
 
         string path = Path.Combine(outputFolderPath, "Info.dat");
         string json = JsonSerializer.Serialize(info, _infoOpts);
-        File.WriteAllText(path, json, Encoding.UTF8);
+        File.WriteAllText(path, json, _utf8NoBom);
     }
 
     private static string SerialiseV3(CanonicalBeatmap beatmap)

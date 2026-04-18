@@ -11,7 +11,7 @@ using BeatSaber.AutoMapper.Training.SelfSupervised;
 
 namespace BeatSaber.AutoMapper.Training;
 
-public sealed class TrainingPipeline
+public sealed class TrainingPipeline : IDisposable
 {
     private readonly CorpusIngestionService _ingestion        = new();
     private readonly TrainingExampleBuilder _exampleBuilder   = new();
@@ -19,6 +19,8 @@ public sealed class TrainingPipeline
     private readonly TorchPlacementTrainer   _placementTrainer = new();
     private readonly AttributeModelTrainer  _attributeTrainer = new();
     private readonly EvaluationRunner       _evaluator        = new();
+
+    public void Dispose() => _placementTrainer.Dispose();
 
     // Pre-analysed audio kept alive for all epochs (analysis is expensive, result is immutable)
     private sealed record CachedPair(
@@ -186,12 +188,20 @@ public sealed class TrainingPipeline
         // 5. Placement model — epoch loop with shuffle + parallel mini-batch GD
         // ----------------------------------------------------------------
         double lr = warmStarted ? options.InitialLearningRate * 0.3 : options.InitialLearningRate;
+        const double MinLr      = 1e-5;
+        const double LrDecay    = 0.5;   // multiply LR by this when plateaued
+        // Reduce LR after this many no-improvement epochs (before full early-stop)
+        int lrPatience = Math.Max(1, options.EarlyStopPatience / 3);
 
         Console.WriteLine(
-            $"[Training] Training neural placement model 23→1024→512→256→128 ({options.Epochs} epochs max, " +
-            $"Adam lr={lr:G4}, patience={options.EarlyStopPatience})...[warmStart={warmStarted}]");
+            $"[Training] Training neural placement model 27→1024→512→256→128 ({options.Epochs} epochs max, " +
+            $"Adam lr={lr:G4}, patience={options.EarlyStopPatience}, lr-patience={lrPatience})...[warmStart={warmStarted}]");
         double bestQuality         = -1.0;
+        double bestSmoothedQuality = -1.0;   // EMA-smoothed, used for LR/early-stop
+        double smoothedQuality     = -1.0;
+        const double EmaAlpha      = 0.4;    // weight of current epoch vs history
         int    epochsNoImprovement = 0;
+        int    lrReductions        = 0;
         _placementTrainer.SaveBestWeights();
 
         var epochRng = new Random((int)(options.RandomSeed & int.MaxValue));
@@ -221,22 +231,57 @@ public sealed class TrainingPipeline
                     currentSynthetics = new List<TrainingExample>(newSynthetics);
             }
 
+            // EMA smoothing — stabilises LR/early-stop signals across noisy epochs
+            smoothedQuality = smoothedQuality < 0
+                ? qualityScore
+                : EmaAlpha * qualityScore + (1 - EmaAlpha) * smoothedQuality;
+
             Console.WriteLine(
                 $"[Training] Epoch {epoch + 1}/{options.Epochs}: " +
-                $"loss={loss:F4}  acc={acc:P2}  genQuality={qualityScore:F3}" +
+                $"loss={loss:F4}  acc={acc:P2}  genQuality={qualityScore:F3}  lr={lr:G4}" +
                 (currentSynthetics.Count > 0
                     ? $"  synthEx={currentSynthetics.Count}"
                     : string.Empty));
 
+            // Save best weights on RAW quality peaks (catches genuine highs even in noisy epochs)
             if (qualityScore > bestQuality + 1e-4)
             {
                 bestQuality = qualityScore;
-                epochsNoImprovement = 0;
                 _placementTrainer.SaveBestWeights();
+                _placementTrainer.SaveWeights(options.ArtifactsOutputPath);
+                _attributeTrainer.SaveModel(options.ArtifactsOutputPath);
+            }
+
+            // Use EMA-smoothed quality for plateau/early-stop decisions
+            if (smoothedQuality > bestSmoothedQuality + 1e-4)
+            {
+                bestSmoothedQuality = smoothedQuality;
+                epochsNoImprovement = 0;
             }
             else
             {
                 epochsNoImprovement++;
+
+                // Periodic checkpoint (even if not a new best)
+                if (options.CheckpointEveryNEpochs > 0
+                    && (epoch + 1) % options.CheckpointEveryNEpochs == 0)
+                {
+                    _placementTrainer.SaveWeights(options.ArtifactsOutputPath);
+                    _attributeTrainer.SaveModel(options.ArtifactsOutputPath);
+                    Console.WriteLine(
+                        $"[Training] Checkpoint saved at epoch {epoch + 1} (bestQuality={bestQuality:F3})");
+                }
+
+                // Reduce LR on plateau before triggering full early stop
+                if (epochsNoImprovement > 0 && epochsNoImprovement % lrPatience == 0
+                    && lr > MinLr * 1.1)
+                {
+                    lr = Math.Max(lr * LrDecay, MinLr);
+                    lrReductions++;
+                    Console.WriteLine(
+                        $"[Training] Plateau detected — reducing lr to {lr:G4} (reduction #{lrReductions})");
+                }
+
                 if (options.EarlyStopPatience > 0 && epochsNoImprovement >= options.EarlyStopPatience)
                 {
                     Console.WriteLine(

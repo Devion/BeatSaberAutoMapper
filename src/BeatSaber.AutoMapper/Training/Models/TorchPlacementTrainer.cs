@@ -66,12 +66,17 @@ public sealed class TorchPlacementTrainer : IPlacementScorer, IDisposable
 
         _gpu.train();
 
-        // Lazy-create (or recreate on LR change) the Adam optimizer so momentum
-        // state persists across epochs for better convergence.
-        if (_optimizer is null || Math.Abs(_optimizerLr - lr) > 1e-12)
+        // Lazy-create or update LR on the existing Adam optimizer.
+        // Updating in-place preserves momentum/variance state across LR reductions.
+        if (_optimizer is null)
         {
-            _optimizer?.Dispose();
             _optimizer   = optim.Adam(_gpu.parameters(), lr: lr, weight_decay: 1e-5);
+            _optimizerLr = lr;
+        }
+        else if (Math.Abs(_optimizerLr - lr) > 1e-12)
+        {
+            foreach (var g in _optimizer.ParamGroups)
+                g.LearningRate = lr;
             _optimizerLr = lr;
         }
 
@@ -82,13 +87,17 @@ public sealed class TorchPlacementTrainer : IPlacementScorer, IDisposable
 
         // ── Build float / long arrays (CPU) ───────────────────────────────────
         const int D = BeatSaberMappingNet.InputDim;
-        var xArr   = new float[n * D];
-        var yPlArr = new float[n];
-        var yHaArr = new float[n];
-        var yCdArr = new long[n];
-        var yLnArr = new long[n];
-        var yRwArr = new long[n];
+        var xArr    = new float[n * D];
+        var yPlArr  = new float[n];
+        var yHaArr  = new float[n];
+        var yCdArr  = new long[n];
+        var yLnArr  = new long[n];
+        var yRwArr  = new long[n];
         var noteArr = new float[n];
+        var hasMask = new float[n];  // 1 = has real hand label
+        var cdMask  = new float[n];  // 1 = has real cut-dir label
+        var lnMask  = new float[n];  // 1 = has real lane label
+        var rwMask  = new float[n];  // 1 = has real row label
 
         for (int i = 0; i < n; i++)
         {
@@ -100,17 +109,25 @@ public sealed class TorchPlacementTrainer : IPlacementScorer, IDisposable
             yLnArr[i]  = ex.NoteLane  >= 0 ? ex.NoteLane  : 0;
             yRwArr[i]  = ex.NoteRow   >= 0 ? ex.NoteRow   : 0;
             noteArr[i] = ex.HasNote ? 1f : 0f;
+            hasMask[i] = ex.HasNote && ex.NoteHand   >= 0 ? 1f : 0f;
+            cdMask[i]  = ex.HasNote && ex.NoteCutDir >= 0 ? 1f : 0f;
+            lnMask[i]  = ex.HasNote && ex.NoteLane   >= 0 ? 1f : 0f;
+            rwMask[i]  = ex.HasNote && ex.NoteRow    >= 0 ? 1f : 0f;
         }
 
         // ── Move full dataset to device once ──────────────────────────────────
-        using var xT    = tensor(xArr,   new long[] { n, D }, device: _device);
-        using var yPlT  = tensor(yPlArr, new long[] { n },    device: _device);
-        using var yHaT  = tensor(yHaArr, new long[] { n },    device: _device);
-        using var yCdT  = tensor(yCdArr, new long[] { n },    device: _device);
-        using var yLnT  = tensor(yLnArr, new long[] { n },    device: _device);
-        using var yRwT  = tensor(yRwArr, new long[] { n },    device: _device);
-        using var noteT = tensor(noteArr, new long[] { n },   device: _device);
-        using var posWtT = tensor(posWt, device: _device);
+        using var xT     = tensor(xArr,   new long[] { n, D }, device: _device);
+        using var yPlT   = tensor(yPlArr, new long[] { n },    device: _device);
+        using var yHaT   = tensor(yHaArr, new long[] { n },    device: _device);
+        using var yCdT   = tensor(yCdArr, new long[] { n },    device: _device);
+        using var yLnT   = tensor(yLnArr, new long[] { n },    device: _device);
+        using var yRwT   = tensor(yRwArr, new long[] { n },    device: _device);
+        using var noteT  = tensor(noteArr, new long[] { n },   device: _device);
+        using var posWtT = tensor(posWt,   device: _device);
+        using var haMaskT = tensor(hasMask, new long[] { n },  device: _device);
+        using var cdMaskT = tensor(cdMask,  new long[] { n },  device: _device);
+        using var lnMaskT = tensor(lnMask,  new long[] { n },  device: _device);
+        using var rwMaskT = tensor(rwMask,  new long[] { n },  device: _device);
 
         const int batchSize = 4096;
         int numBatches = Math.Max(1, (n + batchSize - 1) / batchSize);
@@ -122,13 +139,17 @@ public sealed class TorchPlacementTrainer : IPlacementScorer, IDisposable
             long s   = (long)b * batchSize;
             long len = Math.Min(batchSize, n - s);
 
-            using var xB    = xT.narrow(0, s, len);
-            using var yPlB  = yPlT.narrow(0, s, len);
-            using var yHaB  = yHaT.narrow(0, s, len);
-            using var yCdB  = yCdT.narrow(0, s, len);
-            using var yLnB  = yLnT.narrow(0, s, len);
-            using var yRwB  = yRwT.narrow(0, s, len);
-            using var noteB = noteT.narrow(0, s, len);
+            using var xB      = xT.narrow(0, s, len);
+            using var yPlB    = yPlT.narrow(0, s, len);
+            using var yHaB    = yHaT.narrow(0, s, len);
+            using var yCdB    = yCdT.narrow(0, s, len);
+            using var yLnB    = yLnT.narrow(0, s, len);
+            using var yRwB    = yRwT.narrow(0, s, len);
+            using var noteB   = noteT.narrow(0, s, len);
+            using var haMaskB = haMaskT.narrow(0, s, len);
+            using var cdMaskB = cdMaskT.narrow(0, s, len);
+            using var lnMaskB = lnMaskT.narrow(0, s, len);
+            using var rwMaskB = rwMaskT.narrow(0, s, len);
 
             using var outB  = _gpu.forward(xB);       // [B, 18]
             using var plLgt = outB.select(1, 0);      // [B]
@@ -143,29 +164,44 @@ public sealed class TorchPlacementTrainer : IPlacementScorer, IDisposable
                 functional.binary_cross_entropy_with_logits(plLgt, yPlB, null, Reduction.Mean, posWtT)
             };
 
-            using var noteMask = (noteB > 0.5f).nonzero().squeeze(1);  // [k]
-            long noteCount = noteMask.shape[0];
-            if (noteCount > 0)
+            // Hand head — only examples with a real hand label
+            using var haMaskIdx = (haMaskB > 0.5f).nonzero().squeeze(1);
+            if (haMaskIdx.shape[0] > 0)
             {
-                using var haSelLgt = haLgt.index_select(0, noteMask);
-                using var haSelY   = yHaB.index_select(0, noteMask);
+                using var haSelLgt = haLgt.index_select(0, haMaskIdx);
+                using var haSelY   = yHaB.index_select(0, haMaskIdx);
                 using var haRaw    = functional.binary_cross_entropy_with_logits(haSelLgt, haSelY);
                 lossTerms.Add(0.5 * haRaw);
+            }
 
-                using var cdSelLgt = cdLgt.index_select(0, noteMask);
-                using var cdSelY   = yCdB.index_select(0, noteMask);
+            // Cut-direction head — only examples with a real cut-dir label
+            using var cdMaskIdx = (cdMaskB > 0.5f).nonzero().squeeze(1);
+            if (cdMaskIdx.shape[0] > 0)
+            {
+                using var cdSelLgt = cdLgt.index_select(0, cdMaskIdx);
+                using var cdSelY   = yCdB.index_select(0, cdMaskIdx);
                 using var cdRaw    = functional.cross_entropy(cdSelLgt, cdSelY);
                 lossTerms.Add(1.0 * cdRaw);
+            }
 
-                using var lnSelLgt = lnLgt.index_select(0, noteMask);
-                using var lnSelY   = yLnB.index_select(0, noteMask);
+            // Lane head — only examples with a real lane label (NOT self-supervised)
+            using var lnMaskIdx = (lnMaskB > 0.5f).nonzero().squeeze(1);
+            if (lnMaskIdx.shape[0] > 0)
+            {
+                using var lnSelLgt = lnLgt.index_select(0, lnMaskIdx);
+                using var lnSelY   = yLnB.index_select(0, lnMaskIdx);
                 using var lnRaw    = functional.cross_entropy(lnSelLgt, lnSelY);
-                lossTerms.Add(0.8 * lnRaw);
+                lossTerms.Add(1.2 * lnRaw);
+            }
 
-                using var rwSelLgt = rwLgt.index_select(0, noteMask);
-                using var rwSelY   = yRwB.index_select(0, noteMask);
+            // Row head — only examples with a real row label (NOT self-supervised)
+            using var rwMaskIdx = (rwMaskB > 0.5f).nonzero().squeeze(1);
+            if (rwMaskIdx.shape[0] > 0)
+            {
+                using var rwSelLgt = rwLgt.index_select(0, rwMaskIdx);
+                using var rwSelY   = yRwB.index_select(0, rwMaskIdx);
                 using var rwRaw    = functional.cross_entropy(rwSelLgt, rwSelY);
-                lossTerms.Add(0.5 * rwRaw);
+                lossTerms.Add(0.8 * rwRaw);
             }
 
             // Sum all loss terms
@@ -307,6 +343,10 @@ public sealed class TorchPlacementTrainer : IPlacementScorer, IDisposable
         arr[offset + 20] = (float)ex.MidBandEnergy;
         arr[offset + 21] = (float)ex.HighBandEnergy;
         arr[offset + 22] = (float)ex.SpectralCentroid;
+        arr[offset + 23] = (float)Math.Clamp(ex.EnergyDelta,      -1.0, 1.0);
+        arr[offset + 24] = (float)Math.Clamp(ex.HighBandDelta,    -1.0, 1.0);
+        arr[offset + 25] = (float)Math.Clamp(ex.TimeSinceAnyNote,  0.0, 1.0);
+        arr[offset + 26] = (float)Math.Clamp(ex.SongFraction,      0.0, 1.0);
     }
 
     public void Dispose()

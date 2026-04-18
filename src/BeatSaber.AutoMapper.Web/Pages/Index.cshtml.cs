@@ -9,13 +9,12 @@ using Microsoft.AspNetCore.Mvc.RazorPages;
 
 namespace BeatSaber.AutoMapper.Web.Pages;
 
-public class IndexModel(JobStore jobStore) : PageModel
+public class IndexModel(JobStore jobStore, IConfiguration config) : PageModel
 {
     [BindProperty] public string Title     { get; set; } = "My Song";
     [BindProperty] public string Artist    { get; set; } = "Unknown Artist";
     [BindProperty] public IFormFile? AudioFile { get; set; }
     [BindProperty] public List<string> Difficulties { get; set; } = ["Hard"];
-    [BindProperty] public string? ArtifactsPath { get; set; }
 
     public string? Error { get; private set; }
 
@@ -53,6 +52,24 @@ public class IndexModel(JobStore jobStore) : PageModel
 
         try
         {
+            // --- Extract cover art from audio tags; fall back to a placeholder ---
+            string coverFile;
+            string coverPath;
+            // Try embedded ID3 art first — preserve whatever extension/format is stored in tags.
+            string jpgPath = Path.Combine(mapDir, "cover.jpg");
+            if (TryExtractCoverArt(origPath, jpgPath))
+            {
+                coverFile = "cover.jpg";
+                coverPath = jpgPath;
+            }
+            else
+            {
+                // Fallback: minimal PNG (valid image, correct extension)
+                coverFile = "cover.png";
+                coverPath = Path.Combine(mapDir, coverFile);
+                await System.IO.File.WriteAllBytesAsync(coverPath, CreatePlaceholderPng());
+            }
+
             // --- Analyse audio (get BPM etc.) from original file -------------
             var extractor = new AudioFeatureExtractor();
             var audio     = extractor.Extract(origPath);
@@ -72,7 +89,7 @@ public class IndexModel(JobStore jobStore) : PageModel
                 SongTimeOffset:   0,
                 PreviewStartTime: 10,
                 PreviewDuration:  30,
-                CoverImagePath:   null,
+                CoverImagePath:   coverFile,
                 AudioPath:        "song.egg");
 
             var diffs = Difficulties
@@ -80,13 +97,17 @@ public class IndexModel(JobStore jobStore) : PageModel
                 .Distinct()
                 .ToList();
 
+            var artifactsPath = config["BeatSaber:ArtifactsPath"] ?? @"D:\bsamartifacts";
+            var useLearned    = Directory.Exists(artifactsPath) &&
+                                Directory.GetFiles(artifactsPath, "*.pt").Length > 0;
+
             var templateSettings = new GenerationSettings(
                 TargetDifficulty: diffs[0],
                 AllowBombs:       false,
                 AllowObstacles:   false,
                 RandomSeed:       42,
-                UseLearned:       !string.IsNullOrWhiteSpace(ArtifactsPath),
-                ArtifactsPath:    string.IsNullOrWhiteSpace(ArtifactsPath) ? null : ArtifactsPath);
+                UseLearned:       useLearned,
+                ArtifactsPath:    useLearned ? artifactsPath : null);
 
             // --- Generate all requested difficulties -------------------------
             var svc     = new MapGenerationService();
@@ -139,4 +160,88 @@ public class IndexModel(JobStore jobStore) : PageModel
         "ExpertPlus" => DifficultyLevel.ExpertPlus,
         _            => DifficultyLevel.Hard
     };
+
+    // --- Cover art helpers ---------------------------------------------------
+
+    private static bool TryExtractCoverArt(string audioPath, string destPath)
+    {
+        try
+        {
+            using var tags = TagLib.File.Create(audioPath);
+            var pic = tags.Tag.Pictures.FirstOrDefault();
+            if (pic?.Data?.Data is { Length: > 0 } bytes)
+            {
+                System.IO.File.WriteAllBytes(destPath, bytes);
+                return true;
+            }
+        }
+        catch { /* Unsupported format, missing tags, corrupt file, etc. */ }
+        return false;
+    }
+
+    /// <summary>Generates a minimal solid dark-navy PNG without any extra packages.</summary>
+    private static byte[] CreatePlaceholderPng(int size = 256)
+    {
+        // Raw image: per row → filter byte (0 = None) + RGB pixels
+        int rowLen = 1 + size * 3;
+        byte[] raw = new byte[size * rowLen];
+        for (int row = 0; row < size; row++)
+        {
+            int off = row * rowLen;
+            for (int col = 0; col < size; col++)
+            {
+                raw[off + 1 + col * 3] = 0x1a; // R
+                raw[off + 2 + col * 3] = 0x1a; // G
+                raw[off + 3 + col * 3] = 0x50; // B  →  dark navy
+            }
+        }
+
+        byte[] idat;
+        using (var ms = new MemoryStream())
+        {
+            using (var zlib = new System.IO.Compression.ZLibStream(
+                       ms, System.IO.Compression.CompressionLevel.Fastest, leaveOpen: true))
+                zlib.Write(raw);
+            idat = ms.ToArray();
+        }
+
+        using var result = new MemoryStream(1024);
+        result.Write(stackalloc byte[] { 137, 80, 78, 71, 13, 10, 26, 10 }); // PNG signature
+
+        byte[] ihdr = new byte[13];
+        ihdr[0] = (byte)(size >> 24); ihdr[1] = (byte)(size >> 16);
+        ihdr[2] = (byte)(size >> 8);  ihdr[3] = (byte)size; // width
+        ihdr[4] = (byte)(size >> 24); ihdr[5] = (byte)(size >> 16);
+        ihdr[6] = (byte)(size >> 8);  ihdr[7] = (byte)size; // height
+        ihdr[8] = 8; ihdr[9] = 2;    // bit depth 8, colour type RGB
+        WritePngChunk(result, "IHDR"u8, ihdr);
+        WritePngChunk(result, "IDAT"u8, idat);
+        WritePngChunk(result, "IEND"u8, []);
+        return result.ToArray();
+    }
+
+    private static void WritePngChunk(MemoryStream ms, ReadOnlySpan<byte> type, byte[] data)
+    {
+        int len = data.Length;
+        ms.WriteByte((byte)(len >> 24)); ms.WriteByte((byte)(len >> 16));
+        ms.WriteByte((byte)(len >> 8));  ms.WriteByte((byte)len);
+        ms.Write(type);
+        ms.Write(data);
+        uint crc = PngCrc32(0xFFFF_FFFFu, type);
+        crc = PngCrc32(crc, data);
+        crc ^= 0xFFFF_FFFFu;
+        ms.WriteByte((byte)(crc >> 24)); ms.WriteByte((byte)(crc >> 16));
+        ms.WriteByte((byte)(crc >> 8));  ms.WriteByte((byte)crc);
+    }
+
+    private static uint PngCrc32(uint crc, ReadOnlySpan<byte> data)
+    {
+        foreach (byte b in data)
+        {
+            crc ^= b;
+            for (int i = 0; i < 8; i++)
+                crc = (crc & 1) != 0 ? (crc >> 1) ^ 0xEDB8_8320u : crc >> 1;
+        }
+        return crc;
+    }
 }

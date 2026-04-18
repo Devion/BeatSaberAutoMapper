@@ -16,7 +16,9 @@ public sealed record TrainingOptions(
     int SelfSupervisedWarmupEpochs,
     int SelfSupervisedEveryNEpochs,
     double SelfSupervisedPositiveWeight,
-    double SelfSupervisedNegativeWeight
+    double SelfSupervisedNegativeWeight,
+    // Periodic checkpoint
+    int CheckpointEveryNEpochs = 10
 )
 {
     public static TrainingOptions Default => new(
@@ -34,6 +36,7 @@ public sealed record TrainingOptions(
         SelfSupervisedWarmupEpochs: 5,
         SelfSupervisedEveryNEpochs: 1,
         SelfSupervisedPositiveWeight: 4.0,
-        SelfSupervisedNegativeWeight: 3.0
+        SelfSupervisedNegativeWeight: 3.0,
+        CheckpointEveryNEpochs: 10
     );
 }

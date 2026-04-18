@@ -12,7 +12,7 @@ internal sealed record BeamState(
 /// <summary>Beam-search decoder that ensures parity validity across the note sequence.</summary>
 public sealed class ConstrainedDecoder
 {
-    public int BeamWidth { get; set; } = 5;
+    public int BeamWidth { get; set; } = 12;
 
     public IReadOnlyList<CanonicalNote> Decode(
         IReadOnlyList<ProposedEvent> candidates,

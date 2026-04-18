@@ -29,6 +29,11 @@ public sealed record TrainingExample(
     double MidBandEnergy    = 0.0,  // 250-2000 Hz — snare / vocals
     double HighBandEnergy   = 0.0,  // 2000+ Hz — hi-hat / cymbal
     double SpectralCentroid = 0.5,  // 0-1 brightness
+    // Derived temporal features
+    double EnergyDelta      = 0.0,  // normalised energy rise since 100 ms ago [-1,1]
+    double HighBandDelta    = 0.0,  // hi-hat/cymbal delta since 100 ms ago [-1,1]
+    double TimeSinceAnyNote = 0.5,  // min(L,R) beats-since-last-note / 8, [0,1]
+    double SongFraction     = 0.0,  // beat / totalBeats [0,1]
     // Labels
     bool HasNote   = false,
     int NoteHand   = -1,   // 0=left, 1=right, -1=none
@@ -91,6 +96,20 @@ public sealed class TrainingExampleBuilder
             double highBand      = audio.GetHighBand(timeSeconds);
             double centroid      = audio.GetCentroid(timeSeconds);
 
+            // Derived temporal features
+            double prevTime      = Math.Max(0, timeSeconds - 0.1);
+            double prevEnergy    = audio.GetEnergy(prevTime);
+            double prevHighBand  = audio.GetHighBand(prevTime);
+            double energyMax     = Math.Max(0.01, Math.Max(energy, prevEnergy));
+            double energyDelta   = Math.Clamp((energy - prevEnergy) / energyMax, -1.0, 1.0);
+            double highBandDelta = Math.Clamp(highBand - prevHighBand, -1.0, 1.0);
+            double timeSinceAny  = Math.Min(
+                lastLeft  != null ? beat - lastLeft.Beat  : 999.0,
+                lastRight != null ? beat - lastRight.Beat : 999.0);
+            timeSinceAny = Math.Clamp(timeSinceAny / 8.0, 0.0, 1.0);
+            double songFraction  = songDurationBeats > 0
+                ? Math.Clamp(beat / songDurationBeats, 0.0, 1.0) : 0.0;
+
             // ---- Find the note nearest to this beat (within ±0.13 beats) ----
             var note    = beatmap.Notes.FirstOrDefault(n => Math.Abs(n.Beat - beat) < 0.13);
             bool hasNote = note is not null;
@@ -120,6 +139,10 @@ public sealed class TrainingExampleBuilder
                 MidBandEnergy:         midBand,
                 HighBandEnergy:        highBand,
                 SpectralCentroid:      centroid,
+                EnergyDelta:           energyDelta,
+                HighBandDelta:         highBandDelta,
+                TimeSinceAnyNote:      timeSinceAny,
+                SongFraction:          songFraction,
                 HasNote:               hasNote,
                 NoteHand:              noteHand,
                 NoteLane:              note?.Lane ?? -1,
