@@ -17,25 +17,20 @@ public sealed class CandidateEventProposer
     {
         Guard.NotNull(ctx, nameof(ctx));
 
-        // Pre-compute the most-recent and second-most-recent note per hand from already-placed notes.
-        // Both are passed to the neural context so the network can learn phrasing patterns
-        // (e.g., left follows right, direction flow, 2-note alternating patterns).
         CanonicalNote? lastLeft = null, lastRight = null;
-        CanonicalNote? prev2Left = null, prev2Right = null;
         foreach (var n in ctx.PlacedNotes)
         {
             if (n.Hand == NoteHand.Left)
             {
-                if (lastLeft == null || n.Beat > lastLeft.Beat) { prev2Left  = lastLeft;  lastLeft  = n; }
+                if (lastLeft == null || n.Beat > lastLeft.Beat) lastLeft = n;
             }
             else
             {
-                if (lastRight == null || n.Beat > lastRight.Beat) { prev2Right = lastRight; lastRight = n; }
+                if (lastRight == null || n.Beat > lastRight.Beat) lastRight = n;
             }
         }
 
         var proposed  = new List<ProposedEvent>();
-        bool nextLeft = true;
 
         // Difficulty-aware threshold: tighter for easy difficulties (fewer false-positives),
         // looser for expert (high note density expected). Heuristic uses a much lower floor.
@@ -53,110 +48,172 @@ public sealed class CandidateEventProposer
 
         foreach (var candidate in ctx.CandidateGrid)
         {
-            double score = ScoreCandidate(candidate, ctx, lastLeft, lastRight, prev2Left, prev2Right,
-                                          nextLeft, out var neuralPred);
+            double score = ScoreCandidate(
+                candidate,
+                ctx,
+                lastLeft,
+                lastRight,
+                ctx.LeftHandContext,
+                ctx.RightHandContext,
+                ctx.GruHiddenState?.Clone(),
+                out var neuralPred);
             if (score < threshold) continue;
 
-            var hand = nextLeft ? NoteHand.Left : NoteHand.Right;
-            nextLeft = !nextLeft;
+            var hand = neuralPred.HasValue && neuralPred.Value.HandScore >= 0.5
+                ? NoteHand.Right
+                : NoteHand.Left;
 
-            proposed.Add(new ProposedEvent(candidate, score, hand, score, neuralPred));
+            proposed.Add(new ProposedEvent(candidate, score, hand, neuralPred?.HandScore ?? score, neuralPred));
         }
 
         return ApplyDensityControl(proposed, ctx);
     }
 
-    private double ScoreCandidate(TimingCandidate candidate, GenerationContext ctx,
-                                  CanonicalNote? lastLeft, CanonicalNote? lastRight,
-                                  CanonicalNote? prev2Left, CanonicalNote? prev2Right,
-                                  bool isNextLeft,
-                                  out NeuralMapPrediction? neuralPred)
+    internal static NeuralPlacementContext BuildNeuralContext(
+        TimingCandidate candidate,
+        GenerationContext ctx,
+        CanonicalNote? lastLeft,
+        CanonicalNote? lastRight,
+        SwingContext leftCtx,
+        SwingContext rightCtx,
+        GruState? gruState)
+    {
+        double beatStrength = ComputeBeatStrength(candidate.Beat);
+        int    measureBeat  = ((int)Math.Floor(candidate.Beat) % 4) + 1;
+        double energy       = ctx.AudioAnalysis.GetEnergy(candidate.TimeSeconds);
+        double phase        = candidate.Beat - Math.Floor(candidate.Beat);
+        double secProg      = GetSectionProgress(candidate.TimeSeconds, ctx);
+        double barPosition  = (candidate.Beat % 4) / 4.0;
+        double localNps     = EstimateLocalNps(candidate.Beat, ctx);
+        double prevTime      = Math.Max(0, candidate.TimeSeconds - 0.1);
+        double prevEnergy    = ctx.AudioAnalysis.GetEnergy(prevTime);
+        double prevHighBand  = ctx.AudioAnalysis.GetHighBand(prevTime);
+        double energyMax     = Math.Max(0.01, Math.Max(energy, prevEnergy));
+        double energyDelta   = Math.Clamp((energy - prevEnergy) / energyMax, -1.0, 1.0);
+        double highBandDelta = Math.Clamp(ctx.AudioAnalysis.GetHighBand(candidate.TimeSeconds) - prevHighBand, -1.0, 1.0);
+        double totalBeats    = MathHelpers.SecondsToBeat(ctx.AudioAnalysis.DurationSeconds, ctx.Song.BeatsPerMinute);
+        double songFraction  = totalBeats > 0 ? Math.Clamp(candidate.Beat / totalBeats, 0.0, 1.0) : 0.0;
+        double spectralFlux  = ctx.AudioAnalysis.GetSpectralFlux(candidate.TimeSeconds);
+        double transient     = ctx.AudioAnalysis.GetTransient(candidate.TimeSeconds);
+        double energyTrend4  = ctx.AudioAnalysis.GetMeanEnergyBeforeBeats(candidate.TimeSeconds, ctx.Song.BeatsPerMinute, 4);
+        double energyTrend8  = ctx.AudioAnalysis.GetMeanEnergyBeforeBeats(candidate.TimeSeconds, ctx.Song.BeatsPerMinute, 8);
+        int    sectionType   = GetSectionTypeIndex(candidate.TimeSeconds, ctx);
+        double leftParity    = ParityStateFromSwingContext(leftCtx);
+        double rightParity   = ParityStateFromSwingContext(rightCtx);
+        var (beatsSinceSectionStart, beatsToSectionBoundary) =
+            MappingFeatureEngineering.SectionBoundaryFeatures(ctx.AudioAnalysis.Sections, candidate.Beat);
+        var (_, prev2Left)   = MappingFeatureEngineering.LastTwoForHand(ctx.PlacedNotes, NoteHand.Left);
+        var (_, prev2Right)  = MappingFeatureEngineering.LastTwoForHand(ctx.PlacedNotes, NoteHand.Right);
+        double lookaheadBeat   = Math.Min(candidate.Beat + 1.0, totalBeats);
+        double lookaheadSec    = MathHelpers.BeatToSeconds(lookaheadBeat, ctx.Song.BeatsPerMinute);
+        double lookaheadEnergy = ctx.AudioAnalysis.GetEnergy(lookaheadSec);
+        double lookaheadOnset  = ctx.AudioAnalysis.GetOnsetStrength(lookaheadSec);
+        double futureEnergy4   = ctx.AudioAnalysis.GetMeanEnergyAfterBeats(candidate.TimeSeconds, ctx.Song.BeatsPerMinute, 4);
+        double futureEnergy8   = ctx.AudioAnalysis.GetMeanEnergyAfterBeats(candidate.TimeSeconds, ctx.Song.BeatsPerMinute, 8);
+        double futureEnergy16  = ctx.AudioAnalysis.GetMeanEnergyAfterBeats(candidate.TimeSeconds, ctx.Song.BeatsPerMinute, 16);
+        double futureOnset4    = ctx.AudioAnalysis.GetMeanOnsetAfterBeats(candidate.TimeSeconds, ctx.Song.BeatsPerMinute, 4);
+        double futureOnset8    = ctx.AudioAnalysis.GetMeanOnsetAfterBeats(candidate.TimeSeconds, ctx.Song.BeatsPerMinute, 8);
+        double futureOnset16   = ctx.AudioAnalysis.GetMeanOnsetAfterBeats(candidate.TimeSeconds, ctx.Song.BeatsPerMinute, 16);
+        double recentChordRate4 = MappingFeatureEngineering.RecentChordRate(ctx.PlacedNotes, candidate.Beat, 4.0);
+        double recentOffbeatRate4 = MappingFeatureEngineering.RecentOffbeatRate(ctx.PlacedNotes, candidate.Beat, 4.0);
+        double recentStreamRate4 = MappingFeatureEngineering.RecentStreamRate(ctx.PlacedNotes, candidate.Beat, 4.0);
+        double recentAlternation8 = MappingFeatureEngineering.RecentAlternation(ctx.PlacedNotes, 8);
+        double recentHandBalance8 = MappingFeatureEngineering.RecentHandBalance(ctx.PlacedNotes, candidate.Beat, 8.0);
+        double consecutiveSameHandCount = MappingFeatureEngineering.ConsecutiveSameHandCount(ctx.PlacedNotes);
+        double beatsSinceLastAny = MappingFeatureEngineering.BeatsSinceLastAny(ctx.PlacedNotes, candidate.Beat);
+        double notesAtCurrentBeatSoFar = MappingFeatureEngineering.NotesAtCurrentBeatSoFar(ctx.PlacedNotes, candidate.Beat);
+        double interHandLaneDistance = MappingFeatureEngineering.InterHandLaneDistance(lastLeft, lastRight);
+        double interHandRowDistance = MappingFeatureEngineering.InterHandRowDistance(lastLeft, lastRight);
+        double handsCrossedFlag = MappingFeatureEngineering.HandsCrossedFlag(lastLeft, lastRight);
+        double leftRecentTravel = MappingFeatureEngineering.RecentTravel(prev2Left, lastLeft);
+        double rightRecentTravel = MappingFeatureEngineering.RecentTravel(prev2Right, lastRight);
+        double recentLaneSpan4 = MappingFeatureEngineering.RecentLaneSpan(ctx.PlacedNotes, candidate.Beat, 4.0);
+        double recentRowSpan4 = MappingFeatureEngineering.RecentRowSpan(ctx.PlacedNotes, candidate.Beat, 4.0);
+
+        return new NeuralPlacementContext
+        {
+            OnsetStrength    = ctx.AudioAnalysis.GetOnsetStrength(candidate.TimeSeconds),
+            EnergyLevel      = energy,
+            SpectralFlux     = spectralFlux,
+            TransientStrength = transient,
+            LowBandEnergy    = ctx.AudioAnalysis.GetLowBand(candidate.TimeSeconds),
+            MidBandEnergy    = ctx.AudioAnalysis.GetMidBand(candidate.TimeSeconds),
+            HighBandEnergy   = ctx.AudioAnalysis.GetHighBand(candidate.TimeSeconds),
+            SpectralCentroid = ctx.AudioAnalysis.GetCentroid(candidate.TimeSeconds),
+            EnergyDelta      = energyDelta,
+            HighBandDelta    = highBandDelta,
+            EnergyTrend4     = energyTrend4,
+            EnergyTrend8     = energyTrend8,
+            LookaheadEnergy  = lookaheadEnergy,
+            LookaheadOnset   = lookaheadOnset,
+            BeatPhase        = phase,
+            Subdiv           = candidate.SubdivisionDenominator,
+            BeatStrength     = beatStrength,
+            MeasureBeat      = measureBeat,
+            SongFraction     = songFraction,
+            SectionProgress  = secProg,
+            BarPosition      = barPosition,
+            SectionTypeIndex = sectionType,
+            DifficultyLevel  = (int)ctx.Profile.Difficulty,
+            LocalNps         = localNps,
+            PrevLeftLane     = lastLeft?.Lane  ?? 1,
+            PrevLeftRow      = lastLeft?.Row   ?? 1,
+            PrevLeftCutDir   = lastLeft  != null ? (int)lastLeft.CutDirection  : -1,
+            PrevRightLane    = lastRight?.Lane ?? 2,
+            PrevRightRow     = lastRight?.Row  ?? 1,
+            PrevRightCutDir  = lastRight != null ? (int)lastRight.CutDirection : -1,
+            LeftParityState  = leftParity,
+            RightParityState = rightParity,
+            BeatsSinceLastLeft  = lastLeft  != null ? candidate.Beat - lastLeft.Beat  : 999,
+            BeatsSinceLastRight = lastRight != null ? candidate.Beat - lastRight.Beat : 999,
+            NoteHandHint     = 0.5,
+            FutureEnergy4    = futureEnergy4,
+            FutureEnergy8    = futureEnergy8,
+            FutureEnergy16   = futureEnergy16,
+            FutureOnset4     = futureOnset4,
+            FutureOnset8     = futureOnset8,
+            FutureOnset16    = futureOnset16,
+            BeatsSinceSectionStart = beatsSinceSectionStart,
+            BeatsToSectionBoundary = beatsToSectionBoundary,
+            RecentChordRate4  = recentChordRate4,
+            RecentOffbeatRate4 = recentOffbeatRate4,
+            RecentStreamRate4 = recentStreamRate4,
+            RecentAlternation8 = recentAlternation8,
+            RecentHandBalance8 = recentHandBalance8,
+            ConsecutiveSameHandCount = consecutiveSameHandCount,
+            BeatsSinceLastAny = beatsSinceLastAny,
+            NotesAtCurrentBeatSoFar = notesAtCurrentBeatSoFar,
+            InterHandLaneDistance = interHandLaneDistance,
+            InterHandRowDistance = interHandRowDistance,
+            HandsCrossedFlag = handsCrossedFlag,
+            LeftRecentTravel = leftRecentTravel,
+            RightRecentTravel = rightRecentTravel,
+            RecentLaneSpan4 = recentLaneSpan4,
+            RecentRowSpan4 = recentRowSpan4,
+            GruHiddenState   = gruState,
+        };
+    }
+
+    private double ScoreCandidate(
+        TimingCandidate candidate,
+        GenerationContext ctx,
+        CanonicalNote? lastLeft,
+        CanonicalNote? lastRight,
+        SwingContext leftCtx,
+        SwingContext rightCtx,
+        GruState? gruState,
+        out NeuralMapPrediction? neuralPred)
     {
         double localNps  = EstimateLocalNps(candidate.Beat, ctx);
         double targetNps = ctx.Profile.TargetNps;
 
-        if (ctx.NeuralModel is not null || ctx.PlacementScorer is not null)
+        if (ctx.MultiTaskModel is not null || ctx.PlacementScorer is not null)
         {
-            double beatStrength = ComputeBeatStrength(candidate.Beat);
-            int    measureBeat  = ((int)Math.Floor(candidate.Beat) % 4) + 1;
-            double energy       = ctx.AudioAnalysis.GetEnergy(candidate.TimeSeconds);
-            double phase        = candidate.Beat - Math.Floor(candidate.Beat);
-            double secProg      = GetSectionProgress(candidate.TimeSeconds, ctx);
-            double barPosition  = (candidate.Beat % 4) / 4.0;
-
-            // Derived temporal features
-            double prevTime      = Math.Max(0, candidate.TimeSeconds - 0.1);
-            double prevEnergy    = ctx.AudioAnalysis.GetEnergy(prevTime);
-            double prevHighBand  = ctx.AudioAnalysis.GetHighBand(prevTime);
-            double energyMax     = Math.Max(0.01, Math.Max(energy, prevEnergy));
-            double energyDelta   = Math.Clamp((energy - prevEnergy) / energyMax, -1.0, 1.0);
-            double highBandDelta = Math.Clamp(ctx.AudioAnalysis.GetHighBand(candidate.TimeSeconds) - prevHighBand, -1.0, 1.0);
-            double totalBeats    = MathHelpers.SecondsToBeat(ctx.AudioAnalysis.DurationSeconds, ctx.Song.BeatsPerMinute);
-            double songFraction  = totalBeats > 0 ? Math.Clamp(candidate.Beat / totalBeats, 0.0, 1.0) : 0.0;
-
-            // New features: spectral flux, transient, energy trends, section type
-            double spectralFlux  = ctx.AudioAnalysis.GetSpectralFlux(candidate.TimeSeconds);
-            double transient     = ctx.AudioAnalysis.GetTransient(candidate.TimeSeconds);
-            double energyTrend4  = ctx.AudioAnalysis.GetMeanEnergyBeforeBeats(
-                candidate.TimeSeconds, ctx.Song.BeatsPerMinute, 4);
-            double energyTrend8  = ctx.AudioAnalysis.GetMeanEnergyBeforeBeats(
-                candidate.TimeSeconds, ctx.Song.BeatsPerMinute, 8);
-            int    sectionType   = GetSectionTypeIndex(candidate.TimeSeconds, ctx);
-
-            // Parity state: read the current parity from the swing contexts
-            double leftParity  = ParityStateFromSwingContext(ctx.LeftHandContext);
-            double rightParity = ParityStateFromSwingContext(ctx.RightHandContext);
-
-            // Lookahead audio (1 beat ahead)
-            double lookaheadBeat   = Math.Min(candidate.Beat + 1.0, totalBeats);
-            double lookaheadSec    = MathHelpers.BeatToSeconds(lookaheadBeat, ctx.Song.BeatsPerMinute);
-            double lookaheadEnergy = ctx.AudioAnalysis.GetEnergy(lookaheadSec);
-            double lookaheadOnset  = ctx.AudioAnalysis.GetOnsetStrength(lookaheadSec);
-
-            var nctx = new NeuralPlacementContext
-            {
-                OnsetStrength    = ctx.AudioAnalysis.GetOnsetStrength(candidate.TimeSeconds),
-                EnergyLevel      = energy,
-                SpectralFlux     = spectralFlux,
-                TransientStrength = transient,
-                LowBandEnergy    = ctx.AudioAnalysis.GetLowBand(candidate.TimeSeconds),
-                MidBandEnergy    = ctx.AudioAnalysis.GetMidBand(candidate.TimeSeconds),
-                HighBandEnergy   = ctx.AudioAnalysis.GetHighBand(candidate.TimeSeconds),
-                SpectralCentroid = ctx.AudioAnalysis.GetCentroid(candidate.TimeSeconds),
-                EnergyDelta      = energyDelta,
-                HighBandDelta    = highBandDelta,
-                EnergyTrend4     = energyTrend4,
-                EnergyTrend8     = energyTrend8,
-                LookaheadEnergy  = lookaheadEnergy,
-                LookaheadOnset   = lookaheadOnset,
-                BeatPhase        = phase,
-                Subdiv           = candidate.SubdivisionDenominator,
-                BeatStrength     = beatStrength,
-                MeasureBeat      = measureBeat,
-                SongFraction     = songFraction,
-                SectionProgress  = secProg,
-                BarPosition      = barPosition,
-                SectionTypeIndex = sectionType,
-                DifficultyLevel  = (int)ctx.Profile.Difficulty,
-                LocalNps         = localNps,
-                PrevLeftLane     = lastLeft?.Lane  ?? 1,
-                PrevLeftRow      = lastLeft?.Row   ?? 1,
-                PrevLeftCutDir   = lastLeft  != null ? (int)lastLeft.CutDirection  : -1,
-                PrevRightLane    = lastRight?.Lane ?? 2,
-                PrevRightRow     = lastRight?.Row  ?? 1,
-                PrevRightCutDir  = lastRight != null ? (int)lastRight.CutDirection : -1,
-                LeftParityState  = leftParity,
-                RightParityState = rightParity,
-                BeatsSinceLastLeft  = lastLeft  != null ? candidate.Beat - lastLeft.Beat  : 999,
-                BeatsSinceLastRight = lastRight != null ? candidate.Beat - lastRight.Beat : 999,
-                NoteHandHint     = isNextLeft ? 0.0 : 1.0,
-                GruHiddenState   = ctx.GruHiddenState,
-            };
-
+            var nctx = BuildNeuralContext(candidate, ctx, lastLeft, lastRight, leftCtx, rightCtx, gruState);
             double score;
-            if (ctx.NeuralModel is not null)
+            if (ctx.MultiTaskModel is not null)
             {
-                var pred = ctx.NeuralModel.PredictAll(in nctx);
+                var pred = ctx.MultiTaskModel.PredictAll(in nctx);
                 neuralPred = pred;
                 score = pred.PlacementScore;
             }

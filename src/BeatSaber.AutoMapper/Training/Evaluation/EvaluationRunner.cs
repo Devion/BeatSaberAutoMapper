@@ -27,6 +27,7 @@ public sealed class EvaluationRunner
         int tp = 0, fp = 0, fn = 0;
         int handCorrect = 0;
         int noteCount = 0;
+        var multiTask = scorer as IMultiTaskPlacementModel;
 
         foreach (var ex in testExamples)
         {
@@ -41,8 +42,19 @@ public sealed class EvaluationRunner
             if (ex.HasNote && predicted)
             {
                 noteCount++;
-                // Attribute accuracy (simplified: random baseline for v1)
-                if (ex.NoteHand >= 0) handCorrect++;
+                if (ex.NoteHand >= 0)
+                {
+                    if (multiTask is not null)
+                    {
+                        var predAll = multiTask.PredictAll(in ctx);
+                        int predHand = predAll.HandScore >= 0.5 ? 1 : 0;
+                        if (predHand == ex.NoteHand) handCorrect++;
+                    }
+                    else
+                    {
+                        handCorrect++;
+                    }
+                }
             }
         }
 
@@ -97,6 +109,29 @@ public sealed class EvaluationRunner
         RightParityState  = ex.RightParityState,
         BeatsSinceLastLeft  = ex.BeatsSinceLastLeft,
         BeatsSinceLastRight = ex.BeatsSinceLastRight,
-        NoteHandHint      = ex.NoteHand >= 0 ? ex.NoteHand : 0.5,
+        NoteHandHint      = 0.5,
+        FutureEnergy4     = ex.FutureEnergy4,
+        FutureEnergy8     = ex.FutureEnergy8,
+        FutureEnergy16    = ex.FutureEnergy16,
+        FutureOnset4      = ex.FutureOnset4,
+        FutureOnset8      = ex.FutureOnset8,
+        FutureOnset16     = ex.FutureOnset16,
+        BeatsSinceSectionStart = ex.BeatsSinceSectionStart,
+        BeatsToSectionBoundary = ex.BeatsToSectionBoundary,
+        RecentChordRate4  = ex.RecentChordRate4,
+        RecentOffbeatRate4 = ex.RecentOffbeatRate4,
+        RecentStreamRate4 = ex.RecentStreamRate4,
+        RecentAlternation8 = ex.RecentAlternation8,
+        RecentHandBalance8 = ex.RecentHandBalance8,
+        ConsecutiveSameHandCount = ex.ConsecutiveSameHandCount,
+        BeatsSinceLastAny = ex.BeatsSinceLastAny,
+        NotesAtCurrentBeatSoFar = ex.NotesAtCurrentBeatSoFar,
+        InterHandLaneDistance = ex.InterHandLaneDistance,
+        InterHandRowDistance = ex.InterHandRowDistance,
+        HandsCrossedFlag = ex.HandsCrossedFlag,
+        LeftRecentTravel = ex.LeftRecentTravel,
+        RightRecentTravel = ex.RightRecentTravel,
+        RecentLaneSpan4 = ex.RecentLaneSpan4,
+        RecentRowSpan4 = ex.RecentRowSpan4,
     };
 }

@@ -17,35 +17,49 @@ internal sealed class ValidationAudioCache
     private const string CacheVersion = "v3";
 
     private readonly string _cacheDir;
+    private readonly string[] _fallbackCacheDirs;
 
-    public ValidationAudioCache(string artifactsPath)
+    public ValidationAudioCache(
+        string cachePath,
+        bool exactDirectory = false,
+        params string[] fallbackCacheDirs)
     {
-        _cacheDir = Path.Combine(artifactsPath, "validation_audio_cache");
+        _cacheDir = exactDirectory
+            ? cachePath
+            : Path.Combine(cachePath, "validation_audio_cache");
+        _fallbackCacheDirs = fallbackCacheDirs
+            .Where(d => !string.IsNullOrWhiteSpace(d))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
         Directory.CreateDirectory(_cacheDir);
     }
 
     /// <summary>Returns a cached result, or <c>null</c> if the entry is missing or stale.</summary>
     public AudioAnalysisResult? TryLoad(string audioFilePath)
     {
-        string cachePath = CacheFilePath(audioFilePath);
-        if (!File.Exists(cachePath)) return null;
-
-        try
+        foreach (var cachePath in EnumerateCandidateCachePaths(audioFilePath))
         {
-            var envelope = JsonSerializer.Deserialize<CacheEnvelope>(
-                File.ReadAllText(cachePath), SerializerOptions);
-            if (envelope?.Result is null) return null;
-            if (envelope.Version != CacheVersion) return null;
+            if (!File.Exists(cachePath)) continue;
 
-            long lastWrite = File.GetLastWriteTimeUtc(audioFilePath).Ticks;
-            if (envelope.SourceLastWriteTicks != lastWrite) return null;
+            try
+            {
+                var envelope = JsonSerializer.Deserialize<CacheEnvelope>(
+                    File.ReadAllText(cachePath), SerializerOptions);
+                if (envelope?.Result is null) continue;
+                if (envelope.Version != CacheVersion) continue;
 
-            return envelope.Result;
+                long lastWrite = File.GetLastWriteTimeUtc(audioFilePath).Ticks;
+                if (envelope.SourceLastWriteTicks != lastWrite) continue;
+
+                return envelope.Result;
+            }
+            catch
+            {
+                // Keep searching fallback cache locations.
+            }
         }
-        catch
-        {
-            return null;
-        }
+
+        return null;
     }
 
     /// <summary>Persists an analysis result. Write failures are non-fatal.</summary>
@@ -59,7 +73,7 @@ internal sealed class ValidationAudioCache
                 SourceLastWriteTicks = File.GetLastWriteTimeUtc(audioFilePath).Ticks,
                 Result               = result,
             };
-            File.WriteAllText(CacheFilePath(audioFilePath),
+            File.WriteAllText(CacheFilePath(audioFilePath, _cacheDir),
                 JsonSerializer.Serialize(envelope, SerializerOptions));
         }
         catch { /* non-fatal */ }
@@ -67,10 +81,17 @@ internal sealed class ValidationAudioCache
 
     // -----------------------------------------------------------------------
 
-    private string CacheFilePath(string audioFilePath)
+    private IEnumerable<string> EnumerateCandidateCachePaths(string audioFilePath)
+    {
+        yield return CacheFilePath(audioFilePath, _cacheDir);
+        foreach (var dir in _fallbackCacheDirs)
+            yield return CacheFilePath(audioFilePath, dir);
+    }
+
+    private static string CacheFilePath(string audioFilePath, string cacheDir)
     {
         byte[] hash = SHA256.HashData(Encoding.UTF8.GetBytes(Path.GetFullPath(audioFilePath)));
-        return Path.Combine(_cacheDir, Convert.ToHexString(hash)[..16] + ".json");
+        return Path.Combine(cacheDir, Convert.ToHexString(hash)[..16] + ".json");
     }
 
     private static readonly JsonSerializerOptions SerializerOptions = new()

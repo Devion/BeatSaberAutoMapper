@@ -54,9 +54,13 @@ public sealed class SelfSupervisedExampleGenerator
         double bpm = audio.EstimatedBpm > 0 ? audio.EstimatedBpm : 120.0;
         double songDurationBeats = audio.DurationSeconds > 0
             ? MathHelpers.SecondsToBeat(audio.DurationSeconds, bpm) : 1.0;
+        var orderedNotes = generated.Notes
+            .OrderBy(n => n.Beat)
+            .ThenBy(n => n.Hand == NoteHand.Left ? 0 : 1)
+            .ToList();
 
         // Sorted note times for fast "covered?" lookup
-        var noteTimes = generated.Notes
+        var noteTimes = orderedNotes
             .Select(n => MathHelpers.BeatToSeconds(n.Beat, bpm))
             .OrderBy(t => t)
             .ToList();
@@ -64,7 +68,8 @@ public sealed class SelfSupervisedExampleGenerator
         // ------------------------------------------------------------------
         // 1. Score every placed note — reinforce good, penalise bad
         // ------------------------------------------------------------------
-        foreach (var note in generated.Notes)
+        var history = new List<CanonicalNote>();
+        foreach (var note in orderedNotes)
         {
             double noteTime = MathHelpers.BeatToSeconds(note.Beat, bpm);
             double quality  = NoteQualityScorer.ScorePosition(noteTime, note.Beat, audio);
@@ -79,12 +84,14 @@ public sealed class SelfSupervisedExampleGenerator
             if (quality >= StrongPositiveThreshold)
             {
                 result.Add(MakeExample(note.Beat, noteTime, audio, bpm, difficultyLevel,
+                    history,
                     localNps, songDurationBeats, hasNote: true, weight: positiveWeight * quality,
                     noteHand: hand, noteLane: lane, noteRow: row, noteCutDir: cutDir));
             }
             else if (quality >= WeakPositiveThreshold)
             {
                 result.Add(MakeExample(note.Beat, noteTime, audio, bpm, difficultyLevel,
+                    history,
                     localNps, songDurationBeats, hasNote: true, weight: positiveWeight * 0.5,
                     noteHand: hand, noteLane: lane, noteRow: row, noteCutDir: cutDir));
             }
@@ -94,9 +101,11 @@ public sealed class SelfSupervisedExampleGenerator
                     ? negativeWeight * 1.5
                     : negativeWeight;
                 result.Add(MakeExample(note.Beat, noteTime, audio, bpm, difficultyLevel,
+                    history,
                     localNps, songDurationBeats, hasNote: false, weight: w));
             }
             // Middle range (0.35–0.50): ambiguous, skip to avoid noisy signal
+            history.Add(note);
         }
 
         // ------------------------------------------------------------------
@@ -124,6 +133,7 @@ public sealed class SelfSupervisedExampleGenerator
             if (score < MissedOnsetScoreMin) continue;
 
             result.Add(MakeExample(beat, onset, audio, bpm, difficultyLevel,
+                HistoryBeforeBeat(orderedNotes, beat),
                 localNps: 0, songDurationBeats, hasNote: true, weight: positiveWeight));
         }
 
@@ -156,6 +166,7 @@ public sealed class SelfSupervisedExampleGenerator
                 if (covered) continue;
 
                 result.Add(MakeExample(beat, bt, audio, bpm, difficultyLevel,
+                    HistoryBeforeBeat(orderedNotes, beat),
                     localNps: 0, songDurationBeats, hasNote: true, weight: positiveWeight * 0.7));
             }
         }
@@ -168,6 +179,7 @@ public sealed class SelfSupervisedExampleGenerator
     private static TrainingExample MakeExample(
         double beat, double timeSeconds,
         AudioAnalysisResult audio, double bpm, int difficultyLevel,
+        IReadOnlyList<CanonicalNote> history,
         double localNps, double songDurationBeats, bool hasNote, double weight,
         int noteHand = -1, int noteLane = -1, int noteRow = -1, int noteCutDir = -1)
     {
@@ -200,6 +212,34 @@ public sealed class SelfSupervisedExampleGenerator
 
         int sectionTypeIdx     = GetSectionTypeIndex(timeSeconds, audio);
         double sectionProgress = GetSectionProgress(timeSeconds, audio);
+        var (lastLeft, prev2Left)   = MappingFeatureEngineering.LastTwoForHand(history, NoteHand.Left);
+        var (lastRight, prev2Right) = MappingFeatureEngineering.LastTwoForHand(history, NoteHand.Right);
+        double leftParity  = lastLeft is not null ? (lastLeft.CutDirection is CutDirection.Up or CutDirection.UpLeft or CutDirection.UpRight or CutDirection.Left or CutDirection.Right ? 1.0 : 0.0) : 0.5;
+        double rightParity = lastRight is not null ? (lastRight.CutDirection is CutDirection.Up or CutDirection.UpLeft or CutDirection.UpRight or CutDirection.Left or CutDirection.Right ? 1.0 : 0.0) : 0.5;
+        double beatsSinceLeft = lastLeft is not null ? Math.Max(0, beat - lastLeft.Beat) : 999;
+        double beatsSinceRight = lastRight is not null ? Math.Max(0, beat - lastRight.Beat) : 999;
+        var (beatsSinceSectionStart, beatsToSectionBoundary) = MappingFeatureEngineering.SectionBoundaryFeatures(audio.Sections, beat);
+        double futureEnergy4 = audio.GetMeanEnergyAfterBeats(timeSeconds, bpm, 4);
+        double futureEnergy8 = audio.GetMeanEnergyAfterBeats(timeSeconds, bpm, 8);
+        double futureEnergy16 = audio.GetMeanEnergyAfterBeats(timeSeconds, bpm, 16);
+        double futureOnset4 = audio.GetMeanOnsetAfterBeats(timeSeconds, bpm, 4);
+        double futureOnset8 = audio.GetMeanOnsetAfterBeats(timeSeconds, bpm, 8);
+        double futureOnset16 = audio.GetMeanOnsetAfterBeats(timeSeconds, bpm, 16);
+        double recentChordRate4 = MappingFeatureEngineering.RecentChordRate(history, beat, 4.0);
+        double recentOffbeatRate4 = MappingFeatureEngineering.RecentOffbeatRate(history, beat, 4.0);
+        double recentStreamRate4 = MappingFeatureEngineering.RecentStreamRate(history, beat, 4.0);
+        double recentAlternation8 = MappingFeatureEngineering.RecentAlternation(history, 8);
+        double recentHandBalance8 = MappingFeatureEngineering.RecentHandBalance(history, beat, 8.0);
+        double consecutiveSameHandCount = MappingFeatureEngineering.ConsecutiveSameHandCount(history);
+        double beatsSinceLastAny = MappingFeatureEngineering.BeatsSinceLastAny(history, beat);
+        double notesAtCurrentBeatSoFar = MappingFeatureEngineering.NotesAtCurrentBeatSoFar(history, beat);
+        double interHandLaneDistance = MappingFeatureEngineering.InterHandLaneDistance(lastLeft, lastRight);
+        double interHandRowDistance = MappingFeatureEngineering.InterHandRowDistance(lastLeft, lastRight);
+        double handsCrossedFlag = MappingFeatureEngineering.HandsCrossedFlag(lastLeft, lastRight);
+        double leftRecentTravel = MappingFeatureEngineering.RecentTravel(prev2Left, lastLeft);
+        double rightRecentTravel = MappingFeatureEngineering.RecentTravel(prev2Right, lastRight);
+        double recentLaneSpan4 = MappingFeatureEngineering.RecentLaneSpan(history, beat, 4.0);
+        double recentRowSpan4 = MappingFeatureEngineering.RecentRowSpan(history, beat, 4.0);
 
         return new TrainingExample(
             Beat:                   beat,
@@ -227,23 +267,53 @@ public sealed class SelfSupervisedExampleGenerator
             DifficultyLevel:        difficultyLevel,
             LocalNps:               localNps,
             BarPosition:            barPosition,
-            PreviousLeftLane:       1,
-            PreviousLeftRow:        1,
-            PreviousLeftCutDir:     -1,
-            PreviousRightLane:      2,
-            PreviousRightRow:       1,
-            PreviousRightCutDir:    -1,
-            LeftParityState:        0.5,
-            RightParityState:       0.5,
-            BeatsSinceLastLeft:     999,
-            BeatsSinceLastRight:    999,
+            PreviousLeftLane:       lastLeft?.Lane ?? 1,
+            PreviousLeftRow:        lastLeft?.Row ?? 1,
+            PreviousLeftCutDir:     lastLeft is not null ? (int)lastLeft.CutDirection : -1,
+            PreviousRightLane:      lastRight?.Lane ?? 2,
+            PreviousRightRow:       lastRight?.Row ?? 1,
+            PreviousRightCutDir:    lastRight is not null ? (int)lastRight.CutDirection : -1,
+            LeftParityState:        leftParity,
+            RightParityState:       rightParity,
+            BeatsSinceLastLeft:     beatsSinceLeft,
+            BeatsSinceLastRight:    beatsSinceRight,
             HasNote:                hasNote,
             NoteHand:               noteHand,
             NoteLane:               noteLane,
             NoteRow:                noteRow,
             NoteCutDir:             noteCutDir,
-            Weight:                 weight);
+            Weight:                 weight,
+            FutureEnergy4:          futureEnergy4,
+            FutureEnergy8:          futureEnergy8,
+            FutureEnergy16:         futureEnergy16,
+            FutureOnset4:           futureOnset4,
+            FutureOnset8:           futureOnset8,
+            FutureOnset16:          futureOnset16,
+            BeatsSinceSectionStart: beatsSinceSectionStart,
+            BeatsToSectionBoundary: beatsToSectionBoundary,
+            RecentChordRate4:       recentChordRate4,
+            RecentOffbeatRate4:     recentOffbeatRate4,
+            RecentStreamRate4:      recentStreamRate4,
+            RecentAlternation8:     recentAlternation8,
+            RecentHandBalance8:     recentHandBalance8,
+            ConsecutiveSameHandCount: consecutiveSameHandCount,
+            BeatsSinceLastAny:      beatsSinceLastAny,
+            NotesAtCurrentBeatSoFar: notesAtCurrentBeatSoFar,
+            InterHandLaneDistance:  interHandLaneDistance,
+            InterHandRowDistance:   interHandRowDistance,
+            HandsCrossedFlag:       handsCrossedFlag,
+            LeftRecentTravel:       leftRecentTravel,
+            RightRecentTravel:      rightRecentTravel,
+            RecentLaneSpan4:        recentLaneSpan4,
+            RecentRowSpan4:         recentRowSpan4);
     }
+
+    private static List<CanonicalNote> HistoryBeforeBeat(IReadOnlyList<CanonicalNote> orderedNotes, double beat) =>
+        orderedNotes
+            .Where(n => n.Beat < beat)
+            .OrderBy(n => n.Beat)
+            .ThenBy(n => n.Hand == NoteHand.Left ? 0 : 1)
+            .ToList();
 
     private static int GetSectionTypeIndex(double timeSeconds, AudioAnalysisResult audio)
     {

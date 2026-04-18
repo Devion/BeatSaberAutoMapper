@@ -8,11 +8,11 @@ namespace BeatSaber.AutoMapper.Training.Models;
 
 /// <summary>
 /// TorchSharp-backed GPU trainer for the GRU-based Beat Saber note placement model.
-/// Training is sequence-based (windows of W=16 steps) with BPTT.
+/// Training is sequence-based with contiguous truncated BPTT over longer chunks.
 /// A shadow CPU model is kept in sync after each epoch for inference during generation
 /// quality validation — no disk I/O on the hot path.
 /// </summary>
-public sealed class TorchPlacementTrainer : IPlacementScorer, IDisposable
+public sealed class TorchPlacementTrainer : IMultiTaskPlacementModel, IDisposable
 {
     private readonly BeatSaberMappingNet _gpu;
     private readonly BeatSaberMappingNet _cpu;
@@ -22,9 +22,8 @@ public sealed class TorchPlacementTrainer : IPlacementScorer, IDisposable
     private          string?             _bestWeightsTmp;
 
     // Sequence training hyper-parameters
-    private const int WindowSize  = 16;
-    private const int WindowStride = 8;
-    private const int BatchWindows = 128;  // windows per gradient step
+    private const int WindowSize  = 64;
+    private const int WindowStride = 64;
 
     public TorchPlacementTrainer()
     {
@@ -87,63 +86,38 @@ public sealed class TorchPlacementTrainer : IPlacementScorer, IDisposable
             _optimizerLr = lr;
         }
 
-        // Enumerate all (sequence, windowStart) pairs
-        var windows = new List<(IReadOnlyList<TrainingExample> Seq, int Start)>();
-        foreach (var seq in sequences)
-        {
-            if (seq.Count < 2) continue;
-            int maxStart = seq.Count - 1;
-            for (int i = 0; i + WindowSize <= seq.Count; i += WindowStride)
-                windows.Add((seq, i));
-            // Include the tail if it wasn't covered
-            if (maxStart - WindowSize + 1 > 0 && (seq.Count - WindowSize) % WindowStride != 0)
-                windows.Add((seq, Math.Max(0, seq.Count - WindowSize)));
-        }
-
-        if (windows.Count == 0) return (0, 0);
-
-        // Shuffle windows (deterministically per epoch based on existing state)
-        for (int i = windows.Count - 1; i > 0; i--)
-        {
-            int j = (int)((uint)HashCode.Combine(i, windows.Count) % (uint)(i + 1));
-            (windows[i], windows[j]) = (windows[j], windows[i]);
-        }
-
         // Class-balance weight from all examples in all sequences
         int posCount = 0, totalCount = 0;
         foreach (var seq in sequences) foreach (var ex in seq) { totalCount++; if (ex.HasNote) posCount++; }
         float posWt = posCount > 0 ? Math.Min((float)(totalCount - posCount) / posCount, 10f) : 1f;
 
-        const int D   = BeatSaberMappingNet.InputDim;
-        int  numBatch = (windows.Count + BatchWindows - 1) / BatchWindows;
+        const int D = BeatSaberMappingNet.InputDim;
         double totalLoss = 0, totalPlaceBce = 0;
+        int totalChunks = 0;
 
-        for (int b = 0; b < numBatch; b++)
+        foreach (var seq in sequences)
         {
-            int wStart = b * BatchWindows;
-            int wEnd   = Math.Min(wStart + BatchWindows, windows.Count);
-            int B      = wEnd - wStart;
-            int W      = WindowSize;
-
-            var xArr    = new float[B * W * D];
-            var yPlArr  = new float[B * W];
-            var yHaArr  = new float[B * W];
-            var yCdArr  = new long[B * W];
-            var yLnArr  = new long[B * W];
-            var yRwArr  = new long[B * W];
-            var hasMask = new float[B * W];
-            var cdMask  = new float[B * W];
-            var lnMask  = new float[B * W];
-            var rwMask  = new float[B * W];
-
-            for (int i = 0; i < B; i++)
+            if (seq.Count == 0) continue;
+            Tensor? hidden = null;
+            for (int start = 0; start < seq.Count; start += WindowStride)
             {
-                var (seq, seqStart) = windows[wStart + i];
-                for (int t = 0; t < W; t++)
+                int len = Math.Min(WindowSize, seq.Count - start);
+                var xArr    = new float[len * D];
+                var yPlArr  = new float[len];
+                var yHaArr  = new float[len];
+                var yCdArr  = new long[len];
+                var yLnArr  = new long[len];
+                var yRwArr  = new long[len];
+                var hasMask = new float[len];
+                var cdMask  = new float[len];
+                var lnMask  = new float[len];
+                var rwMask  = new float[len];
+                var exWtArr = new float[len];
+
+                for (int t = 0; t < len; t++)
                 {
-                    int si  = Math.Min(seqStart + t, seq.Count - 1);
-                    var ex  = seq[si];
-                    int idx = i * W + t;
+                    var ex  = seq[start + t];
+                    int idx = t;
                     FillFeaturesFromExample(ex, xArr, idx * D);
                     yPlArr[idx]  = ex.HasNote ? 1f : 0f;
                     yHaArr[idx]  = ex.NoteHand == 1 ? 1f : 0f;
@@ -154,100 +128,104 @@ public sealed class TorchPlacementTrainer : IPlacementScorer, IDisposable
                     cdMask[idx]  = ex.HasNote && ex.NoteCutDir >= 0 ? 1f : 0f;
                     lnMask[idx]  = ex.HasNote && ex.NoteLane   >= 0 ? 1f : 0f;
                     rwMask[idx]  = ex.HasNote && ex.NoteRow    >= 0 ? 1f : 0f;
+                    exWtArr[idx] = (float)Math.Max(0.05, ex.Weight);
                 }
+
+                long N = len;
+                using var xT      = tensor(xArr,    new long[] { 1, len, D }, device: _device);
+                using var yPlT    = tensor(yPlArr,  new long[] { N },          device: _device);
+                using var yHaT    = tensor(yHaArr,  new long[] { N },          device: _device);
+                using var yCdT    = tensor(yCdArr,  new long[] { N },          device: _device);
+                using var yLnT    = tensor(yLnArr,  new long[] { N },          device: _device);
+                using var yRwT    = tensor(yRwArr,  new long[] { N },          device: _device);
+                using var posWtT  = tensor(posWt,                             device: _device);
+                using var haMaskT = tensor(hasMask, new long[] { N },         device: _device);
+                using var cdMaskT = tensor(cdMask,  new long[] { N },         device: _device);
+                using var lnMaskT = tensor(lnMask,  new long[] { N },         device: _device);
+                using var rwMaskT = tensor(rwMask,  new long[] { N },         device: _device);
+                using var exWtT   = tensor(exWtArr, new long[] { N },         device: _device);
+
+                var (outT, hn) = _gpu.ForwardSequence(xT, hidden);
+                using (hidden) { }
+                hidden = hn.detach();
+                hn.Dispose();
+
+                using var plLgt = outT.select(1, 0);
+                using var haLgt = outT.select(1, 1);
+                using var cdLgt = outT.narrow(1, 2,  9);
+                using var lnLgt = outT.narrow(1, 11, 4);
+                using var rwLgt = outT.narrow(1, 15, 3);
+
+                var plBceTens = functional.binary_cross_entropy_with_logits(plLgt, yPlT, exWtT, Reduction.Mean, posWtT);
+                totalPlaceBce += plBceTens.item<float>();
+                var lossTerms = new List<Tensor> { plBceTens };
+
+                using var haMaskIdx = (haMaskT > 0.5f).nonzero().squeeze(1);
+                if (haMaskIdx.shape[0] > 0)
+                {
+                    using var haSelLgt = haLgt.index_select(0, haMaskIdx);
+                    using var haSelY   = yHaT.index_select(0, haMaskIdx);
+                    using var haSelW   = exWtT.index_select(0, haMaskIdx);
+                    using var haRaw    = functional.binary_cross_entropy_with_logits(haSelLgt, haSelY, haSelW);
+                lossTerms.Add(0.8 * haRaw);
+                }
+
+                using var cdMaskIdx = (cdMaskT > 0.5f).nonzero().squeeze(1);
+                if (cdMaskIdx.shape[0] > 0)
+                {
+                    using var cdSelLgt = cdLgt.index_select(0, cdMaskIdx);
+                    using var cdSelY   = yCdT.index_select(0, cdMaskIdx);
+                    using var cdSelW   = exWtT.index_select(0, cdMaskIdx);
+                    using var cdRaw    = WeightedCrossEntropy(cdSelLgt, cdSelY, cdSelW);
+                    lossTerms.Add(1.0 * cdRaw);
+                }
+
+                using var lnMaskIdx = (lnMaskT > 0.5f).nonzero().squeeze(1);
+                if (lnMaskIdx.shape[0] > 0)
+                {
+                    using var lnSelLgt  = lnLgt.index_select(0, lnMaskIdx);
+                    using var lnSelY    = yLnT.index_select(0, lnMaskIdx);
+                    using var lnSelW    = exWtT.index_select(0, lnMaskIdx);
+                    var lnLoss          = 1.2 * WeightedCrossEntropy(lnSelLgt, lnSelY, lnSelW);
+                    lossTerms.Add(lnLoss);
+                }
+
+                using var rwMaskIdx = (rwMaskT > 0.5f).nonzero().squeeze(1);
+                if (rwMaskIdx.shape[0] > 0)
+                {
+                    using var rwSelLgt  = rwLgt.index_select(0, rwMaskIdx);
+                    using var rwSelY    = yRwT.index_select(0, rwMaskIdx);
+                    using var rwSelW    = exWtT.index_select(0, rwMaskIdx);
+                    var rwLoss          = 0.8 * WeightedCrossEntropy(rwSelLgt, rwSelY, rwSelW);
+                    lossTerms.Add(rwLoss);
+                }
+
+                Tensor loss;
+                if (lossTerms.Count == 1)
+                {
+                    loss = lossTerms[0];
+                }
+                else
+                {
+                    using var stacked = stack(lossTerms.ToArray());
+                    loss = stacked.sum();
+                    foreach (var t in lossTerms) t.Dispose();
+                }
+
+                totalLoss += loss.item<float>();
+                totalChunks++;
+                _optimizer.zero_grad();
+                loss.backward();
+                nn.utils.clip_grad_norm_(_gpu.parameters(), 5.0);
+                _optimizer.step();
+                outT.Dispose();
+                loss.Dispose();
             }
-
-            long N = B * W;
-            using var xT      = tensor(xArr,    new long[] { B, W, D }, device: _device);
-            using var yPlT    = tensor(yPlArr,  new long[] { N },        device: _device);
-            using var yHaT    = tensor(yHaArr,  new long[] { N },        device: _device);
-            using var yCdT    = tensor(yCdArr,  new long[] { N },        device: _device);
-            using var yLnT    = tensor(yLnArr,  new long[] { N },        device: _device);
-            using var yRwT    = tensor(yRwArr,  new long[] { N },        device: _device);
-            using var posWtT  = tensor(posWt,                             device: _device);
-            using var haMaskT = tensor(hasMask, new long[] { N },         device: _device);
-            using var cdMaskT = tensor(cdMask,  new long[] { N },         device: _device);
-            using var lnMaskT = tensor(lnMask,  new long[] { N },         device: _device);
-            using var rwMaskT = tensor(rwMask,  new long[] { N },         device: _device);
-
-            // forward: xT [B, W, D] → [B*W, OutDim]
-            using var outT  = _gpu.forward(xT);
-            using var plLgt = outT.select(1, 0);
-            using var haLgt = outT.select(1, 1);
-            using var cdLgt = outT.narrow(1, 2,  9);
-            using var lnLgt = outT.narrow(1, 11, 4);
-            using var rwLgt = outT.narrow(1, 15, 3);
-
-            var plBceTens = functional.binary_cross_entropy_with_logits(plLgt, yPlT, null, Reduction.Mean, posWtT);
-            totalPlaceBce += plBceTens.item<float>();
-            var lossTerms = new List<Tensor> { plBceTens };
-
-            using var haMaskIdx = (haMaskT > 0.5f).nonzero().squeeze(1);
-            if (haMaskIdx.shape[0] > 0)
-            {
-                using var haSelLgt = haLgt.index_select(0, haMaskIdx);
-                using var haSelY   = yHaT.index_select(0, haMaskIdx);
-                using var haRaw    = functional.binary_cross_entropy_with_logits(haSelLgt, haSelY);
-                lossTerms.Add(0.5 * haRaw);
-            }
-
-            using var cdMaskIdx = (cdMaskT > 0.5f).nonzero().squeeze(1);
-            if (cdMaskIdx.shape[0] > 0)
-            {
-                using var cdSelLgt = cdLgt.index_select(0, cdMaskIdx);
-                using var cdSelY   = yCdT.index_select(0, cdMaskIdx);
-                using var cdRaw    = functional.cross_entropy(cdSelLgt, cdSelY);
-                lossTerms.Add(1.0 * cdRaw);
-            }
-
-            using var lnMaskIdx = (lnMaskT > 0.5f).nonzero().squeeze(1);
-            if (lnMaskIdx.shape[0] > 0)
-            {
-                using var lnSelLgt  = lnLgt.index_select(0, lnMaskIdx);
-                using var lnSelY    = yLnT.index_select(0, lnMaskIdx);
-                using var lnCE      = functional.cross_entropy(lnSelLgt, lnSelY);
-                using var lnLogProb = functional.log_softmax(lnSelLgt, dim: 1);
-                using var lnProb    = softmax(lnSelLgt, dim: 1);
-                using var lnEntr    = -(lnProb * lnLogProb).sum(1).mean();
-                var lnLoss          = 1.2 * lnCE - 0.10 * lnEntr;
-                lossTerms.Add(lnLoss);
-            }
-
-            using var rwMaskIdx = (rwMaskT > 0.5f).nonzero().squeeze(1);
-            if (rwMaskIdx.shape[0] > 0)
-            {
-                using var rwSelLgt  = rwLgt.index_select(0, rwMaskIdx);
-                using var rwSelY    = yRwT.index_select(0, rwMaskIdx);
-                using var rwCE      = functional.cross_entropy(rwSelLgt, rwSelY);
-                using var rwLogProb = functional.log_softmax(rwSelLgt, dim: 1);
-                using var rwProb    = softmax(rwSelLgt, dim: 1);
-                using var rwEntr    = -(rwProb * rwLogProb).sum(1).mean();
-                var rwLoss          = 0.8 * rwCE - 0.08 * rwEntr;
-                lossTerms.Add(rwLoss);
-            }
-
-            Tensor loss;
-            if (lossTerms.Count == 1)
-            {
-                loss = lossTerms[0];
-            }
-            else
-            {
-                using var stacked = stack(lossTerms.ToArray());
-                loss = stacked.sum();
-                foreach (var t in lossTerms) t.Dispose();
-            }
-
-            totalLoss += loss.item<float>();
-            _optimizer.zero_grad();
-            loss.backward();
-            nn.utils.clip_grad_norm_(_gpu.parameters(), 5.0);
-            _optimizer.step();
-            loss.Dispose();
+            hidden?.Dispose();
         }
 
         SyncCpuShadow();
-        return (totalLoss / numBatch, totalPlaceBce / numBatch);
+        return (totalChunks > 0 ? totalLoss / totalChunks : 0, totalChunks > 0 ? totalPlaceBce / totalChunks : 0);
     }
 
     // ── Best-epoch snapshot ───────────────────────────────────────────────────
@@ -310,12 +288,63 @@ public sealed class TorchPlacementTrainer : IPlacementScorer, IDisposable
         return result;
     }
 
+    public NeuralMapPrediction PredictAll(in NeuralPlacementContext ctx)
+    {
+        using var noGrad = no_grad();
+        var f = new float[BeatSaberMappingNet.InputDim];
+        ctx.FillFeaturesFloat(f);
+        using var xT = tensor(f, new long[] { 1, 1, BeatSaberMappingNet.InputDim });
+        var (outT, hn) = ForwardStepCpu(xT, ctx.GruHiddenState);
+
+        if (ctx.GruHiddenState is not null)
+        {
+            var hnData = hn.data<float>();
+            for (int i = 0; i < ctx.GruHiddenState.H.Length; i++)
+                ctx.GruHiddenState.H[i] = hnData[i];
+        }
+        hn.Dispose();
+
+        using var plProb = sigmoid(outT.select(1, 0));
+        using var haProb = sigmoid(outT.select(1, 1));
+        using var cdSm   = softmax(outT.narrow(1, 2,  9), dim: 1);
+        using var lnSm   = softmax(outT.narrow(1, 11, 4), dim: 1);
+        using var rwSm   = softmax(outT.narrow(1, 15, 3), dim: 1);
+        outT.Dispose();
+
+        return new NeuralMapPrediction
+        {
+            PlacementScore = plProb.item<float>(),
+            HandScore      = haProb.item<float>(),
+            CutDirProbs    = ToDoubleArray(cdSm.squeeze(0)),
+            LaneProbs      = ToDoubleArray(lnSm.squeeze(0)),
+            RowProbs       = ToDoubleArray(rwSm.squeeze(0)),
+        };
+    }
+
     private (Tensor output, Tensor hn) ForwardStepCpu(Tensor x, GruState? state)
     {
         using var h0 = state is not null
             ? tensor(state.H, new long[] { BeatSaberMappingNet.GruLayers, 1, BeatSaberMappingNet.GruHiddenDim })
             : zeros(new long[] { BeatSaberMappingNet.GruLayers, 1, BeatSaberMappingNet.GruHiddenDim });
         return _cpu.ForwardStep(x, h0);
+    }
+
+    private static Tensor WeightedCrossEntropy(Tensor logits, Tensor targets, Tensor weights)
+    {
+        using var logProb = functional.log_softmax(logits, dim: 1);
+        using var idx     = targets.unsqueeze(1);
+        using var picked  = logProb.gather(1, idx).squeeze(1);
+        using var numer   = -(picked * weights).sum();
+        using var denom   = weights.sum().clamp_min(1e-6);
+        return numer / denom;
+    }
+
+    private static double[] ToDoubleArray(Tensor t)
+    {
+        var data = t.data<float>();
+        var arr  = new double[data.Count];
+        for (int i = 0; i < arr.Length; i++) arr[i] = data[i];
+        return arr;
     }
 
     // ── CPU shadow sync ───────────────────────────────────────────────────────
@@ -384,7 +413,31 @@ public sealed class TorchPlacementTrainer : IPlacementScorer, IDisposable
         arr[offset + 41] = (float)Math.Clamp(ex.BeatsSinceLastLeft  / 8.0, 0.0, 1.0);
         arr[offset + 42] = (float)Math.Clamp(ex.BeatsSinceLastRight / 8.0, 0.0, 1.0);
         arr[offset + 43] = (ex.PreviousLeftCutDir >= 0 || ex.PreviousRightCutDir >= 0) ? 1f : 0f;
-        arr[offset + 44] = ex.NoteHand == 0 ? 0f : ex.NoteHand == 1 ? 1f : 0.5f;
+        arr[offset + 44] = 0.5f;
+        // Phrase / history / geometry [45-67]
+        arr[offset + 45] = (float)Math.Clamp(ex.FutureEnergy4, 0.0, 1.0);
+        arr[offset + 46] = (float)Math.Clamp(ex.FutureEnergy8, 0.0, 1.0);
+        arr[offset + 47] = (float)Math.Clamp(ex.FutureEnergy16, 0.0, 1.0);
+        arr[offset + 48] = (float)Math.Clamp(ex.FutureOnset4, 0.0, 1.0);
+        arr[offset + 49] = (float)Math.Clamp(ex.FutureOnset8, 0.0, 1.0);
+        arr[offset + 50] = (float)Math.Clamp(ex.FutureOnset16, 0.0, 1.0);
+        arr[offset + 51] = (float)Math.Clamp(ex.BeatsSinceSectionStart / 16.0, 0.0, 1.0);
+        arr[offset + 52] = (float)Math.Clamp(ex.BeatsToSectionBoundary / 16.0, 0.0, 1.0);
+        arr[offset + 53] = (float)Math.Clamp(ex.RecentChordRate4, 0.0, 1.0);
+        arr[offset + 54] = (float)Math.Clamp(ex.RecentOffbeatRate4, 0.0, 1.0);
+        arr[offset + 55] = (float)Math.Clamp(ex.RecentStreamRate4, 0.0, 1.0);
+        arr[offset + 56] = (float)Math.Clamp(ex.RecentAlternation8, 0.0, 1.0);
+        arr[offset + 57] = (float)Math.Clamp(ex.RecentHandBalance8, 0.0, 1.0);
+        arr[offset + 58] = (float)Math.Clamp(ex.ConsecutiveSameHandCount / 8.0, 0.0, 1.0);
+        arr[offset + 59] = (float)Math.Clamp(ex.BeatsSinceLastAny / 8.0, 0.0, 1.0);
+        arr[offset + 60] = (float)Math.Clamp(ex.NotesAtCurrentBeatSoFar / 2.0, 0.0, 1.0);
+        arr[offset + 61] = (float)Math.Clamp(ex.InterHandLaneDistance / 3.0, 0.0, 1.0);
+        arr[offset + 62] = (float)Math.Clamp(ex.InterHandRowDistance / 2.0, 0.0, 1.0);
+        arr[offset + 63] = (float)Math.Clamp(ex.HandsCrossedFlag, 0.0, 1.0);
+        arr[offset + 64] = (float)Math.Clamp(ex.LeftRecentTravel / 5.0, 0.0, 1.0);
+        arr[offset + 65] = (float)Math.Clamp(ex.RightRecentTravel / 5.0, 0.0, 1.0);
+        arr[offset + 66] = (float)Math.Clamp(ex.RecentLaneSpan4 / 3.0, 0.0, 1.0);
+        arr[offset + 67] = (float)Math.Clamp(ex.RecentRowSpan4 / 2.0, 0.0, 1.0);
     }
 
     public void Dispose()

@@ -11,7 +11,7 @@ public sealed record TimingCandidate(
 public sealed class TimingGridBuilder
 {
     public static readonly double[] StandardSubdivisions =
-        [1.0, 0.5, 0.333333, 0.25, 0.1666667, 0.125];
+        [1.0, 0.5, 0.25];
 
     /// <summary>
     /// Build a candidate timing grid by aligning subdivisions to beat times
@@ -59,7 +59,7 @@ public sealed class TimingGridBuilder
         // Remove duplicates (same beat rounded to 4dp)
         var unique = candidates
             .GroupBy(c => Math.Round(c.Beat, 4))
-            .Select(g => g.OrderBy(c => c.SubdivisionDenominator).First())
+            .Select(g => g.OrderByDescending(c => c.SubdivisionDenominator).First())
             .OrderBy(c => c.Beat)
             .ToArray();
 

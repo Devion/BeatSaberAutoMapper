@@ -14,6 +14,7 @@ public sealed class GenerationContext
 
     // Optional learned models — null = fall back to heuristics
     public IPlacementScorer?     PlacementScorer { get; init; }
+    public IMultiTaskPlacementModel? MultiTaskModel { get; init; }
     /// <summary>
     /// Multi-task neural model — serves as placement scorer and provides cut-direction,
     /// lane and row distributions. Cached per-beat predictions are stored in ProposedEvent.
@@ -21,8 +22,8 @@ public sealed class GenerationContext
     public NeuralPlacementModel? NeuralModel { get; init; }
 
     public List<CanonicalNote> PlacedNotes { get; } = [];
-    public SwingContext LeftHandContext  { get; } = new(NoteHand.Left);
-    public SwingContext RightHandContext { get; } = new(NoteHand.Right);
+    public SwingContext LeftHandContext  { get; init; } = new(NoteHand.Left);
+    public SwingContext RightHandContext { get; init; } = new(NoteHand.Right);
     public Random Rng { get; init; } = new(42);
 
     /// <summary>

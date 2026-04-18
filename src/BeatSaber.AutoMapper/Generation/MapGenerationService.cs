@@ -103,11 +103,13 @@ public sealed class MapGenerationService
         Guard.NotNull(settings, nameof(settings));
 
         NeuralPlacementModel? neuralModel = null;
+        IMultiTaskPlacementModel? multiTaskModel = placementScorer as IMultiTaskPlacementModel;
         if (settings.UseLearned && settings.ArtifactsPath is not null)
         {
             neuralModel = NeuralPlacementModel.TryLoad(settings.ArtifactsPath);
             placementScorer ??= neuralModel
                              ?? (IPlacementScorer?)PlacementModel.TryLoad(settings.ArtifactsPath);
+            multiTaskModel ??= neuralModel;
         }
 
         var grid = _gridBuilder.Build(
@@ -128,6 +130,7 @@ public sealed class MapGenerationService
             Profile         = profile,
             CandidateGrid   = grid,
             PlacementScorer = placementScorer,
+            MultiTaskModel  = multiTaskModel,
             NeuralModel     = neuralModel,
             Rng             = new Random((int)settings.RandomSeed),
             GruHiddenState  = neuralModel is not null

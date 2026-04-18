@@ -21,7 +21,7 @@ public readonly struct NeuralMapPrediction
 /// Uses single-step GRU inference (<see cref="BeatSaberMappingNet.ForwardStep"/>) with
 /// <see cref="GruState"/> carried between steps to maintain temporal context.
 /// </summary>
-public sealed class NeuralPlacementModel : IPlacementScorer, IDisposable
+public sealed class NeuralPlacementModel : IMultiTaskPlacementModel, IDisposable
 {
     private readonly BeatSaberMappingNet _net;
 

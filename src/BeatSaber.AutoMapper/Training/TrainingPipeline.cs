@@ -127,8 +127,13 @@ public sealed class TrainingPipeline : IDisposable
         var buildStopwatch = Stopwatch.StartNew();
 
         // Separate cache directory for training audio (never touches the validation cache).
+        string trainingCacheDir = Path.Combine(options.ArtifactsOutputPath, "training_audio_cache");
+        string validationCacheDir = Path.Combine(options.ArtifactsOutputPath, "validation_audio_cache");
         var trainAudioCache = new ValidationAudioCache(
-            Path.Combine(options.ArtifactsOutputPath, "training_audio_cache"));
+            trainingCacheDir,
+            exactDirectory: true,
+            validationCacheDir,
+            Path.Combine(trainingCacheDir, "validation_audio_cache"));
 
         Parallel.ForEach(
             trainFolders,
@@ -219,7 +224,11 @@ public sealed class TrainingPipeline : IDisposable
         CachedPair[] cachedPairs = [];
         if (poolGroups.Count > 0)
         {
-            var audioCache  = new ValidationAudioCache(options.ArtifactsOutputPath);
+            var audioCache  = new ValidationAudioCache(
+                validationCacheDir,
+                exactDirectory: true,
+                trainingCacheDir,
+                Path.Combine(trainingCacheDir, "validation_audio_cache"));
             var poolTmp     = new CachedSong?[poolGroups.Count];
             int cacheHits   = 0;
             int cacheMisses = 0;
@@ -344,7 +353,10 @@ public sealed class TrainingPipeline : IDisposable
             var shuffledSeqs = FisherYatesShuffleSeqs(trainSeqs, epochRng.Next());
 
             if (currentSyntheticSeqs.Count > 0 && epoch >= options.SelfSupervisedWarmupEpochs)
-                shuffledSeqs = MergeSequences(shuffledSeqs, currentSyntheticSeqs, epochRng.Next());
+                shuffledSeqs = MergeSequences(
+                    shuffledSeqs,
+                    LimitSyntheticSequences(currentSyntheticSeqs, shuffledSeqs.Count / 2, epochRng.Next()),
+                    epochRng.Next());
 
             var (loss, plBce) = _placementTrainer.TrainEpoch(shuffledSeqs, lr);
 
@@ -367,7 +379,7 @@ public sealed class TrainingPipeline : IDisposable
                 // Refresh synthetic pool on the configured cadence.
                 // Each batch from a generated map becomes one sequence (sorted by beat).
                 if ((epoch + 1) % Math.Max(1, options.SelfSupervisedEveryNEpochs) == 0)
-                    currentSyntheticSeqs = WrapAsSingleSequences(newSynthetics);
+                    currentSyntheticSeqs = new List<List<TrainingExample>>(newSynthetics);
             }
 
             // ── Improvement check (raw quality) ──────────────────────────────────
@@ -481,12 +493,12 @@ public sealed class TrainingPipeline : IDisposable
     // Both happen in the same generation pass — no extra cost.
     // ----------------------------------------------------------------
 
-    private (double Quality, IReadOnlyList<TrainingExample> Synthetics,
+    private (double Quality, IReadOnlyList<List<TrainingExample>> Synthetics,
              Dictionary<DifficultyLevel, double> DiffScores)
         RunGenerationValidationWithFeedback(CachedPair[] cachedPairs, TrainingOptions options)
     {
         var scores   = new double[cachedPairs.Length];
-        var synthBag = new ConcurrentBag<TrainingExample>();
+        var synthBag = new ConcurrentBag<List<TrainingExample>>();
 
         Parallel.For(0, cachedPairs.Length,
             new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount },
@@ -504,7 +516,7 @@ public sealed class TrainingPipeline : IDisposable
                         AllowBombs:       false,
                         AllowObstacles:   false,
                         RandomSeed:       options.RandomSeed,
-                        UseLearned:       false,
+                        UseLearned:       true,
                         ArtifactsPath:    null);
 
                     var result = svc.Generate(
@@ -523,7 +535,8 @@ public sealed class TrainingPipeline : IDisposable
                         options.SelfSupervisedPositiveWeight,
                         options.SelfSupervisedNegativeWeight);
 
-                    foreach (var s in synthetics) synthBag.Add(s);
+                    if (synthetics.Count > 0)
+                        synthBag.Add(synthetics.OrderBy(s => s.Beat).ToList());
                 }
                 catch { scores[i] = 0; }
             });
@@ -577,16 +590,20 @@ public sealed class TrainingPipeline : IDisposable
         return merged;
     }
 
-    /// <summary>
-    /// Wraps a flat list of self-supervised examples into sequences (one sequence,
-    /// sorted by beat, so GRU has sensible ordering even without song partitioning).
-    /// </summary>
-    private static List<List<TrainingExample>> WrapAsSingleSequences(
-        IReadOnlyList<TrainingExample> examples)
+    private static List<List<TrainingExample>> LimitSyntheticSequences(
+        List<List<TrainingExample>> synthetics,
+        int maxCount,
+        int seed)
     {
-        if (examples.Count == 0) return [];
-        var sorted = examples.OrderBy(e => e.Beat).ToList();
-        return [sorted];
+        if (synthetics.Count <= maxCount) return synthetics;
+        var copy = new List<List<TrainingExample>>(synthetics);
+        var rng = new Random(seed);
+        for (int i = copy.Count - 1; i > 0; i--)
+        {
+            int j = rng.Next(i + 1);
+            (copy[i], copy[j]) = (copy[j], copy[i]);
+        }
+        return copy.Take(Math.Max(1, maxCount)).ToList();
     }
 
     /// <summary>Fisher-Yates in-place shuffle of a copy, using the given seed.</summary>

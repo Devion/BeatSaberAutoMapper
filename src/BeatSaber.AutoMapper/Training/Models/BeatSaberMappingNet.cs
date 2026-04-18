@@ -8,7 +8,7 @@ namespace BeatSaber.AutoMapper.Training.Models;
 /// <summary>
 /// GRU-based multi-task neural network for Beat Saber note generation.
 ///
-/// Architecture: GRU(input=45, hidden=256, layers=2, causal) → MLP(256→128) → 5 heads
+/// Architecture: GRU(input=68, hidden=320, layers=2, causal) → MLP(320→160) → 5 heads
 ///
 /// Training: forward(x=[B, SeqLen, D]) → [B*SeqLen, OutDim]  (BPTT over W=16 windows)
 /// Inference: ForwardStep(x=[1,1,D], h=[L,1,H]) → ([1, OutDim], [L,1,H])
@@ -24,15 +24,15 @@ namespace BeatSaber.AutoMapper.Training.Models;
 /// </summary>
 internal sealed class BeatSaberMappingNet : Module<Tensor, Tensor>
 {
-    internal const int InputDim    = 45;
-    internal const int GruHiddenDim = 256;
+    internal const int InputDim    = 68;
+    internal const int GruHiddenDim = 320;
     internal const int GruLayers   = 2;
-    internal const int MlpHidden   = 128;
+    internal const int MlpHidden   = 160;
     internal const int OutDim      = 18;   // 1+1+9+4+3
 
     private readonly GRU     _gru;
     private readonly Linear  _mlpLin;
-    private readonly BatchNorm1d _mlpBn;
+    private readonly LayerNorm _mlpLn;
     private readonly Dropout _mlpDrop;
     private readonly Linear _headPl, _headHa, _headCd, _headLn, _headRw;
 
@@ -41,7 +41,7 @@ internal sealed class BeatSaberMappingNet : Module<Tensor, Tensor>
         _gru     = GRU(InputDim, GruHiddenDim, numLayers: GruLayers,
                        batchFirst: false, dropout: 0.10);
         _mlpLin  = Linear(GruHiddenDim, MlpHidden, hasBias: false);
-        _mlpBn   = BatchNorm1d(MlpHidden);
+        _mlpLn   = LayerNorm(MlpHidden);
         _mlpDrop = Dropout(0.15);
         _headPl  = Linear(MlpHidden, 1);
         _headHa  = Linear(MlpHidden, 1);
@@ -67,6 +67,16 @@ internal sealed class BeatSaberMappingNet : Module<Tensor, Tensor>
         return ApplyMlpAndHeads(flat);
     }
 
+    internal (Tensor output, Tensor newHidden) ForwardSequence(Tensor x, Tensor? h)
+    {
+        long B = x.shape[0], S = x.shape[1];
+        using var xT = x.permute(1, 0, 2);         // [S, B, D]
+        var (gruOut, hn) = _gru.forward(xT, h);    // [S, B, H], [L, B, H]
+        using var gruT = gruOut.permute(1, 0, 2);  // [B, S, H]
+        using var flat = gruT.reshape(B * S, GruHiddenDim);
+        return (ApplyMlpAndHeads(flat), hn);
+    }
+
     /// <summary>
     /// Single-step inference. Input x: [1, 1, D], h: [GruLayers, 1, H].
     /// Returns (output: [1, OutDim], newHidden: [GruLayers, 1, H]).
@@ -83,7 +93,9 @@ internal sealed class BeatSaberMappingNet : Module<Tensor, Tensor>
 
     private Tensor ApplyMlpAndHeads(Tensor flat)
     {
-        using var h   = _mlpDrop.forward(functional.relu(_mlpBn.forward(_mlpLin.forward(flat))));
+        using var h0  = _mlpLin.forward(flat);
+        using var h1  = _mlpLn.forward(h0);
+        using var h   = _mlpDrop.forward(functional.relu(h1));
         using var pl  = _headPl.forward(h);   // [N, 1]
         using var ha  = _headHa.forward(h);   // [N, 1]
         using var cd  = _headCd.forward(h);   // [N, 9]

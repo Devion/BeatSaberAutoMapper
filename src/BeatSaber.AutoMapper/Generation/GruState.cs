@@ -16,6 +16,10 @@ public sealed class GruState
         H = new float[numLayers * hiddenDim];
     }
 
+    private GruState(float[] state) => H = state;
+
     /// <summary>Reset hidden state to zeros (start of a new song).</summary>
     public void Reset() => Array.Clear(H, 0, H.Length);
+
+    public GruState Clone() => new((float[])H.Clone());
 }

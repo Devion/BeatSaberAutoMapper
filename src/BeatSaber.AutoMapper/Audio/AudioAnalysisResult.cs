@@ -74,4 +74,28 @@ public sealed class AudioAnalysisResult
         for (int i = f0; i <= f1; i++) sum += EnergyEnvelope[i];
         return sum / (f1 - f0 + 1);
     }
+
+    public double GetMeanEnergyAfterBeats(double timeSeconds, double bpm, int beatCount) =>
+        GetMeanFeatureAfterBeats(EnergyEnvelope, timeSeconds, bpm, beatCount, fallback: GetEnergy(timeSeconds));
+
+    public double GetMeanOnsetAfterBeats(double timeSeconds, double bpm, int beatCount) =>
+        GetMeanFeatureAfterBeats(OnsetStrengthEnvelope, timeSeconds, bpm, beatCount, fallback: GetOnsetStrength(timeSeconds));
+
+    private double GetMeanFeatureAfterBeats(
+        IReadOnlyList<double> values,
+        double timeSeconds,
+        double bpm,
+        int beatCount,
+        double fallback)
+    {
+        if (values.Count == 0 || bpm <= 0 || beatCount <= 0 || FrameRateHz <= 0) return fallback;
+        double beatSec = 60.0 / bpm;
+        double endTime = Math.Min(DurationSeconds, timeSeconds + beatCount * beatSec);
+        int f0 = TimeToFrame(timeSeconds);
+        int f1 = TimeToFrame(endTime);
+        if (f1 <= f0) return fallback;
+        double sum = 0;
+        for (int i = f0; i <= f1; i++) sum += values[i];
+        return sum / (f1 - f0 + 1);
+    }
 }

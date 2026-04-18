@@ -6,6 +6,7 @@ internal sealed record BeamState(
     ImmutableList<CanonicalNote> Notes,
     SwingContext LeftCtx,
     SwingContext RightCtx,
+    GruState? Hidden,
     double Score
 );
 
@@ -21,13 +22,13 @@ public sealed class ConstrainedDecoder
         Guard.NotNull(candidates, nameof(candidates));
         Guard.NotNull(ctx, nameof(ctx));
 
-        // Initialise beam with empty state
         var beam = new List<BeamState>
         {
-            new BeamState(
+            new(
                 ImmutableList<CanonicalNote>.Empty,
                 new SwingContext(NoteHand.Left),
                 new SwingContext(NoteHand.Right),
+                ctx.GruHiddenState?.Clone(),
                 0.0)
         };
 
@@ -39,47 +40,85 @@ public sealed class ConstrainedDecoder
 
             foreach (var state in beam)
             {
-                // Option 1: skip this candidate
-                nextBeam.Add(state);
-
-                // Build generation context with current state's placed notes
                 var tempCtx = CloneContextWith(ctx, state);
+                var updatedHidden = state.Hidden?.Clone();
+                NeuralMapPrediction? beamPred = null;
+                double placementScore = candidate.PlacementScore;
 
-                // Try placing a note
-                var proposed = candidate;
-                var note = selector.SelectAttributes(proposed, tempCtx);
-                if (note is not null)
+                if (ctx.MultiTaskModel is not null)
                 {
+                    var nctx = CandidateEventProposer.BuildNeuralContext(
+                        candidate.Timing,
+                        tempCtx,
+                        GetLastNote(state, NoteHand.Left),
+                        GetLastNote(state, NoteHand.Right),
+                        state.LeftCtx,
+                        state.RightCtx,
+                        updatedHidden);
+                    beamPred = ctx.MultiTaskModel.PredictAll(in nctx);
+                    placementScore = beamPred.Value.PlacementScore;
+                }
+
+                nextBeam.Add(state with
+                {
+                    Hidden = updatedHidden?.Clone(),
+                    Score = state.Score - placementScore * 0.15
+                });
+
+                if (placementScore < 0.20)
+                    continue;
+
+                foreach (var hand in GetHandOrder(candidate, beamPred))
+                {
+                    var proposed = candidate with
+                    {
+                        SuggestedHand = hand,
+                        PlacementScore = placementScore,
+                        HandScore = beamPred?.HandScore ?? candidate.HandScore,
+                        NeuralPrediction = beamPred
+                    };
+
+                    var note = selector.SelectAttributes(proposed, tempCtx);
+                    if (note is null)
+                        continue;
+
                     var transition = ParityAnalyzer.ClassifyTransition(
                         GetLastNote(state, note.Hand),
                         note,
                         note.Hand == NoteHand.Left ? state.LeftCtx : state.RightCtx);
 
-                    if (transition.Transition != ParityTransition.Invalid)
-                    {
-                        var newLeft = note.Hand == NoteHand.Left ? state.LeftCtx.Clone() : state.LeftCtx;
-                        var newRight = note.Hand == NoteHand.Right ? state.RightCtx.Clone() : state.RightCtx;
+                    if (transition.Transition == ParityTransition.Invalid)
+                        continue;
 
-                        if (note.Hand == NoteHand.Left) newLeft.Update(note);
-                        else newRight.Update(note);
+                    var newLeft = state.LeftCtx.Clone();
+                    var newRight = state.RightCtx.Clone();
+                    if (note.Hand == NoteHand.Left) newLeft.Update(note);
+                    else newRight.Update(note);
 
-                        double delta = ScoreState(state, note, transition);
-                        nextBeam.Add(new BeamState(
-                            state.Notes.Add(note),
-                            newLeft,
-                            newRight,
-                            state.Score + delta));
-                    }
+                    nextBeam.Add(new BeamState(
+                        state.Notes.Add(note),
+                        newLeft,
+                        newRight,
+                        updatedHidden?.Clone(),
+                        state.Score + ScoreState(proposed, note, transition)));
                 }
             }
 
-            // Prune to BeamWidth
             beam = nextBeam.OrderByDescending(s => s.Score).Take(BeamWidth).ToList();
         }
 
-        // Return best path
         var best = beam.OrderByDescending(s => s.Score).First();
         return best.Notes.OrderBy(n => n.Beat).ToList();
+    }
+
+    private static NoteHand[] GetHandOrder(ProposedEvent candidate, NeuralMapPrediction? prediction)
+    {
+        if (!prediction.HasValue)
+            return [candidate.SuggestedHand];
+
+        return prediction.Value.HandScore >= 0.5
+            ? [NoteHand.Right, NoteHand.Left]
+            : [NoteHand.Left, NoteHand.Right];
     }
 
     private static CanonicalNote? GetLastNote(BeamState state, NoteHand hand) =>
@@ -89,21 +128,33 @@ public sealed class ConstrainedDecoder
     {
         var clone = new GenerationContext
         {
-            Song            = original.Song,
-            AudioAnalysis   = original.AudioAnalysis,
-            Settings        = original.Settings,
-            Profile         = original.Profile,
-            CandidateGrid   = original.CandidateGrid,
-            PlacementScorer = original.PlacementScorer,
-            Rng             = original.Rng
+            Song             = original.Song,
+            AudioAnalysis    = original.AudioAnalysis,
+            Settings         = original.Settings,
+            Profile          = original.Profile,
+            CandidateGrid    = original.CandidateGrid,
+            PlacementScorer  = original.PlacementScorer,
+            MultiTaskModel   = original.MultiTaskModel,
+            NeuralModel      = original.NeuralModel,
+            LeftHandContext  = state.LeftCtx.Clone(),
+            RightHandContext = state.RightCtx.Clone(),
+            Rng              = original.Rng
         };
         clone.PlacedNotes.AddRange(state.Notes);
         return clone;
     }
 
-    private static double ScoreState(BeamState state, CanonicalNote note, ParityTransitionResult transition)
+    private static double ScoreState(ProposedEvent proposed, CanonicalNote note, ParityTransitionResult transition)
     {
-        double score = 1.0; // base placement score
+        double score = proposed.PlacementScore * 1.2;
+        if (proposed.NeuralPrediction.HasValue)
+        {
+            double handPrior = note.Hand == NoteHand.Right
+                ? proposed.NeuralPrediction.Value.HandScore
+                : 1.0 - proposed.NeuralPrediction.Value.HandScore;
+            score += (handPrior - 0.5) * 0.4;
+        }
+
         score += transition.Transition switch
         {
             ParityTransition.GoodFlow => 0.5,

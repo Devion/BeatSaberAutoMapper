@@ -4,13 +4,14 @@ using BeatSaber.AutoMapper.Canonical;
 namespace BeatSaber.AutoMapper.Training.Features;
 
 /// <summary>
-/// One beat-position training example. Features map 1-to-1 to the 45-dim GRU input vector.
+/// One beat-position training example. Features map 1-to-1 to the GRU input vector.
 /// Feature layout (see BeatSaberMappingNet.InputDim):
 ///   [0-13]  Audio features (onset, energy, spectral flux, transient, bands, centroid, deltas, trends, lookahead)
 ///   [14-19] Beat position (phase, subdiv, strength, measure beat, song fraction, section progress)
 ///   [20-27] Section type one-hot (Intro/Verse/Chorus/Bridge/Buildup/Drop/Outro/Unknown)
 ///   [28-30] Context (difficulty, local NPS, bar position)
 ///   [31-44] Previous placement (teacher-forced: has-note, hand, L lane/row/dir, R lane/row/dir, parity, beats-since)
+///   [45-67] Phrase, rhythm-history, geometry, and comfort features.
 /// </summary>
 public sealed record TrainingExample(
     double Beat,
@@ -61,7 +62,31 @@ public sealed record TrainingExample(
     int NoteRow    = -1,
     int NoteCutDir = -1,
     // ── Per-example gradient multiplier ────────────────────────────────
-    double Weight = 1.0
+    double Weight = 1.0,
+    // ── Extended phrase / history / geometry features ────────────────
+    double FutureEnergy4 = 0,
+    double FutureEnergy8 = 0,
+    double FutureEnergy16 = 0,
+    double FutureOnset4 = 0,
+    double FutureOnset8 = 0,
+    double FutureOnset16 = 0,
+    double BeatsSinceSectionStart = 0,
+    double BeatsToSectionBoundary = 16,
+    double RecentChordRate4 = 0,
+    double RecentOffbeatRate4 = 0,
+    double RecentStreamRate4 = 0,
+    double RecentAlternation8 = 0.5,
+    double RecentHandBalance8 = 0.5,
+    double ConsecutiveSameHandCount = 0,
+    double BeatsSinceLastAny = 999,
+    double NotesAtCurrentBeatSoFar = 0,
+    double InterHandLaneDistance = 1.5,
+    double InterHandRowDistance = 1.0,
+    double HandsCrossedFlag = 0,
+    double LeftRecentTravel = 0,
+    double RightRecentTravel = 0,
+    double RecentLaneSpan4 = 0,
+    double RecentRowSpan4 = 0
 );
 
 public sealed class TrainingExampleBuilder
@@ -88,7 +113,7 @@ public sealed class TrainingExampleBuilder
         var beatTimes = audio.BeatTimesSeconds;
 
         var examples = new List<TrainingExample>((int)(songDurationBeats * 4) + 8);
-        CanonicalNote? lastLeft = null, lastRight = null;
+        var history  = new List<CanonicalNote>();
 
         for (double beat = 0; beat < songDurationBeats; beat += 0.25)
         {
@@ -136,65 +161,187 @@ public sealed class TrainingExampleBuilder
 
             // ── Context ───────────────────────────────────────────────────
             double localNps = beatmap.LocalNps(beat, 4.0);
+            var (lastLeft, prev2Left)   = MappingFeatureEngineering.LastTwoForHand(history, NoteHand.Left);
+            var (lastRight, prev2Right) = MappingFeatureEngineering.LastTwoForHand(history, NoteHand.Right);
+            var (beatsSinceSectionStart, beatsToSectionBoundary) =
+                MappingFeatureEngineering.SectionBoundaryFeatures(audio.Sections, beat);
+            double futureEnergy4 = audio.GetMeanEnergyAfterBeats(timeSeconds, bpm, 4);
+            double futureEnergy8 = audio.GetMeanEnergyAfterBeats(timeSeconds, bpm, 8);
+            double futureEnergy16 = audio.GetMeanEnergyAfterBeats(timeSeconds, bpm, 16);
+            double futureOnset4 = audio.GetMeanOnsetAfterBeats(timeSeconds, bpm, 4);
+            double futureOnset8 = audio.GetMeanOnsetAfterBeats(timeSeconds, bpm, 8);
+            double futureOnset16 = audio.GetMeanOnsetAfterBeats(timeSeconds, bpm, 16);
+            double recentChordRate4 = MappingFeatureEngineering.RecentChordRate(history, beat, 4.0);
+            double recentOffbeatRate4 = MappingFeatureEngineering.RecentOffbeatRate(history, beat, 4.0);
+            double recentStreamRate4 = MappingFeatureEngineering.RecentStreamRate(history, beat, 4.0);
+            double recentAlternation8 = MappingFeatureEngineering.RecentAlternation(history, 8);
+            double recentHandBalance8 = MappingFeatureEngineering.RecentHandBalance(history, beat, 8.0);
+            double consecutiveSameHandCount = MappingFeatureEngineering.ConsecutiveSameHandCount(history);
+            double beatsSinceLastAny = MappingFeatureEngineering.BeatsSinceLastAny(history, beat);
+            double notesAtCurrentBeatSoFar = MappingFeatureEngineering.NotesAtCurrentBeatSoFar(history, beat);
+            double interHandLaneDistance = MappingFeatureEngineering.InterHandLaneDistance(lastLeft, lastRight);
+            double interHandRowDistance = MappingFeatureEngineering.InterHandRowDistance(lastLeft, lastRight);
+            double handsCrossedFlag = MappingFeatureEngineering.HandsCrossedFlag(lastLeft, lastRight);
+            double leftRecentTravel = MappingFeatureEngineering.RecentTravel(prev2Left, lastLeft);
+            double rightRecentTravel = MappingFeatureEngineering.RecentTravel(prev2Right, lastRight);
+            double recentLaneSpan4 = MappingFeatureEngineering.RecentLaneSpan(history, beat, 4.0);
+            double recentRowSpan4 = MappingFeatureEngineering.RecentRowSpan(history, beat, 4.0);
 
-            // ── Previous placement context (teacher-forced from GT) ────────
-            double leftParity  = ParityStateFromCutDir(lastLeft?.CutDirection);
-            double rightParity = ParityStateFromCutDir(lastRight?.CutDirection);
-            double beatsL = lastLeft  is not null ? beat - lastLeft.Beat  : 999;
-            double beatsR = lastRight is not null ? beat - lastRight.Beat : 999;
+            var notesAtBeat = beatmap.Notes
+                .Where(n => Math.Abs(n.Beat - beat) < 0.13)
+                .OrderBy(n => n.Hand == NoteHand.Left ? 0 : 1)
+                .ToList();
 
-            // ── Label ─────────────────────────────────────────────────────
-            var note     = beatmap.Notes.FirstOrDefault(n => Math.Abs(n.Beat - beat) < 0.13);
-            bool hasNote = note is not null;
-            int noteHand = note?.Hand == NoteHand.Left ? 0 : note?.Hand == NoteHand.Right ? 1 : -1;
-
-            examples.Add(new TrainingExample(
-                Beat:                   beat,
-                OnsetStrength:          onsetStr,
-                EnergyLevel:            energy,
-                SpectralFlux:           spectralFlux,
-                TransientStrength:      transient,
-                LowBandEnergy:          lowBand,
-                MidBandEnergy:          midBand,
-                HighBandEnergy:         highBand,
-                SpectralCentroid:       centroid,
-                EnergyDelta:            energyDelta,
-                HighBandDelta:          highDelta,
-                EnergyTrend4:           energyTrend4,
-                EnergyTrend8:           energyTrend8,
-                LookaheadEnergy:        lookaheadEnergy,
-                LookaheadOnset:         lookaheadOnset,
-                BeatPhase:              beatPhase,
-                SubdivisionDenominator: subdiv,
-                BeatStrength:           beatStrength,
-                MeasureBeat:            measureBeat,
-                SongFraction:           songFraction,
-                SectionProgress:        sectionProg,
-                SectionTypeIndex:       sectionTypeIdx,
-                DifficultyLevel:        diffLevel,
-                LocalNps:               localNps,
-                BarPosition:            barPosition,
-                PreviousLeftLane:       lastLeft?.Lane  ?? 1,
-                PreviousLeftRow:        lastLeft?.Row   ?? 1,
-                PreviousLeftCutDir:     lastLeft  is not null ? (int)lastLeft.CutDirection  : -1,
-                PreviousRightLane:      lastRight?.Lane ?? 2,
-                PreviousRightRow:       lastRight?.Row  ?? 1,
-                PreviousRightCutDir:    lastRight is not null ? (int)lastRight.CutDirection : -1,
-                LeftParityState:        leftParity,
-                RightParityState:       rightParity,
-                BeatsSinceLastLeft:     beatsL,
-                BeatsSinceLastRight:    beatsR,
-                HasNote:                hasNote,
-                NoteHand:               noteHand,
-                NoteLane:               note?.Lane ?? -1,
-                NoteRow:                note?.Row  ?? -1,
-                NoteCutDir:             note is not null ? (int)note.CutDirection : -1
-            ));
-
-            if (note is not null)
+            if (notesAtBeat.Count == 0)
             {
-                if (note.Hand == NoteHand.Left)  lastLeft  = note;
-                else                             lastRight = note;
+                double leftParity  = ParityStateFromCutDir(lastLeft?.CutDirection);
+                double rightParity = ParityStateFromCutDir(lastRight?.CutDirection);
+                double beatsL = lastLeft  is not null ? beat - lastLeft.Beat  : 999;
+                double beatsR = lastRight is not null ? beat - lastRight.Beat : 999;
+
+                examples.Add(new TrainingExample(
+                    Beat:                   beat,
+                    OnsetStrength:          onsetStr,
+                    EnergyLevel:            energy,
+                    SpectralFlux:           spectralFlux,
+                    TransientStrength:      transient,
+                    LowBandEnergy:          lowBand,
+                    MidBandEnergy:          midBand,
+                    HighBandEnergy:         highBand,
+                    SpectralCentroid:       centroid,
+                    EnergyDelta:            energyDelta,
+                    HighBandDelta:          highDelta,
+                    EnergyTrend4:           energyTrend4,
+                    EnergyTrend8:           energyTrend8,
+                    LookaheadEnergy:        lookaheadEnergy,
+                    LookaheadOnset:         lookaheadOnset,
+                    BeatPhase:              beatPhase,
+                    SubdivisionDenominator: subdiv,
+                    BeatStrength:           beatStrength,
+                    MeasureBeat:            measureBeat,
+                    SongFraction:           songFraction,
+                    SectionProgress:        sectionProg,
+                    SectionTypeIndex:       sectionTypeIdx,
+                    DifficultyLevel:        diffLevel,
+                    LocalNps:               localNps,
+                    BarPosition:            barPosition,
+                    PreviousLeftLane:       lastLeft?.Lane  ?? 1,
+                    PreviousLeftRow:        lastLeft?.Row   ?? 1,
+                    PreviousLeftCutDir:     lastLeft  is not null ? (int)lastLeft.CutDirection  : -1,
+                    PreviousRightLane:      lastRight?.Lane ?? 2,
+                    PreviousRightRow:       lastRight?.Row  ?? 1,
+                    PreviousRightCutDir:    lastRight is not null ? (int)lastRight.CutDirection : -1,
+                    LeftParityState:        leftParity,
+                    RightParityState:       rightParity,
+                    BeatsSinceLastLeft:     beatsL,
+                    BeatsSinceLastRight:    beatsR,
+                    HasNote:                false,
+                    NoteHand:               -1,
+                    NoteLane:               -1,
+                    NoteRow:                -1,
+                    NoteCutDir:             -1,
+                    FutureEnergy4:          futureEnergy4,
+                    FutureEnergy8:          futureEnergy8,
+                    FutureEnergy16:         futureEnergy16,
+                    FutureOnset4:           futureOnset4,
+                    FutureOnset8:           futureOnset8,
+                    FutureOnset16:          futureOnset16,
+                    BeatsSinceSectionStart: beatsSinceSectionStart,
+                    BeatsToSectionBoundary: beatsToSectionBoundary,
+                    RecentChordRate4:       recentChordRate4,
+                    RecentOffbeatRate4:     recentOffbeatRate4,
+                    RecentStreamRate4:      recentStreamRate4,
+                    RecentAlternation8:     recentAlternation8,
+                    RecentHandBalance8:     recentHandBalance8,
+                    ConsecutiveSameHandCount: consecutiveSameHandCount,
+                    BeatsSinceLastAny:      beatsSinceLastAny,
+                    NotesAtCurrentBeatSoFar: notesAtCurrentBeatSoFar,
+                    InterHandLaneDistance:  interHandLaneDistance,
+                    InterHandRowDistance:   interHandRowDistance,
+                    HandsCrossedFlag:       handsCrossedFlag,
+                    LeftRecentTravel:       leftRecentTravel,
+                    RightRecentTravel:      rightRecentTravel,
+                    RecentLaneSpan4:        recentLaneSpan4,
+                    RecentRowSpan4:         recentRowSpan4
+                ));
+                continue;
+            }
+
+            foreach (var note in notesAtBeat)
+            {
+                double leftParity  = ParityStateFromCutDir(lastLeft?.CutDirection);
+                double rightParity = ParityStateFromCutDir(lastRight?.CutDirection);
+                double beatsL = lastLeft  is not null ? beat - lastLeft.Beat  : 999;
+                double beatsR = lastRight is not null ? beat - lastRight.Beat : 999;
+                int noteHand = note.Hand == NoteHand.Left ? 0 : 1;
+
+                examples.Add(new TrainingExample(
+                    Beat:                   beat,
+                    OnsetStrength:          onsetStr,
+                    EnergyLevel:            energy,
+                    SpectralFlux:           spectralFlux,
+                    TransientStrength:      transient,
+                    LowBandEnergy:          lowBand,
+                    MidBandEnergy:          midBand,
+                    HighBandEnergy:         highBand,
+                    SpectralCentroid:       centroid,
+                    EnergyDelta:            energyDelta,
+                    HighBandDelta:          highDelta,
+                    EnergyTrend4:           energyTrend4,
+                    EnergyTrend8:           energyTrend8,
+                    LookaheadEnergy:        lookaheadEnergy,
+                    LookaheadOnset:         lookaheadOnset,
+                    BeatPhase:              beatPhase,
+                    SubdivisionDenominator: subdiv,
+                    BeatStrength:           beatStrength,
+                    MeasureBeat:            measureBeat,
+                    SongFraction:           songFraction,
+                    SectionProgress:        sectionProg,
+                    SectionTypeIndex:       sectionTypeIdx,
+                    DifficultyLevel:        diffLevel,
+                    LocalNps:               localNps,
+                    BarPosition:            barPosition,
+                    PreviousLeftLane:       lastLeft?.Lane  ?? 1,
+                    PreviousLeftRow:        lastLeft?.Row   ?? 1,
+                    PreviousLeftCutDir:     lastLeft  is not null ? (int)lastLeft.CutDirection  : -1,
+                    PreviousRightLane:      lastRight?.Lane ?? 2,
+                    PreviousRightRow:       lastRight?.Row  ?? 1,
+                    PreviousRightCutDir:    lastRight is not null ? (int)lastRight.CutDirection : -1,
+                    LeftParityState:        leftParity,
+                    RightParityState:       rightParity,
+                    BeatsSinceLastLeft:     beatsL,
+                    BeatsSinceLastRight:    beatsR,
+                    HasNote:                true,
+                    NoteHand:               noteHand,
+                    NoteLane:               note.Lane,
+                    NoteRow:                note.Row,
+                    NoteCutDir:             (int)note.CutDirection,
+                    FutureEnergy4:          futureEnergy4,
+                    FutureEnergy8:          futureEnergy8,
+                    FutureEnergy16:         futureEnergy16,
+                    FutureOnset4:           futureOnset4,
+                    FutureOnset8:           futureOnset8,
+                    FutureOnset16:          futureOnset16,
+                    BeatsSinceSectionStart: beatsSinceSectionStart,
+                    BeatsToSectionBoundary: beatsToSectionBoundary,
+                    RecentChordRate4:       recentChordRate4,
+                    RecentOffbeatRate4:     recentOffbeatRate4,
+                    RecentStreamRate4:      recentStreamRate4,
+                    RecentAlternation8:     recentAlternation8,
+                    RecentHandBalance8:     recentHandBalance8,
+                    ConsecutiveSameHandCount: consecutiveSameHandCount,
+                    BeatsSinceLastAny:      beatsSinceLastAny,
+                    NotesAtCurrentBeatSoFar: notesAtCurrentBeatSoFar,
+                    InterHandLaneDistance:  interHandLaneDistance,
+                    InterHandRowDistance:   interHandRowDistance,
+                    HandsCrossedFlag:       handsCrossedFlag,
+                    LeftRecentTravel:       leftRecentTravel,
+                    RightRecentTravel:      rightRecentTravel,
+                    RecentLaneSpan4:        recentLaneSpan4,
+                    RecentRowSpan4:         recentRowSpan4
+                ));
+
+                history.Add(note);
             }
         }
 
