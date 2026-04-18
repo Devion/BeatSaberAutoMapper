@@ -76,10 +76,46 @@ public sealed class TrainingPipeline : IDisposable
         }
 
         // ----------------------------------------------------------------
-        // 2. Build training examples — parallel across map folders
+        // 2. Song-level train / val / test split
+        //    Shuffle all map folders deterministically, then partition so that
+        //    validation and test songs are never seen during training.
+        // ----------------------------------------------------------------
+        var splitRng      = new Random((int)(options.RandomSeed & int.MaxValue));
+        var shuffledFolders = FisherYatesShuffleFolders(mapFolders, splitRng);
+        int totalSongs    = shuffledFolders.Length;
+
+        // Number of songs to reserve for the validation pool.
+        // Prefer the explicit ValidationCachePoolSize if given; otherwise use the fraction.
+        int valPoolSize = options.ValidationCachePoolSize > 0
+            ? options.ValidationCachePoolSize
+            : Math.Max(
+                options.ValidationSongsPerEpoch,
+                (int)(totalSongs * options.ValidationFraction));
+        valPoolSize = Math.Min(valPoolSize, totalSongs / 4);   // cap at 25% of songs
+
+        int testSongCount  = Math.Max(0, (int)(totalSongs * options.TestFraction));
+        int trainSongCount = totalSongs - valPoolSize - testSongCount;
+
+        if (trainSongCount <= 0)
+        {
+            Console.WriteLine("[Training] Not enough songs to split into train / val / test. Aborting.");
+            return;
+        }
+
+        var trainFolders = shuffledFolders[..trainSongCount];
+        var valFolders   = shuffledFolders[trainSongCount..(trainSongCount + valPoolSize)];
+        var testFolders  = shuffledFolders[(trainSongCount + valPoolSize)..];
+
+        Console.WriteLine(
+            $"[Training] Split: {trainFolders.Length} train / " +
+            $"{valFolders.Length} val / {testFolders.Length} test songs " +
+            $"(total {totalSongs}).");
+
+        // ----------------------------------------------------------------
+        // 3. Build training examples — parallel across trainFolders only
         // ----------------------------------------------------------------
         Console.WriteLine(
-            $"[Training] Building examples from {mapFolders.Length} map folders " +
+            $"[Training] Building examples from {trainFolders.Length} train folders " +
             $"using {Environment.ProcessorCount} threads...");
 
         var allExamples  = new List<TrainingExample>();
@@ -88,7 +124,7 @@ public sealed class TrainingPipeline : IDisposable
         var listLock     = new object();
 
         Parallel.ForEach(
-            mapFolders,
+            trainFolders,
             new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount },
             () => new List<TrainingExample>(),       // thread-local list
             (folder, _, localList) =>
@@ -127,9 +163,9 @@ public sealed class TrainingPipeline : IDisposable
                 }
 
                 int n = Interlocked.Increment(ref doneCount);
-                if (n % 25 == 0 || n == mapFolders.Length)
+                if (n % 25 == 0 || n == trainFolders.Length)
                     lock (printLock)
-                        Console.WriteLine($"[Training]   {n}/{mapFolders.Length} folders processed...");
+                        Console.WriteLine($"[Training]   {n}/{trainFolders.Length} folders processed...");
 
                 return localList;
             },
@@ -141,29 +177,24 @@ public sealed class TrainingPipeline : IDisposable
         Console.WriteLine($"[Training] Built {allExamples.Count} training examples.");
         if (allExamples.Count == 0) return;
 
-        int trainN  = (int)(allExamples.Count * options.TrainFraction);
-        var trainEx = allExamples[..trainN];
-        var testEx  = allExamples[trainN..];
+        var trainEx = allExamples;
+
+        // Build test examples from held-out test folders (used only for final evaluation)
+        var testEx = testFolders.Length > 0
+            ? BuildExamplesFromFolders(testFolders, printLock)
+            : (IReadOnlyList<TrainingExample>)[];
 
         // ----------------------------------------------------------------
-        // 3. Pre-cache audio analysis for validation songs (runs ONCE, reused every epoch)
+        // 4. Pre-cache audio analysis for validation songs (runs ONCE, reused every epoch)
         //
-        // Pool model:
-        //   poolSize = max(ValidationSongsPerEpoch, ValidationCachePoolSize)
-        //   → find 'poolSize' unique songs and cache one audio entry per song
-        //   → each song contributes ALL its valid difficulties as separate pairs
-        //   → randomly sample 'songsPerEpoch' songs from the pool each run;
-        //     total pairs per epoch ≈ songsPerEpoch × avg_difficulties_per_song
-        //
-        // On the first run the cache is empty — all poolSize songs are analysed and saved.
-        // On subsequent restarts only new / invalidated entries are re-analysed.
+        // Only songs from valFolders are used — training songs are never evaluated.
+        // Each song contributes ALL its valid difficulties as separate pairs.
+        // 'songsPerEpoch' is sampled from the pool once and fixed for the whole run.
         // ----------------------------------------------------------------
         int songsPerEpoch = Math.Max(1, options.ValidationSongsPerEpoch);
-        int poolSize      = Math.Max(songsPerEpoch,
-            options.ValidationCachePoolSize > 0 ? options.ValidationCachePoolSize : songsPerEpoch);
 
         var poolGroups = new ValidationSongFinder()
-            .Find(mapFolders, poolSize, options.RandomSeed);
+            .Find(valFolders, valFolders.Length, options.RandomSeed);
 
         CachedPair[] cachedPairs = [];
         if (poolGroups.Count > 0)
@@ -210,8 +241,7 @@ public sealed class TrainingPipeline : IDisposable
                 $"({poolPairCount} total pairs, {cacheHits} from cache, {cacheMisses} freshly analysed).");
 
             // Randomly sample songsPerEpoch unique songs from the pool (without replacement).
-            // Each sampled song contributes all its difficulties, so total pairs per epoch
-            // is typically 2–4× songsPerEpoch.
+            // This sample is fixed for the entire run so genQ is comparable across epochs.
             var sampledSongs = pool.Length <= songsPerEpoch
                 ? pool
                 : FisherYatesSample(pool, songsPerEpoch, new Random((int)(options.RandomSeed >> 1)));
@@ -231,14 +261,16 @@ public sealed class TrainingPipeline : IDisposable
         }
 
         // ----------------------------------------------------------------
-        // 4. Placement model — epoch loop with shuffle + parallel mini-batch GD
+        // 5. Placement model — epoch loop with shuffle + parallel mini-batch GD
         // ----------------------------------------------------------------
         double lr = warmStarted ? options.InitialLearningRate * 0.3 : options.InitialLearningRate;
         const double MinLr   = 1e-5;
         const double LrDecay = 0.5;
         // Reduce LR after this many consecutive stagnation epochs.
-        // patience/3 → 3 LR reductions across the full patience window.
-        int lrPatience = Math.Max(1, options.EarlyStopPatience / 3);
+        // Default: patience/5 → faster LR drops than the old patience/3.
+        int lrPatience = options.LrPatience > 0
+            ? options.LrPatience
+            : Math.Max(1, options.EarlyStopPatience / 5);
 
         Console.WriteLine(
             $"[Training] Training neural placement model {BeatSaberMappingNet.InputDim}→1024→512→256→128 ({options.Epochs} epochs max, " +
@@ -275,9 +307,18 @@ public sealed class TrainingPipeline : IDisposable
             double qualityScore = 0;
             if (cachedPairs.Length > 0)
             {
-                var (score, newSynthetics) =
+                var (score, newSynthetics, diffScores) =
                     RunGenerationValidationWithFeedback(cachedPairs, options);
                 qualityScore = score;
+
+                // Per-difficulty breakdown (logged after the main epoch line)
+                if (diffScores.Count > 1)
+                {
+                    var parts = diffScores
+                        .OrderBy(kv => (int)kv.Key)
+                        .Select(kv => $"{kv.Key}={kv.Value:F3}");
+                    Console.WriteLine($"[Training]   genQ by diff: {string.Join("  ", parts)}");
+                }
 
                 // Refresh synthetic pool on the configured cadence
                 if ((epoch + 1) % Math.Max(1, options.SelfSupervisedEveryNEpochs) == 0)
@@ -369,12 +410,12 @@ public sealed class TrainingPipeline : IDisposable
         _placementTrainer.RestoreBestWeights();
 
         // ----------------------------------------------------------------
-        // 5. Save artifacts
+        // 6. Save artifacts
         // ----------------------------------------------------------------
         _placementTrainer.SaveWeights(options.ArtifactsOutputPath);
 
         // ----------------------------------------------------------------
-        // 6. Final test-set evaluation
+        // 7. Final test-set evaluation
         // ----------------------------------------------------------------
         if (testEx.Count > 0)
         {
@@ -395,10 +436,11 @@ public sealed class TrainingPipeline : IDisposable
     // Both happen in the same generation pass — no extra cost.
     // ----------------------------------------------------------------
 
-    private (double Quality, IReadOnlyList<TrainingExample> Synthetics)
+    private (double Quality, IReadOnlyList<TrainingExample> Synthetics,
+             Dictionary<DifficultyLevel, double> DiffScores)
         RunGenerationValidationWithFeedback(CachedPair[] cachedPairs, TrainingOptions options)
     {
-        var scores  = new double[cachedPairs.Length];
+        var scores   = new double[cachedPairs.Length];
         var synthBag = new ConcurrentBag<TrainingExample>();
 
         Parallel.For(0, cachedPairs.Length,
@@ -443,7 +485,15 @@ public sealed class TrainingPipeline : IDisposable
 
         var valid = scores.Where(s => s > 0).ToArray();
         double quality = valid.Length > 0 ? valid.Average() : 0;
-        return (quality, synthBag.ToList());
+
+        // Per-difficulty breakdown
+        var diffScores = scores
+            .Select((s, i) => (Score: s, Diff: cachedPairs[i].Pair.ReferenceMap.Difficulty.Difficulty))
+            .Where(x => x.Score > 0)
+            .GroupBy(x => x.Diff)
+            .ToDictionary(g => g.Key, g => g.Average(x => x.Score));
+
+        return (quality, synthBag.ToList(), diffScores);
     }
 
     // ----------------------------------------------------------------
@@ -461,6 +511,67 @@ public sealed class TrainingPipeline : IDisposable
             (copy[i], copy[j]) = (copy[j], copy[i]);
         }
         return copy;
+    }
+
+    /// <summary>Fisher-Yates shuffle of a string array, returning a new shuffled copy.</summary>
+    private static string[] FisherYatesShuffleFolders(string[] source, Random rng)
+    {
+        var arr = (string[])source.Clone();
+        for (int i = arr.Length - 1; i > 0; i--)
+        {
+            int j = rng.Next(i + 1);
+            (arr[i], arr[j]) = (arr[j], arr[i]);
+        }
+        return arr;
+    }
+
+    /// <summary>
+    /// Build training examples from a set of map folders.
+    /// Used to produce the held-out test set from test-split folders.
+    /// </summary>
+    private static IReadOnlyList<TrainingExample> BuildExamplesFromFolders(
+        string[] folders, object printLock)
+    {
+        var result   = new List<TrainingExample>();
+        var listLock = new object();
+
+        Parallel.ForEach(
+            folders,
+            new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount },
+            () => new List<TrainingExample>(),
+            (folder, _, localList) =>
+            {
+                try
+                {
+                    var maps    = BeatmapImporter.Import(folder);
+                    var builder = new TrainingExampleBuilder();
+                    foreach (var map in maps)
+                    {
+                        double bpm      = map.Song.BeatsPerMinute > 0 ? map.Song.BeatsPerMinute : 120.0;
+                        double lastBeat = map.Notes.Count > 0 ? map.Notes[^1].Beat : 0;
+                        double[] onsets = map.Notes
+                            .Select(n => MathHelpers.BeatToSeconds(n.Beat, bpm))
+                            .Distinct().OrderBy(t => t).ToArray();
+                        localList.AddRange(builder.Build(map, new AudioAnalysisResult
+                        {
+                            EstimatedBpm      = bpm,
+                            DurationSeconds   = MathHelpers.BeatToSeconds(lastBeat + 4.0, bpm),
+                            FrameRateHz       = 43.0,
+                            SampleRate        = 22050,
+                            OnsetTimesSeconds = onsets
+                        }));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    lock (printLock)
+                        Console.WriteLine($"[Training] Warning (test): '{folder}': {ex.Message}");
+                }
+                return localList;
+            },
+            localList => { lock (listLock) result.AddRange(localList); });
+
+        return result;
     }
 
     /// <summary>

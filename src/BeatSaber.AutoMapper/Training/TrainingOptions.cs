@@ -24,7 +24,12 @@ public sealed record TrainingOptions(
     double SelfSupervisedPositiveWeight,
     double SelfSupervisedNegativeWeight,
     // Periodic checkpoint
-    int CheckpointEveryNEpochs = 10
+    int CheckpointEveryNEpochs = 10,
+    /// <summary>
+    /// Epochs of stagnation before the learning rate is reduced.
+    /// 0 = auto (EarlyStopPatience / 5).
+    /// </summary>
+    int LrPatience = 0
 )
 {
     public static TrainingOptions Default => new(
@@ -44,6 +49,7 @@ public sealed record TrainingOptions(
         SelfSupervisedEveryNEpochs: 1,
         SelfSupervisedPositiveWeight: 4.0,
         SelfSupervisedNegativeWeight: 3.0,
-        CheckpointEveryNEpochs: 10
+        CheckpointEveryNEpochs: 10,
+        LrPatience: 0
     );
 }

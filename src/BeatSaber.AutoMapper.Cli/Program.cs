@@ -124,6 +124,8 @@ var trainSsEveryOpt = new Option<int>("--ss-every") { Description = "Refresh sel
 var trainSsPosWOpt = new Option<double>("--ss-pos-weight") { Description = "Weight multiplier for reinforced positive synthetic examples", DefaultValueFactory = _ => 4.0 };
 var trainSsNegWOpt = new Option<double>("--ss-neg-weight") { Description = "Weight multiplier for penalised negative synthetic examples", DefaultValueFactory = _ => 3.0 };
 var trainCheckpointOpt = new Option<int>("--checkpoint-every") { Description = "Save model to artifacts every N epochs (0 = disabled, default 10)", DefaultValueFactory = _ => 10 };
+var trainLrPatienceOpt = new Option<int>("--lr-patience") { Description = "Stagnation epochs before LR is reduced (0 = EarlyStopPatience / 5)", DefaultValueFactory = _ => 0 };
+var trainSeedOpt = new Option<long>("--seed") { Description = "Random seed for reproducible splits and shuffles", DefaultValueFactory = _ => 42L };
 trainCmd.Add(trainDatasetOpt);
 trainCmd.Add(trainProfileOpt);
 trainCmd.Add(trainArtifactsOpt);
@@ -137,6 +139,8 @@ trainCmd.Add(trainSsEveryOpt);
 trainCmd.Add(trainSsPosWOpt);
 trainCmd.Add(trainSsNegWOpt);
 trainCmd.Add(trainCheckpointOpt);
+trainCmd.Add(trainLrPatienceOpt);
+trainCmd.Add(trainSeedOpt);
 
 trainCmd.SetAction((ParseResult pr) =>
 {
@@ -150,7 +154,7 @@ trainCmd.SetAction((ParseResult pr) =>
             TrainFraction: 0.8,
             ValidationFraction: 0.1,
             TestFraction: 0.1,
-            RandomSeed: 42,
+            RandomSeed: pr.GetValue(trainSeedOpt),
             ValidationSongsPerEpoch: pr.GetValue(trainValSongsOpt),
             ValidationCachePoolSize: pr.GetValue(trainValCacheSizeOpt),
             InitialLearningRate: pr.GetValue(trainLrOpt),
@@ -159,7 +163,8 @@ trainCmd.SetAction((ParseResult pr) =>
             SelfSupervisedEveryNEpochs: pr.GetValue(trainSsEveryOpt),
             SelfSupervisedPositiveWeight: pr.GetValue(trainSsPosWOpt),
             SelfSupervisedNegativeWeight: pr.GetValue(trainSsNegWOpt),
-            CheckpointEveryNEpochs: pr.GetValue(trainCheckpointOpt)
+            CheckpointEveryNEpochs: pr.GetValue(trainCheckpointOpt),
+            LrPatience: pr.GetValue(trainLrPatienceOpt)
         );
         using var pipeline = new TrainingPipeline();
         pipeline.Run(options);
