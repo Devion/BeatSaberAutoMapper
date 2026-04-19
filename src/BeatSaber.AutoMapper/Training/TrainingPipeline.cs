@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Text.Json;
 using BeatSaber.AutoMapper.Audio;
 using BeatSaber.AutoMapper.Audio.Features;
 using BeatSaber.AutoMapper.Beatmap;
@@ -46,6 +47,37 @@ public sealed class TrainingPipeline : IDisposable
     private sealed record CachedSong(
         ValidationSongFinder.SongGroup Group,
         AudioAnalysisResult Audio);
+
+    private sealed record ValidationSchedulePlan(
+        CachedPair[] CorePairs,
+        CachedPair[] FullPairs,
+        int CoreSongCount,
+        int FullSongCap,
+        int StageStartEpoch,
+        int StageStepEpochs)
+    {
+        public int ActiveFullSongCountForEpoch(int absoluteEpochCompleted)
+        {
+            if (FullSongCap <= CoreSongCount)
+                return CoreSongCount;
+            if (absoluteEpochCompleted < StageStartEpoch)
+                return CoreSongCount;
+
+            int stages = 1 + Math.Max(0, (absoluteEpochCompleted - StageStartEpoch) / Math.Max(1, StageStepEpochs));
+            int count = CoreSongCount + stages * CoreSongCount;
+            return Math.Clamp(count, CoreSongCount, FullSongCap);
+        }
+    }
+
+    private sealed record PersistedValidationSchedule(
+        long RandomSeed,
+        int CoreSongCount,
+        int FullSongCap,
+        int StageStartEpoch,
+        int StageStepEpochs,
+        int LastCompletedEpoch,
+        string[] CoreFolderPaths,
+        string[] FullFolderPaths);
 
     public void Run(TrainingOptions options)
     {
@@ -227,11 +259,19 @@ public sealed class TrainingPipeline : IDisposable
         // 'songsPerEpoch' is sampled from the pool once and fixed for the whole run.
         // ----------------------------------------------------------------
         int songsPerEpoch = splitPlan.ValidationSongsPerEpoch;
+        string validationStatePath = Path.Combine(options.ArtifactsOutputPath, "validation_schedule.json");
+        int resumeEpochOffset = 0;
+        PersistedValidationSchedule? persistedSchedule = TryLoadValidationSchedule(validationStatePath);
+        if (persistedSchedule is not null)
+        {
+            resumeEpochOffset = Math.Max(0, persistedSchedule.LastCompletedEpoch);
+            Console.WriteLine($"[Training] Loaded validation schedule state (last completed epoch {resumeEpochOffset}).");
+        }
 
         var poolGroups = new ValidationSongFinder()
             .Find(valFolders, splitPlan.ValidationCachePoolSize, options.RandomSeed);
 
-        CachedPair[] cachedPairs = [];
+        ValidationSchedulePlan? validationPlan = null;
         if (poolGroups.Count > 0)
         {
             var audioCache  = new ValidationAudioCache(
@@ -303,24 +343,18 @@ public sealed class TrainingPipeline : IDisposable
                 $"({poolPairCount} total pairs, {cacheHits} from cache, {cacheMisses} freshly analysed, " +
                 $"{valStopwatch.Elapsed.TotalSeconds:F0}s).");
 
-            // Randomly sample songsPerEpoch unique songs from the pool (without replacement).
-            // This sample is fixed for the entire run so genQ is comparable across epochs.
-            var sampledSongs = pool.Length <= songsPerEpoch
-                ? pool
-                : FisherYatesSample(pool, songsPerEpoch, new Random((int)(options.RandomSeed >> 1)));
+            validationPlan = BuildValidationSchedule(
+                pool,
+                songsPerEpoch,
+                options,
+                persistedSchedule);
 
-            // Flatten: one CachedPair per (song, difficulty) combination.
-            cachedPairs = sampledSongs
-                .SelectMany(cs => cs.Group.Difficulties.Select(diff =>
-                    new CachedPair(
-                        new ValidationSongFinder.ValidationPair(
-                            cs.Group.FolderPath, cs.Group.AudioPath, diff),
-                        cs.Audio)))
-                .ToArray();
+            SaveValidationSchedule(validationStatePath, options.RandomSeed, validationPlan, resumeEpochOffset);
 
             Console.WriteLine(
-                $"[Training] Using {cachedPairs.Length} validation pair(s) across " +
-                $"{sampledSongs.Length} song(s) this run (pool size {pool.Length}).");
+                $"[Training] Validation schedule: core={validationPlan.CorePairs.Length} pair(s) / {validationPlan.CoreSongCount} song(s), " +
+                $"full-cap={validationPlan.FullPairs.Length} pair(s) / {validationPlan.FullSongCap} song(s), " +
+                $"stage-start={validationPlan.StageStartEpoch}, stage-step={validationPlan.StageStepEpochs}.");
         }
 
         // ----------------------------------------------------------------
@@ -378,14 +412,23 @@ public sealed class TrainingPipeline : IDisposable
             var (loss, plBce) = _placementTrainer.TrainEpoch(shuffledSeqs, lr);
             double trainSeconds = trainStopwatch.Elapsed.TotalSeconds;
 
-            double qualityScore = 0;
+            double coreQualityScore = 0;
+            double fullQualityScore = 0;
             double validationSeconds = 0;
-            if (cachedPairs.Length > 0)
+            int activeValidationPairs = 0;
+            int activeValidationSongs = 0;
+            if (validationPlan is not null)
             {
                 var validationStopwatch = Stopwatch.StartNew();
-                var (score, newSynthetics, diffScores) =
-                    RunGenerationValidationWithFeedback(cachedPairs, options);
-                qualityScore = score;
+                int absoluteEpoch = resumeEpochOffset + epoch + 1;
+                activeValidationSongs = validationPlan.ActiveFullSongCountForEpoch(absoluteEpoch);
+                activeValidationPairs = CountPairsForSongs(validationPlan.FullPairs, activeValidationSongs);
+                var activePairs = validationPlan.FullPairs.Take(activeValidationPairs).ToArray();
+                int corePairCount = Math.Min(validationPlan.CorePairs.Length, activePairs.Length);
+                var (coreScore, fullScore, newSynthetics, diffScores) =
+                    RunGenerationValidationWithFeedback(activePairs, corePairCount, options);
+                coreQualityScore = coreScore;
+                fullQualityScore = fullScore;
                 validationSeconds = validationStopwatch.Elapsed.TotalSeconds;
 
                 // Per-difficulty breakdown (logged after the main epoch line)
@@ -405,23 +448,23 @@ public sealed class TrainingPipeline : IDisposable
 
             // ── Improvement check (raw quality) ──────────────────────────────────
             // neural_placement.pt is ONLY written when a new best is reached.
-            bool isNewBest = qualityScore > bestQuality + 1e-4;
+            bool isNewBest = coreQualityScore > bestQuality + 1e-4;
             if (isNewBest)
             {
-                bestQuality = qualityScore;
+                bestQuality = coreQualityScore;
                 _placementTrainer.SaveBestWeights();
                 _placementTrainer.SaveWeights(options.ArtifactsOutputPath);
             }
 
             // EMA for display only (no longer drives LR/stop decisions)
             smoothedQuality = smoothedQuality < 0
-                ? qualityScore
-                : EmaAlpha * qualityScore + (1 - EmaAlpha) * smoothedQuality;
+                ? coreQualityScore
+                : EmaAlpha * coreQualityScore + (1 - EmaAlpha) * smoothedQuality;
 
             // ── Trend detection — linear regression over last SlopeWindow epochs ─
             lossHistory.Add(loss);
             if (lossHistory.Count > SlopeWindow) lossHistory.RemoveAt(0);
-            genQHistory.Add(qualityScore);
+            genQHistory.Add(coreQualityScore);
             if (genQHistory.Count > SlopeWindow) genQHistory.RemoveAt(0);
 
             double lossSlope = ComputeLinearSlope(lossHistory); // negative = loss improving
@@ -449,11 +492,18 @@ public sealed class TrainingPipeline : IDisposable
             Console.WriteLine(
                 $"[Training] Epoch {epoch + 1}/{options.Epochs}: " +
                 $"loss={loss:F4}  plBCE={plBce:F4}  " +
-                $"genQ={qualityScore:F3}  best={bestQuality:F3}  sm={smoothedQuality:F3}  lr={lr:G4}" +
+                $"coreQ={coreQualityScore:F3}  fullQ={fullQualityScore:F3}  best={bestQuality:F3}  sm={smoothedQuality:F3}  lr={lr:G4}" +
                 $"  lSlp={lossSlope:+0.0000;-0.0000}  qSlp={genQSlope:+0.0000;-0.0000}" +
                 $"  train={trainSeconds:F1}s  val={validationSeconds:F1}s  epoch={epochStopwatch.Elapsed.TotalSeconds:F1}s" +
+                (activeValidationPairs > 0 ? $"  valPairs={activeValidationPairs}" : string.Empty) +
                 (currentSyntheticSeqs.Count > 0 ? $"  synthEx={currentSyntheticSeqs.Sum(s => s.Count)}" : string.Empty) +
                 statusTag);
+
+            if (validationPlan is not null)
+            {
+                Console.WriteLine(
+                    $"[Training]   validation stage: coreSongs={validationPlan.CoreSongCount}  activeFullSongs={activeValidationSongs}/{validationPlan.FullSongCap}");
+            }
 
             // ── Stagnation-driven LR reduction and early stop ────────────────────
             if (stagnationEpochs > 0)
@@ -484,6 +534,9 @@ public sealed class TrainingPipeline : IDisposable
                     break;
                 }
             }
+
+            if (validationPlan is not null)
+                SaveValidationSchedule(validationStatePath, options.RandomSeed, validationPlan, resumeEpochOffset + epoch + 1);
         }
 
         _placementTrainer.RestoreBestWeights();
@@ -515,9 +568,9 @@ public sealed class TrainingPipeline : IDisposable
     // Both happen in the same generation pass — no extra cost.
     // ----------------------------------------------------------------
 
-    private (double Quality, IReadOnlyList<List<TrainingExample>> Synthetics,
+    private (double CoreQuality, double FullQuality, IReadOnlyList<List<TrainingExample>> Synthetics,
              Dictionary<DifficultyLevel, double> DiffScores)
-        RunGenerationValidationWithFeedback(CachedPair[] cachedPairs, TrainingOptions options)
+        RunGenerationValidationWithFeedback(CachedPair[] cachedPairs, int corePairCount, TrainingOptions options)
     {
         var scores   = new double[cachedPairs.Length];
         var synthBag = new ConcurrentBag<List<TrainingExample>>();
@@ -565,7 +618,10 @@ public sealed class TrainingPipeline : IDisposable
             });
 
         var valid = scores.Where(s => s > 0).ToArray();
-        double quality = valid.Length > 0 ? valid.Average() : 0;
+        double fullQuality = valid.Length > 0 ? valid.Average() : 0;
+
+        var coreValid = scores.Take(Math.Min(corePairCount, scores.Length)).Where(s => s > 0).ToArray();
+        double coreQuality = coreValid.Length > 0 ? coreValid.Average() : 0;
 
         // Per-difficulty breakdown
         var diffScores = scores
@@ -574,12 +630,161 @@ public sealed class TrainingPipeline : IDisposable
             .GroupBy(x => x.Diff)
             .ToDictionary(g => g.Key, g => g.Average(x => x.Score));
 
-        return (quality, synthBag.ToList(), diffScores);
+        return (coreQuality, fullQuality, synthBag.ToList(), diffScores);
     }
 
     // ----------------------------------------------------------------
     // Helpers
     // ----------------------------------------------------------------
+
+    private static ValidationSchedulePlan BuildValidationSchedule(
+        CachedSong[] pool,
+        int coreSongCount,
+        TrainingOptions options,
+        PersistedValidationSchedule? persisted)
+    {
+        int normalizedCoreSongs = Math.Clamp(coreSongCount, 1, Math.Max(1, pool.Length));
+        int fullSongCap = Math.Min(
+            pool.Length,
+            Math.Max(normalizedCoreSongs, Math.Min(64, normalizedCoreSongs * 4)));
+        int stageStartEpoch = Math.Max(15, options.SelfSupervisedWarmupEpochs + 10);
+        int stageStepEpochs = 15;
+
+        var savedCore = persisted is not null && persisted.RandomSeed == options.RandomSeed
+            ? RestoreSongs(pool, persisted.CoreFolderPaths, normalizedCoreSongs)
+            : [];
+        var savedFull = persisted is not null && persisted.RandomSeed == options.RandomSeed
+            ? RestoreSongs(pool, persisted.FullFolderPaths, fullSongCap)
+            : [];
+
+        var rng = new Random((int)(options.RandomSeed >> 1));
+        var coreSongs = savedCore.Count == normalizedCoreSongs
+            ? savedCore
+            : SampleSongs(pool, normalizedCoreSongs, rng);
+
+        var fullSongs = savedFull.Count >= coreSongs.Count
+            ? EnsureContainsCore(savedFull, coreSongs, fullSongCap, pool, rng)
+            : EnsureContainsCore([], coreSongs, fullSongCap, pool, rng);
+
+        return new ValidationSchedulePlan(
+            FlattenPairs(coreSongs),
+            FlattenPairs(fullSongs),
+            coreSongs.Count,
+            fullSongs.Count,
+            stageStartEpoch,
+            stageStepEpochs);
+    }
+
+    private static List<CachedSong> RestoreSongs(CachedSong[] pool, string[] folderPaths, int cap)
+    {
+        var byFolder = pool.ToDictionary(s => s.Group.FolderPath, StringComparer.OrdinalIgnoreCase);
+        var restored = new List<CachedSong>();
+        foreach (var folder in folderPaths)
+        {
+            if (restored.Count >= cap)
+                break;
+            if (byFolder.TryGetValue(folder, out var song))
+                restored.Add(song);
+        }
+        return restored;
+    }
+
+    private static List<CachedSong> SampleSongs(CachedSong[] pool, int count, Random rng) =>
+        FisherYatesSample(pool, count, rng).ToList();
+
+    private static List<CachedSong> EnsureContainsCore(
+        IReadOnlyList<CachedSong> fullBase,
+        IReadOnlyList<CachedSong> coreSongs,
+        int fullSongCap,
+        CachedSong[] pool,
+        Random rng)
+    {
+        var selected = new List<CachedSong>(coreSongs);
+        var seen = new HashSet<string>(coreSongs.Select(s => s.Group.FolderPath), StringComparer.OrdinalIgnoreCase);
+
+        foreach (var song in fullBase)
+        {
+            if (selected.Count >= fullSongCap)
+                break;
+            if (seen.Add(song.Group.FolderPath))
+                selected.Add(song);
+        }
+
+        foreach (var song in FisherYatesSample(pool, pool.Length, rng))
+        {
+            if (selected.Count >= fullSongCap)
+                break;
+            if (seen.Add(song.Group.FolderPath))
+                selected.Add(song);
+        }
+
+        return selected;
+    }
+
+    private static CachedPair[] FlattenPairs(IReadOnlyList<CachedSong> songs) =>
+        songs.SelectMany(cs => cs.Group.Difficulties.Select(diff =>
+            new CachedPair(
+                new ValidationSongFinder.ValidationPair(cs.Group.FolderPath, cs.Group.AudioPath, diff),
+                cs.Audio)))
+        .ToArray();
+
+    private static int CountPairsForSongs(IReadOnlyList<CachedPair> pairs, int songCount)
+    {
+        if (songCount <= 0 || pairs.Count == 0)
+            return 0;
+
+        int count = 0;
+        string? currentFolder = null;
+        int seenSongs = 0;
+        foreach (var pair in pairs)
+        {
+            if (!string.Equals(currentFolder, pair.Pair.MapFolder, StringComparison.OrdinalIgnoreCase))
+            {
+                currentFolder = pair.Pair.MapFolder;
+                seenSongs++;
+                if (seenSongs > songCount)
+                    break;
+            }
+            count++;
+        }
+        return count;
+    }
+
+    private static PersistedValidationSchedule? TryLoadValidationSchedule(string path)
+    {
+        try
+        {
+            if (!File.Exists(path))
+                return null;
+            return JsonSerializer.Deserialize<PersistedValidationSchedule>(File.ReadAllText(path));
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static void SaveValidationSchedule(
+        string path,
+        long randomSeed,
+        ValidationSchedulePlan? plan,
+        int lastCompletedEpoch)
+    {
+        if (plan is null)
+            return;
+
+        var payload = new PersistedValidationSchedule(
+            randomSeed,
+            plan.CoreSongCount,
+            plan.FullSongCap,
+            plan.StageStartEpoch,
+            plan.StageStepEpochs,
+            lastCompletedEpoch,
+            plan.CorePairs.Select(p => p.Pair.MapFolder).Distinct(StringComparer.OrdinalIgnoreCase).ToArray(),
+            plan.FullPairs.Select(p => p.Pair.MapFolder).Distinct(StringComparer.OrdinalIgnoreCase).ToArray());
+
+        File.WriteAllText(path, JsonSerializer.Serialize(payload, new JsonSerializerOptions { WriteIndented = true }));
+    }
 
     /// <summary>Fisher-Yates in-place shuffle of sequences (not individual examples).</summary>
     private static List<List<TrainingExample>> FisherYatesShuffleSeqs(
