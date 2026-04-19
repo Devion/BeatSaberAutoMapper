@@ -1,5 +1,6 @@
 using BeatSaber.AutoMapper.Audio;
 using BeatSaber.AutoMapper.Canonical;
+using BeatSaber.AutoMapper.Training.Patterns;
 
 namespace BeatSaber.AutoMapper.Training.Features;
 
@@ -61,6 +62,7 @@ public sealed record TrainingExample(
     int NoteLane   = -1,
     int NoteRow    = -1,
     int NoteCutDir = -1,
+    int PatternTypeId = 0,
     // ── Per-example gradient multiplier ────────────────────────────────
     double Weight = 1.0,
     // ── Extended phrase / history / geometry features ────────────────
@@ -191,6 +193,7 @@ public sealed class TrainingExampleBuilder
                 .Where(n => Math.Abs(n.Beat - beat) < 0.13)
                 .OrderBy(n => n.Hand == NoteHand.Left ? 0 : 1)
                 .ToList();
+            int patternTypeId = (int)PatternModeling.DerivePatternType(beat, notesAtBeat, history);
 
             if (notesAtBeat.Count == 0)
             {
@@ -240,6 +243,7 @@ public sealed class TrainingExampleBuilder
                     NoteLane:               -1,
                     NoteRow:                -1,
                     NoteCutDir:             -1,
+                    PatternTypeId:          patternTypeId,
                     FutureEnergy4:          futureEnergy4,
                     FutureEnergy8:          futureEnergy8,
                     FutureEnergy16:         futureEnergy16,
@@ -316,6 +320,7 @@ public sealed class TrainingExampleBuilder
                     NoteLane:               note.Lane,
                     NoteRow:                note.Row,
                     NoteCutDir:             (int)note.CutDirection,
+                    PatternTypeId:          patternTypeId,
                     FutureEnergy4:          futureEnergy4,
                     FutureEnergy8:          futureEnergy8,
                     FutureEnergy16:         futureEnergy16,

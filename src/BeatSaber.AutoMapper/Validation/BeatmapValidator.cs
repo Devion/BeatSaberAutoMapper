@@ -11,7 +11,12 @@ public sealed class BeatmapValidator
         _rules =
         [
             new ParityRule(),
+            new DoubleDirectionalRule(),
             new ResetRule(),
+            new SwingSpeedRule(),
+            new ExcessiveDoubleRule(),
+            new HandclapRule(),
+            new HitboxPathRule(),
             new VisionBlockRule(),
             new DensityRule(),
             new LaneBalanceRule(),

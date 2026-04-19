@@ -105,6 +105,7 @@ public class IndexModel(JobStore jobStore, IConfiguration config) : PageModel
                 TargetDifficulty: diffs[0],
                 AllowBombs:       false,
                 AllowObstacles:   false,
+                AllowFieldMovement: false,
                 RandomSeed:       42,
                 UseLearned:       useLearned,
                 ArtifactsPath:    useLearned ? artifactsPath : null);

@@ -123,6 +123,8 @@ var trainSsWarmupOpt = new Option<int>("--ss-warmup") { Description = "Epochs be
 var trainSsEveryOpt = new Option<int>("--ss-every") { Description = "Refresh self-supervised pool every N epochs (1 = every epoch)", DefaultValueFactory = _ => 1 };
 var trainSsPosWOpt = new Option<double>("--ss-pos-weight") { Description = "Weight multiplier for reinforced positive synthetic examples", DefaultValueFactory = _ => 4.0 };
 var trainSsNegWOpt = new Option<double>("--ss-neg-weight") { Description = "Weight multiplier for penalised negative synthetic examples", DefaultValueFactory = _ => 3.0 };
+var trainEnableSyntheticOpt = new Option<bool>("--enable-synthetic-training") { Description = "Allow validated synthetic examples to be merged into training after unlock conditions are met", DefaultValueFactory = _ => false };
+var trainSyntheticUnlockCoreQOpt = new Option<double>("--synthetic-unlock-coreq") { Description = "Minimum coreQ required before synthetic training may unlock", DefaultValueFactory = _ => 0.70 };
 var trainCheckpointOpt = new Option<int>("--checkpoint-every") { Description = "Save model to artifacts every N epochs (0 = disabled, default 10)", DefaultValueFactory = _ => 10 };
 var trainLrPatienceOpt = new Option<int>("--lr-patience") { Description = "Stagnation epochs before LR is reduced (0 = EarlyStopPatience / 5)", DefaultValueFactory = _ => 0 };
 var trainSeedOpt = new Option<long>("--seed") { Description = "Random seed for reproducible splits and shuffles", DefaultValueFactory = _ => 42L };
@@ -138,6 +140,8 @@ trainCmd.Add(trainSsWarmupOpt);
 trainCmd.Add(trainSsEveryOpt);
 trainCmd.Add(trainSsPosWOpt);
 trainCmd.Add(trainSsNegWOpt);
+trainCmd.Add(trainEnableSyntheticOpt);
+trainCmd.Add(trainSyntheticUnlockCoreQOpt);
 trainCmd.Add(trainCheckpointOpt);
 trainCmd.Add(trainLrPatienceOpt);
 trainCmd.Add(trainSeedOpt);
@@ -163,6 +167,8 @@ trainCmd.SetAction((ParseResult pr) =>
             SelfSupervisedEveryNEpochs: pr.GetValue(trainSsEveryOpt),
             SelfSupervisedPositiveWeight: pr.GetValue(trainSsPosWOpt),
             SelfSupervisedNegativeWeight: pr.GetValue(trainSsNegWOpt),
+            EnableSyntheticTraining: pr.GetValue(trainEnableSyntheticOpt),
+            SyntheticUnlockCoreQ: pr.GetValue(trainSyntheticUnlockCoreQOpt),
             CheckpointEveryNEpochs: pr.GetValue(trainCheckpointOpt),
             LrPatience: pr.GetValue(trainLrPatienceOpt)
         );
@@ -214,6 +220,7 @@ var genOutputOpt = new Option<string>("--output") { Description = "Output folder
 var genCoverOpt = new Option<string?>("--cover") { Description = "Cover image path" };
 var genDryRunOpt = new Option<bool>("--dry-run") { Description = "Analyse and propose but do not write output", DefaultValueFactory = _ => false };
 var genDumpDebugOpt = new Option<bool>("--dump-debug") { Description = "Dump debug files", DefaultValueFactory = _ => false };
+var genAllowFieldMovementOpt = new Option<bool>("--allow-field-movement") { Description = "Allow strong lane shifts / moving-field behavior in generated patterns", DefaultValueFactory = _ => false };
 generateCmd.Add(genInputOpt);
 generateCmd.Add(genTitleOpt);
 generateCmd.Add(genArtistOpt);
@@ -223,6 +230,7 @@ generateCmd.Add(genOutputOpt);
 generateCmd.Add(genCoverOpt);
 generateCmd.Add(genDryRunOpt);
 generateCmd.Add(genDumpDebugOpt);
+generateCmd.Add(genAllowFieldMovementOpt);
 
 generateCmd.SetAction((ParseResult pr) =>
 {
@@ -237,6 +245,7 @@ generateCmd.SetAction((ParseResult pr) =>
         string? cover = pr.GetValue(genCoverOpt);
         bool dryRun = pr.GetValue(genDryRunOpt);
         bool dumpDebug = pr.GetValue(genDumpDebugOpt);
+        bool allowFieldMovement = pr.GetValue(genAllowFieldMovementOpt);
 
         static DifficultyLevel ParseDiff(string s) => s switch
         {
@@ -254,6 +263,7 @@ generateCmd.SetAction((ParseResult pr) =>
             TargetDifficulty: difficulties[0],   // overridden per-difficulty in GenerateAll
             AllowBombs: false,
             AllowObstacles: false,
+            AllowFieldMovement: allowFieldMovement,
             RandomSeed: 42,
             UseLearned: artifacts is not null,
             ArtifactsPath: artifacts

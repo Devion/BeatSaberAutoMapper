@@ -13,13 +13,14 @@ namespace BeatSaber.AutoMapper.Training.Models;
 /// Training: forward(x=[B, SeqLen, D]) → [B*SeqLen, OutDim]  (BPTT over W=16 windows)
 /// Inference: ForwardStep(x=[1,1,D], h=[L,1,H]) → ([1, OutDim], [L,1,H])
 ///
-/// Output layout [B*SeqLen, 26]:
+/// Output layout [B*SeqLen, 32]:
 ///   [0]      placement logit  (sigmoid → P(note here))
 ///   [1]      hand logit       (sigmoid → P(right hand))
 ///   [2..10]  cut-dir logits   (softmax → 9 classes)
 ///   [11..14] lane logits      (softmax → 4 lanes)
 ///   [15..17] row logits       (softmax → 3 rows)
 ///   [18..25] hand+lane logits (softmax → 8 classes: L0..L3,R0..R3)
+///   [26..31] pattern logits   (softmax → 6 classes)
 ///
 /// ~540K parameters; float32 .pt file ~2.1 MB.
 /// </summary>
@@ -29,13 +30,13 @@ internal sealed class BeatSaberMappingNet : Module<Tensor, Tensor>
     internal const int GruHiddenDim = 320;
     internal const int GruLayers   = 2;
     internal const int MlpHidden   = 160;
-    internal const int OutDim      = 26;   // 1+1+9+4+3+8
+    internal const int OutDim      = 32;   // 1+1+9+4+3+8+6
 
     private readonly GRU     _gru;
     private readonly Linear  _mlpLin;
     private readonly LayerNorm _mlpLn;
     private readonly Dropout _mlpDrop;
-    private readonly Linear _headPl, _headHa, _headCd, _headLn, _headRw, _headHl;
+    private readonly Linear _headPl, _headHa, _headCd, _headLn, _headRw, _headHl, _headPt;
 
     internal BeatSaberMappingNet() : base(nameof(BeatSaberMappingNet))
     {
@@ -50,6 +51,7 @@ internal sealed class BeatSaberMappingNet : Module<Tensor, Tensor>
         _headLn  = Linear(MlpHidden, 4);
         _headRw  = Linear(MlpHidden, 3);
         _headHl  = Linear(MlpHidden, 8);
+        _headPt  = Linear(MlpHidden, 6);
         RegisterComponents();
     }
 
@@ -104,7 +106,8 @@ internal sealed class BeatSaberMappingNet : Module<Tensor, Tensor>
         using var ln  = _headLn.forward(h);   // [N, 4]
         using var rw  = _headRw.forward(h);   // [N, 3]
         using var hl  = _headHl.forward(h);   // [N, 8]
-        return cat(new[] { pl, ha, cd, ln, rw, hl }, dim: 1);  // [N, 26]
+        using var pt  = _headPt.forward(h);   // [N, 6]
+        return cat(new[] { pl, ha, cd, ln, rw, hl, pt }, dim: 1);  // [N, 32]
     }
 }
 

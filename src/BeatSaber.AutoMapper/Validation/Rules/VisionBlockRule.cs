@@ -20,7 +20,7 @@ public sealed class VisionBlockRule : IValidationRule
                 {
                     var a = notes[i];
                     var b = notes[j];
-                    if (IsVisionBlock(a, b))
+                    if (PlayabilityHeuristics.IsVisionBlock(a, b))
                     {
                         yield return new ValidationIssue(
                             RuleName: RuleName,
@@ -59,12 +59,4 @@ public sealed class VisionBlockRule : IValidationRule
         }
     }
 
-    private static bool IsVisionBlock(CanonicalNote a, CanonicalNote b)
-    {
-        // Two stacked notes near centre with same lane but different rows
-        bool sameLane = a.Lane == b.Lane;
-        bool nearCentre = a.Lane is 1 or 2;
-        bool differentRows = a.Row != b.Row;
-        return sameLane && nearCentre && differentRows;
-    }
 }

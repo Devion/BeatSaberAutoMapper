@@ -23,6 +23,8 @@ public sealed record TrainingOptions(
     int SelfSupervisedEveryNEpochs,
     double SelfSupervisedPositiveWeight,
     double SelfSupervisedNegativeWeight,
+    bool EnableSyntheticTraining,
+    double SyntheticUnlockCoreQ,
     // Periodic checkpoint
     int CheckpointEveryNEpochs = 10,
     /// <summary>
@@ -49,6 +51,8 @@ public sealed record TrainingOptions(
         SelfSupervisedEveryNEpochs: 1,
         SelfSupervisedPositiveWeight: 4.0,
         SelfSupervisedNegativeWeight: 3.0,
+        EnableSyntheticTraining: false,
+        SyntheticUnlockCoreQ: 0.70,
         CheckpointEveryNEpochs: 10,
         LrPatience: 0
     );

@@ -4,6 +4,7 @@ public sealed record GenerationSettings(
     DifficultyLevel TargetDifficulty,
     bool AllowBombs,
     bool AllowObstacles,
+    bool AllowFieldMovement,
     double RandomSeed,
     bool UseLearned,
     string? ArtifactsPath
@@ -13,6 +14,7 @@ public sealed record GenerationSettings(
         TargetDifficulty: difficulty,
         AllowBombs: false,
         AllowObstacles: false,
+        AllowFieldMovement: false,
         RandomSeed: 42,
         UseLearned: false,
         ArtifactsPath: null

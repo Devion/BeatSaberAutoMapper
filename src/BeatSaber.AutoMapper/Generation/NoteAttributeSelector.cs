@@ -1,4 +1,6 @@
 using BeatSaber.AutoMapper.Canonical.Derived;
+using BeatSaber.AutoMapper.Training.Patterns;
+using BeatSaber.AutoMapper.Validation;
 
 namespace BeatSaber.AutoMapper.Generation;
 
@@ -18,6 +20,12 @@ public sealed class NoteAttributeSelector
         var note = new CanonicalNote(proposed.Timing.Beat, lane, row, color, dir);
 
         if (ctx.PlacedNotes.Any(n => n.ConflictsWith(note)))
+            return null;
+        if (PlayabilityHeuristics.WouldCauseImmediatePatternIssue(
+            note,
+            ctx.PlacedNotes,
+            ctx.Song.BeatsPerMinute,
+            ctx.Profile.Difficulty))
             return null;
 
         return note;
@@ -211,6 +219,36 @@ public sealed class NoteAttributeSelector
             }
         }
 
+        PatternType patternType = PredictPatternType(prediction);
+        var lastSameHand = ctx.PlacedNotes.LastOrDefault(n => n.Hand == hand);
+        if (lastSameHand is not null)
+        {
+            int prevLane = lastSameHand.Lane;
+            for (int lane = 0; lane < adjusted.Length; lane++)
+            {
+                int laneDistance = Math.Abs(lane - prevLane);
+                if (!ctx.Settings.AllowFieldMovement)
+                {
+                    if (laneDistance >= 2) adjusted[lane] *= 0.20;
+                    else if (laneDistance == 1) adjusted[lane] *= 0.72;
+                    else adjusted[lane] *= 1.18;
+                }
+
+                if (patternType == PatternType.Anchor)
+                {
+                    adjusted[lane] *= lane == prevLane ? 1.35 : 0.65;
+                }
+                else if (patternType == PatternType.Stream)
+                {
+                    adjusted[lane] *= laneDistance <= 1 ? 1.10 : 0.75;
+                }
+                else if (patternType == PatternType.Reset)
+                {
+                    adjusted[lane] *= laneDistance <= 1 ? 1.06 : 0.85;
+                }
+            }
+        }
+
         Normalize(adjusted, prediction.LaneProbs);
         return adjusted;
     }
@@ -283,4 +321,17 @@ public sealed class NoteAttributeSelector
         parity == ParityClass.Forehand
             ? [CutDirection.Down, CutDirection.DownLeft, CutDirection.DownRight]
             : [CutDirection.Up,   CutDirection.UpLeft,   CutDirection.UpRight, CutDirection.Left, CutDirection.Right];
+
+    private static PatternType PredictPatternType(NeuralMapPrediction prediction)
+    {
+        if (prediction.PatternTypeProbs is not { Length: >= 6 })
+            return PatternType.Isolated;
+        int best = 0;
+        for (int i = 1; i < prediction.PatternTypeProbs.Length; i++)
+        {
+            if (prediction.PatternTypeProbs[i] > prediction.PatternTypeProbs[best])
+                best = i;
+        }
+        return (PatternType)best;
+    }
 }

@@ -10,6 +10,8 @@ namespace BeatSaber.AutoMapper.Generation;
 
 public sealed class MapGenerationService
 {
+    private const double DefaultExportNjs = 12.0;
+
     public sealed record GenerationTelemetry(
         int CandidateCount,
         int ProposedCount,
@@ -151,8 +153,8 @@ public sealed class MapGenerationService
         var difficulty = new DifficultyDescriptor(
             settings.TargetDifficulty,
             BeatmapCharacteristic.Standard,
-            NoteJumpMovementSpeed:       null,
-            NoteJumpStartBeatOffset:     null,
+            NoteJumpMovementSpeed:       EstimateNoteJumpMovementSpeed(audio.EstimatedBpm, settings.TargetDifficulty),
+            NoteJumpStartBeatOffset:     0.0,
             CustomLabel:                 null);
 
         var beatmap = new CanonicalBeatmap
@@ -180,5 +182,26 @@ public sealed class MapGenerationService
             validationReport,
             repairResult,
             telemetry);
+    }
+
+    private static double EstimateNoteJumpMovementSpeed(double bpm, DifficultyLevel difficulty)
+    {
+        double normalizedBpm = bpm > 0 ? bpm : 120.0;
+        double baseNjs = difficulty switch
+        {
+            DifficultyLevel.Easy => 8.5,
+            DifficultyLevel.Normal => 10.0,
+            DifficultyLevel.Hard => 11.5,
+            DifficultyLevel.Expert => 13.0,
+            DifficultyLevel.ExpertPlus => 14.5,
+            _ => DefaultExportNjs,
+        };
+
+        // Keep the adjustment modest so song tempo influences note travel speed
+        // without making low-BPM songs feel lethargic or high-BPM songs unreadable.
+        double bpmAdjustment = Math.Clamp((normalizedBpm - 120.0) / 60.0, -1.5, 1.5);
+        double njs = baseNjs + bpmAdjustment;
+
+        return Math.Round(Math.Clamp(njs, 8.0, 16.0), 2);
     }
 }

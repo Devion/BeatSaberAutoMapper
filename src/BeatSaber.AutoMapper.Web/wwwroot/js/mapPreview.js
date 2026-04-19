@@ -86,9 +86,40 @@
             }
         }
 
+        _currentDifficulty() {
+            return this._data?.difficulties?.[this._diffIdx] ?? null;
+        }
+
+        _currentTimingPoints() {
+            return this._currentDifficulty()?.timingPoints ?? [{ b: 0, t: 0, m: this._data?.bpm ?? 120 }];
+        }
+
+        _currentDuration() {
+            return this._currentDifficulty()?.duration ?? this._data?.duration ?? 60;
+        }
+
+        _beatToSeconds(beat) {
+            const timing = this._currentTimingPoints();
+            let tp = timing[0];
+            for (const point of timing) {
+                if (point.b <= beat) tp = point;
+                else break;
+            }
+            return tp.t + (beat - tp.b) * 60 / tp.m;
+        }
+
+        _secondsToBeat(seconds) {
+            const timing = this._currentTimingPoints();
+            let tp = timing[0];
+            for (const point of timing) {
+                if (point.t <= seconds) tp = point;
+                else break;
+            }
+            return tp.b + (seconds - tp.t) * tp.m / 60;
+        }
+
         _buildUI() {
             const d = this._data;
-            this._totalBeats = d.duration * d.bpm / 60;
             this._diffIdx = d.difficulties.length - 1;
 
             const opts = d.difficulties
@@ -126,12 +157,18 @@
             this._c.querySelector('#mp-reset').addEventListener('click', () => this._reset());
             this._c.querySelector('#mp-diff').addEventListener('change', e => {
                 this._diffIdx = +e.target.value;
+                const duration = this._currentDuration();
+                const clampedSeconds = Math.min(this._beatToSeconds(this._beat), duration);
+                if (this._audio) this._audio.currentTime = clampedSeconds;
+                this._beat = this._secondsToBeat(clampedSeconds);
+                this._updateControls();
                 this._drawFrame();
             });
             this._c.querySelector('#mp-seek').addEventListener('input', e => {
                 const frac = +e.target.value / 1000;
-                this._beat = frac * this._totalBeats;
-                if (this._audio) this._audio.currentTime = frac * d.duration;
+                const seconds = frac * this._currentDuration();
+                this._beat = this._secondsToBeat(seconds);
+                if (this._audio) this._audio.currentTime = seconds;
                 if (!this._playing) this._drawFrame();
             });
             this._c.querySelectorAll('.mp-mode').forEach(btn => btn.addEventListener('click', () => {
@@ -149,7 +186,9 @@
         _resize() {
             const w = this._c.clientWidth || 760;
             const runnerH = Math.round(w * 0.60);
-            const timingH = Math.max(120, Math.round(w * 0.18));
+            const timingH = this._mode === 'timing'
+                ? Math.max(260, Math.round(w * 0.40))
+                : Math.max(190, Math.round(w * 0.28));
             this._runnerCanvas.width = w;
             this._runnerCanvas.height = runnerH;
             this._timingCanvas.width = w;
@@ -166,11 +205,12 @@
                 return;
             }
 
-            if (this._beat >= this._totalBeats) this._beat = 0;
+            const duration = this._currentDuration();
+            if (this._beatToSeconds(this._beat) >= duration) this._beat = 0;
             this._playing = true;
             this._lastTs = null;
             if (this._audio) {
-                this._audio.currentTime = this._beat * 60 / this._data.bpm;
+                this._audio.currentTime = this._beatToSeconds(this._beat);
                 this._audio.play().catch(() => {});
             }
             this._c.querySelector('#mp-play').textContent = '⏸';
@@ -194,17 +234,19 @@
             if (!this._playing) return;
 
             const audio = this._audio;
+            const duration = this._currentDuration();
             if (audio && !audio.paused && !audio.ended && audio.readyState >= 3) {
-                this._beat = audio.currentTime * this._data.bpm / 60;
+                this._beat = this._secondsToBeat(audio.currentTime);
             } else if (this._lastTs !== null) {
-                this._beat = Math.min(this._beat + (ts - this._lastTs) / 1000 * this._data.bpm / 60, this._totalBeats);
+                const nextSeconds = Math.min(this._beatToSeconds(this._beat) + (ts - this._lastTs) / 1000, duration);
+                this._beat = this._secondsToBeat(nextSeconds);
             }
             this._lastTs = ts;
 
             this._updateControls();
             this._drawFrame();
 
-            if (this._beat < this._totalBeats) {
+            if (this._beatToSeconds(this._beat) < duration) {
                 this._rafId = requestAnimationFrame(t => this._tick(t));
             } else {
                 this._playing = false;
@@ -214,11 +256,13 @@
         }
 
         _updateControls() {
-            const frac = this._totalBeats > 0 ? this._beat / this._totalBeats : 0;
+            const currentSeconds = this._beatToSeconds(this._beat);
+            const duration = this._currentDuration();
+            const frac = duration > 0 ? currentSeconds / duration : 0;
             const seek = this._c.querySelector('#mp-seek');
             if (seek && document.activeElement !== seek) seek.value = Math.round(frac * 1000);
             this._c.querySelector('#mp-time').textContent =
-                `${fmtTime(this._beat * 60 / this._data.bpm)} / ${fmtTime(this._data.duration)}`;
+                `${fmtTime(currentSeconds)} / ${fmtTime(duration)}`;
         }
 
         _projectRunner(lane, row, beatAhead, width, height) {
@@ -229,10 +273,11 @@
             const halfW = width * RUNNER_TRACK * 0.5;
             const laneUnit = halfW * scale * 2 / 4;
             const size = Math.min(width * 0.16, (hitY - vpY) * 0.20) * scale;
-            const rowH = size * 1.12;
+            const perspectiveHeight = Math.max(28, (hitY - vpY) * (0.16 + 0.10 * (1 - t)));
+            const rowH = perspectiveHeight / 3;
             const x = width / 2 + (lane - 1.5) * laneUnit;
             const y = (hitY + (vpY - hitY) * t) - (row - 1) * rowH;
-            return { x, y, size, scale, t, hitY, vpY, halfW };
+            return { x, y, size, scale, t, hitY, vpY, halfW, rowH };
         }
 
         _drawFrame() {
@@ -290,7 +335,7 @@
             // Side sabers / lane glow
             this._drawLaneRails(ctx, width, hitY, vpY, halfW);
             this._drawRunnerGrid(ctx, width, hitY, vpY, halfW, beat, beatPulse);
-            this._drawRunnerHitZone(ctx, width, hitY, halfW, beatPulse);
+            this._drawRunnerHitZone(ctx, width, height, hitY, halfW, beatPulse);
 
             const notes = (this._data.difficulties[this._diffIdx]?.notes ?? [])
                 .filter(n => n.b >= beat - LOOK_BACK && n.b <= beat + LOOK_AHEAD)
@@ -343,13 +388,24 @@
                 ctx.moveTo(width / 2 - hw, y);
                 ctx.lineTo(width / 2 + hw, y);
                 ctx.stroke();
+
+                const rowStep = Math.max(10, (hitY - vpY) * (0.16 + 0.10 * (1 - t)) / 3);
+                ctx.strokeStyle = bar ? 'rgba(139,216,255,0.20)' : 'rgba(75,120,216,0.12)';
+                ctx.lineWidth = 0.8;
+                for (let row = 1; row <= 2; row++) {
+                    const rowY = y - row * rowStep;
+                    ctx.beginPath();
+                    ctx.moveTo(width / 2 - hw, rowY);
+                    ctx.lineTo(width / 2 + hw, rowY);
+                    ctx.stroke();
+                }
             }
 
             ctx.fillStyle = `rgba(123,216,255,${0.04 + beatPulse * 0.08})`;
             ctx.fillRect(width / 2 - halfW, hitY - 24, halfW * 2, 48);
         }
 
-        _drawRunnerHitZone(ctx, width, hitY, halfW, beatPulse) {
+        _drawRunnerHitZone(ctx, width, height, hitY, halfW, beatPulse) {
             const glow = ctx.createLinearGradient(0, hitY - 8, 0, hitY + 40);
             glow.addColorStop(0, `rgba(140,210,255,${0.32 + beatPulse * 0.18})`);
             glow.addColorStop(1, 'transparent');
@@ -370,6 +426,16 @@
                 ctx.lineWidth = 1;
                 ctx.beginPath();
                 ctx.arc(cx, hitY, laneW * 0.30, 0, Math.PI * 2);
+                ctx.stroke();
+            }
+
+            ctx.strokeStyle = 'rgba(150,225,255,0.16)';
+            ctx.lineWidth = 1;
+            for (let row = 1; row <= 2; row++) {
+                const rowY = hitY - row * (height * 0.08);
+                ctx.beginPath();
+                ctx.moveTo(width / 2 - halfW, rowY);
+                ctx.lineTo(width / 2 + halfW, rowY);
                 ctx.stroke();
             }
         }
@@ -432,9 +498,13 @@
             const height = this._timingCanvas.height;
             const beat = this._beat;
             const centerX = width * 0.5;
-            const laneBand = height * 0.52;
-            const rowGap = laneBand / 3;
-            const laneGap = width * 0.10;
+            const gridTop = 16;
+            const gridBottom = height - 18;
+            const gridHeight = gridBottom - gridTop;
+            const laneHeight = gridHeight / 4;
+            const rowHeight = laneHeight / 3;
+            const laneLabelX = 26;
+            const noteTravelWidth = width * 0.42;
             const beatPhase = 1 - Math.min(1, Math.abs((beat % 1) - 0) * 4);
 
             ctx.clearRect(0, 0, width, height);
@@ -443,6 +513,46 @@
             bg.addColorStop(1, '#05070f');
             ctx.fillStyle = bg;
             ctx.fillRect(0, 0, width, height);
+
+            for (let lane = 0; lane < 4; lane++) {
+                const laneY = gridTop + lane * laneHeight;
+                const laneBg = ctx.createLinearGradient(0, laneY, width, laneY + laneHeight);
+                laneBg.addColorStop(0, lane % 2 === 0 ? 'rgba(26,42,72,0.30)' : 'rgba(18,30,52,0.22)');
+                laneBg.addColorStop(1, 'rgba(8,12,22,0.08)');
+                ctx.fillStyle = laneBg;
+                ctx.fillRect(0, laneY, width, laneHeight);
+
+                ctx.fillStyle = 'rgba(160,205,255,0.58)';
+                ctx.font = '600 12px Rajdhani, sans-serif';
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.fillText(`${lane + 1}`, laneLabelX, laneY + laneHeight / 2);
+
+                for (let row = 0; row < 3; row++) {
+                    const rowTop = laneY + row * rowHeight;
+                    const alpha = row === 1 ? 0.18 : 0.12;
+                    ctx.fillStyle = `rgba(80,140,210,${alpha})`;
+                    ctx.fillRect(44, rowTop + 1, width - 52, rowHeight - 2);
+                }
+
+                ctx.strokeStyle = 'rgba(120,170,255,0.24)';
+                ctx.lineWidth = 1;
+                ctx.beginPath();
+                ctx.moveTo(44, laneY);
+                ctx.lineTo(width - 8, laneY);
+                ctx.moveTo(44, laneY + laneHeight);
+                ctx.lineTo(width - 8, laneY + laneHeight);
+                ctx.stroke();
+
+                ctx.strokeStyle = 'rgba(120,170,255,0.14)';
+                for (let row = 1; row < 3; row++) {
+                    const y = laneY + row * rowHeight;
+                    ctx.beginPath();
+                    ctx.moveTo(44, y);
+                    ctx.lineTo(width - 8, y);
+                    ctx.stroke();
+                }
+            }
 
             ctx.fillStyle = 'rgba(135,220,255,0.07)';
             ctx.fillRect(centerX - 10, 0, 20, height);
@@ -457,22 +567,13 @@
             const notes = diff?.notes ?? [];
             const visible = notes.filter(n => n.b >= beat - TIMING_PAST && n.b <= beat + TIMING_WINDOW);
 
-            for (let lane = 0; lane < 4; lane++) {
-                const x = width * 0.20 + lane * laneGap;
-                ctx.strokeStyle = 'rgba(80,120,180,0.20)';
-                ctx.lineWidth = 1;
-                ctx.beginPath();
-                ctx.moveTo(x, 10);
-                ctx.lineTo(x, height - 10);
-                ctx.stroke();
-            }
-
             for (const note of visible) {
                 const delta = note.b - beat;
-                const x = centerX + (delta / TIMING_WINDOW) * width * 0.42;
-                const y = height * 0.76 - note.y * (rowGap * 0.95);
-                const w = 18;
-                const h = 18;
+                const x = centerX + (delta / TIMING_WINDOW) * noteTravelWidth;
+                const laneY = gridTop + note.x * laneHeight;
+                const y = laneY + (2 - note.y + 0.5) * rowHeight;
+                const w = Math.min(24, rowHeight * 0.78);
+                const h = Math.min(24, rowHeight * 0.78);
                 ctx.save();
                 if (delta < 0) ctx.globalAlpha = Math.max(0, 1 + delta / TIMING_PAST);
                 ctx.translate(x, y);
@@ -489,7 +590,7 @@
             }
 
             for (let i = -1; i <= 4; i++) {
-                const x = centerX + (i / TIMING_WINDOW) * width * 0.42;
+                const x = centerX + (i / TIMING_WINDOW) * noteTravelWidth;
                 const isBeat = i >= 0;
                 ctx.strokeStyle = isBeat ? 'rgba(120,170,255,0.26)' : 'rgba(255,130,130,0.20)';
                 ctx.lineWidth = isBeat && i % 1 === 0 ? 1.2 : 0.6;
@@ -498,6 +599,12 @@
                 ctx.lineTo(x, height - 2);
                 ctx.stroke();
             }
+
+            ctx.fillStyle = 'rgba(180,230,255,0.70)';
+            ctx.font = '700 11px Orbitron, sans-serif';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'top';
+            ctx.fillText('NOW', centerX, 6);
         }
 
         _fillQuad(ctx, x1, y1, x2, y2, x3, y3, x4, y4, c1, c2) {

@@ -14,6 +14,14 @@ namespace BeatSaber.AutoMapper.Training.Models;
 /// </summary>
 public sealed class TorchPlacementTrainer : IBatchedMultiTaskPlacementModel, IDisposable
 {
+    public enum LoadedCheckpointKind
+    {
+        None,
+        Current,
+        Best,
+        Legacy
+    }
+
     private readonly BeatSaberMappingNet _gpu;
     private readonly BeatSaberMappingNet _cpu;
     private readonly Device              _device;
@@ -48,23 +56,35 @@ public sealed class TorchPlacementTrainer : IBatchedMultiTaskPlacementModel, IDi
 
     // ── Checkpoint ────────────────────────────────────────────────────────────
 
-    public bool TryLoadCheckpoint(string artifactsPath)
+    public LoadedCheckpointKind TryLoadCheckpoint(string artifactsPath)
     {
-        string path = Path.Combine(artifactsPath, "neural_placement.pt");
-        if (!File.Exists(path)) return false;
-        try
+        (string Path, LoadedCheckpointKind Kind)[] candidates =
         {
-            _gpu.load(path);
-            _gpu.to(_device);
-            SyncCpuShadow();
-            Console.WriteLine("[TorchSharp] Warm-start from neural_placement.pt");
-            return true;
-        }
-        catch (Exception ex)
+            (Path.Combine(artifactsPath, "neural_placement.current.pt"), LoadedCheckpointKind.Current),
+            (Path.Combine(artifactsPath, "neural_placement.best.pt"), LoadedCheckpointKind.Best),
+            (Path.Combine(artifactsPath, "neural_placement.pt"), LoadedCheckpointKind.Legacy),
+        };
+
+        foreach (var candidate in candidates)
         {
-            Console.WriteLine($"[TorchSharp] Checkpoint load failed: {ex.Message}");
-            return false;
+            if (!File.Exists(candidate.Path))
+                continue;
+
+            try
+            {
+                _gpu.load(candidate.Path);
+                _gpu.to(_device);
+                SyncCpuShadow();
+                Console.WriteLine($"[TorchSharp] Warm-start from {Path.GetFileName(candidate.Path)}");
+                return candidate.Kind;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[TorchSharp] Checkpoint load failed from {Path.GetFileName(candidate.Path)}: {ex.Message}");
+            }
         }
+
+        return LoadedCheckpointKind.None;
     }
 
     // ── Epoch training ────────────────────────────────────────────────────────
@@ -122,11 +142,13 @@ public sealed class TorchPlacementTrainer : IBatchedMultiTaskPlacementModel, IDi
                 var yLnArr    = new long[batchCount * len];
                 var yRwArr    = new long[batchCount * len];
                 var yHlArr    = new long[batchCount * len];
+                var yPtArr    = new long[batchCount * len];
                 var hasMask   = new float[batchCount * len];
                 var cdMask    = new float[batchCount * len];
                 var lnMask    = new float[batchCount * len];
                 var rwMask    = new float[batchCount * len];
                 var hlMask    = new float[batchCount * len];
+                var ptMask    = new float[batchCount * len];
                 var exWtArr   = new float[batchCount * len];
                 var validMask = new float[batchCount * len];
 
@@ -154,11 +176,13 @@ public sealed class TorchPlacementTrainer : IBatchedMultiTaskPlacementModel, IDi
                         yHlArr[idx]    = ex.HasNote && validHandLane
                             ? ex.NoteHand * 4 + ex.NoteLane
                             : 0;
+                        yPtArr[idx]    = ex.PatternTypeId is >= 0 and < 6 ? ex.PatternTypeId : 0;
                         hasMask[idx]   = ex.HasNote && validHand ? 1f : 0f;
                         cdMask[idx]    = ex.HasNote && validCut ? 1f : 0f;
                         lnMask[idx]    = ex.HasNote && validLane ? 1f : 0f;
                         rwMask[idx]    = ex.HasNote && validRow ? 1f : 0f;
                         hlMask[idx]    = ex.HasNote && validHandLane ? 1f : 0f;
+                        ptMask[idx]    = ex.HasNote ? 1f : 0f;
                         exWtArr[idx]   = (float)Math.Max(0.05, ex.Weight);
                         validMask[idx] = 1f;
                     }
@@ -172,12 +196,14 @@ public sealed class TorchPlacementTrainer : IBatchedMultiTaskPlacementModel, IDi
                 using var yLnT    = tensor(yLnArr,  new long[] { N },          device: _device);
                 using var yRwT    = tensor(yRwArr,  new long[] { N },          device: _device);
                 using var yHlT    = tensor(yHlArr,  new long[] { N },          device: _device);
+                using var yPtT    = tensor(yPtArr,  new long[] { N },          device: _device);
                 using var posWtT  = tensor(posWt,                             device: _device);
                 using var haMaskT = tensor(hasMask, new long[] { N },         device: _device);
                 using var cdMaskT = tensor(cdMask,  new long[] { N },         device: _device);
                 using var lnMaskT = tensor(lnMask,  new long[] { N },         device: _device);
                 using var rwMaskT = tensor(rwMask,  new long[] { N },         device: _device);
                 using var hlMaskT = tensor(hlMask,  new long[] { N },         device: _device);
+                using var ptMaskT = tensor(ptMask,  new long[] { N },         device: _device);
                 using var exWtT   = tensor(exWtArr, new long[] { N },         device: _device);
                 using var validT  = tensor(validMask, new long[] { N },       device: _device);
 
@@ -192,6 +218,7 @@ public sealed class TorchPlacementTrainer : IBatchedMultiTaskPlacementModel, IDi
                 using var lnLgt = outT.narrow(1, 11, 4);
                 using var rwLgt = outT.narrow(1, 15, 3);
                 using var hlLgt = outT.narrow(1, 18, 8);
+                using var ptLgt = outT.narrow(1, 26, 6);
 
                 var plBceTens = MaskedBinaryCrossEntropyWithLogits(plLgt, yPlT, exWtT, validT, posWtT);
                 totalPlaceBce += plBceTens.item<float>();
@@ -247,6 +274,16 @@ public sealed class TorchPlacementTrainer : IBatchedMultiTaskPlacementModel, IDi
                     lossTerms.Add(hlLoss);
                 }
 
+                using var ptMaskIdx = (ptMaskT > 0.5f).nonzero().squeeze(1);
+                if (ptMaskIdx.shape[0] > 0)
+                {
+                    using var ptSelLgt = ptLgt.index_select(0, ptMaskIdx);
+                    using var ptSelY   = yPtT.index_select(0, ptMaskIdx);
+                    using var ptSelW   = exWtT.index_select(0, ptMaskIdx);
+                    var ptLoss         = 0.7 * WeightedCrossEntropy(ptSelLgt, ptSelY, ptSelW);
+                    lossTerms.Add(ptLoss);
+                }
+
                 Tensor loss;
                 if (lossTerms.Count == 1)
                 {
@@ -298,7 +335,22 @@ public sealed class TorchPlacementTrainer : IBatchedMultiTaskPlacementModel, IDi
 
     public void SaveWeights(string artifactsPath)
     {
-        string path = Path.Combine(artifactsPath, "neural_placement.pt");
+        SaveWeightsAs(artifactsPath, "neural_placement.pt");
+    }
+
+    public void SaveCurrentWeights(string artifactsPath)
+    {
+        SaveWeightsAs(artifactsPath, "neural_placement.current.pt");
+    }
+
+    public void SaveBestArtifact(string artifactsPath)
+    {
+        SaveWeightsAs(artifactsPath, "neural_placement.best.pt");
+    }
+
+    private void SaveWeightsAs(string artifactsPath, string fileName)
+    {
+        string path = Path.Combine(artifactsPath, fileName);
         _gpu.save(path);
         Console.WriteLine($"[TorchSharp] Model saved → {path}");
     }
@@ -378,6 +430,7 @@ public sealed class TorchPlacementTrainer : IBatchedMultiTaskPlacementModel, IDi
         using var lnSm   = softmax(outT.narrow(1, 11, 4), dim: 1);
         using var rwSm   = softmax(outT.narrow(1, 15, 3), dim: 1);
         using var hlSm   = softmax(outT.narrow(1, 18, 8), dim: 1);
+        using var ptSm   = softmax(outT.narrow(1, 26, 6), dim: 1);
         outT.Dispose();
 
         return new NeuralMapPrediction
@@ -388,6 +441,7 @@ public sealed class TorchPlacementTrainer : IBatchedMultiTaskPlacementModel, IDi
             LaneProbs      = ToDoubleArray(lnSm.squeeze(0)),
             RowProbs       = ToDoubleArray(rwSm.squeeze(0)),
             HandLaneProbs  = ToDoubleArray(hlSm.squeeze(0)),
+            PatternTypeProbs = ToDoubleArray(ptSm.squeeze(0)),
         };
     }
 
@@ -445,6 +499,7 @@ public sealed class TorchPlacementTrainer : IBatchedMultiTaskPlacementModel, IDi
             using var lnSm   = softmax(outT.narrow(1, 11, 4), dim: 1);
             using var rwSm   = softmax(outT.narrow(1, 15, 3), dim: 1);
             using var hlSm   = softmax(outT.narrow(1, 18, 8), dim: 1);
+            using var ptSm   = softmax(outT.narrow(1, 26, 6), dim: 1);
             outT.Dispose();
 
             return new NeuralMapPrediction
@@ -455,6 +510,7 @@ public sealed class TorchPlacementTrainer : IBatchedMultiTaskPlacementModel, IDi
                 LaneProbs      = ToDoubleArray(lnSm.squeeze(0)),
                 RowProbs       = ToDoubleArray(rwSm.squeeze(0)),
                 HandLaneProbs  = ToDoubleArray(hlSm.squeeze(0)),
+                PatternTypeProbs = ToDoubleArray(ptSm.squeeze(0)),
             };
         }
     }
@@ -533,6 +589,7 @@ public sealed class TorchPlacementTrainer : IBatchedMultiTaskPlacementModel, IDi
             using var lnSm   = softmax(outT.narrow(1, 11, 4), dim: 1);
             using var rwSm   = softmax(outT.narrow(1, 15, 3), dim: 1);
             using var hlSm   = softmax(outT.narrow(1, 18, 8), dim: 1);
+            using var ptSm   = softmax(outT.narrow(1, 26, 6), dim: 1);
 
             var plData = plProb.data<float>();
             var haData = haProb.data<float>();
@@ -540,6 +597,7 @@ public sealed class TorchPlacementTrainer : IBatchedMultiTaskPlacementModel, IDi
             var lnData = lnSm.data<float>().ToArray();
             var rwData = rwSm.data<float>().ToArray();
             var hlData = hlSm.data<float>().ToArray();
+            var ptData = ptSm.data<float>().ToArray();
 
             var results = new NeuralMapPrediction[batchSize];
             for (int i = 0; i < batchSize; i++)
@@ -552,6 +610,7 @@ public sealed class TorchPlacementTrainer : IBatchedMultiTaskPlacementModel, IDi
                     LaneProbs      = SliceToDoubleArray(lnData, i * 4, 4),
                     RowProbs       = SliceToDoubleArray(rwData, i * 3, 3),
                     HandLaneProbs  = SliceToDoubleArray(hlData, i * 8, 8),
+                    PatternTypeProbs = SliceToDoubleArray(ptData, i * 6, 6),
                 };
             }
 

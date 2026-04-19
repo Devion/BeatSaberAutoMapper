@@ -31,28 +31,24 @@ public sealed class CandidateEventProposer
         }
 
         var proposed  = new List<ProposedEvent>();
-
-        // Difficulty-aware threshold: tighter for easy difficulties (fewer false-positives),
-        // looser for expert (high note density expected). Heuristic uses a much lower floor.
-        double threshold = ctx.PlacementScorer is not null
+        double baseThreshold = ctx.PlacementScorer is not null
             ? ctx.Profile.Difficulty switch
             {
-                // Density control already prunes the candidate set, so keep
-                // the proposal gate slightly looser to reduce collapse epochs.
-                DifficultyLevel.Easy       => 0.64,
-                DifficultyLevel.Normal     => 0.59,
-                DifficultyLevel.Hard       => 0.54,
-                DifficultyLevel.Expert     => 0.48,
-                DifficultyLevel.ExpertPlus => 0.42,
-                _                          => 0.56
+                DifficultyLevel.Easy       => 0.22,
+                DifficultyLevel.Normal     => 0.18,
+                DifficultyLevel.Hard       => 0.15,
+                DifficultyLevel.Expert     => 0.12,
+                DifficultyLevel.ExpertPlus => 0.10,
+                _                          => 0.16
             }
             : 0.15;
 
         if (ctx.MultiTaskModel is IBatchedMultiTaskPlacementModel batchedModel)
             return ApplyDensityControl(
-                ProposeEventsBatched(ctx, batchedModel, lastLeft, lastRight, threshold),
+                ProposeEventsBatched(ctx, batchedModel, lastLeft, lastRight, baseThreshold),
                 ctx);
 
+        var scored = new List<ProposedEvent>(ctx.CandidateGrid.Length);
         foreach (var candidate in ctx.CandidateGrid)
         {
             double score = ScoreCandidate(
@@ -64,11 +60,17 @@ public sealed class CandidateEventProposer
                 ctx.RightHandContext,
                 ctx.GruHiddenState?.Clone(),
                 out var neuralPred);
-            if (score < threshold) continue;
-
             var hand = ChooseSuggestedHand(neuralPred, ctx);
+            scored.Add(new ProposedEvent(candidate, score, hand, neuralPred?.HandScore ?? score, neuralPred));
+        }
 
-            proposed.Add(new ProposedEvent(candidate, score, hand, neuralPred?.HandScore ?? score, neuralPred));
+        double threshold = DetermineAdaptiveThreshold(scored, ctx, baseThreshold);
+        foreach (var ev in scored)
+        {
+            if (ev.PlacementScore < threshold)
+                continue;
+
+            proposed.Add(ev);
         }
 
         return ApplyDensityControl(proposed, ctx);
@@ -79,7 +81,7 @@ public sealed class CandidateEventProposer
         IBatchedMultiTaskPlacementModel batchedModel,
         CanonicalNote? lastLeft,
         CanonicalNote? lastRight,
-        double threshold)
+        double baseThreshold)
     {
         var contexts = new NeuralPlacementContext[ctx.CandidateGrid.Length];
         for (int i = 0; i < ctx.CandidateGrid.Length; i++)
@@ -95,7 +97,7 @@ public sealed class CandidateEventProposer
         }
 
         var predictions = batchedModel.PredictAllBatch(contexts);
-        var proposed = new List<ProposedEvent>(predictions.Count);
+        var scored = new List<ProposedEvent>(predictions.Count);
 
         for (int i = 0; i < predictions.Count; i++)
         {
@@ -109,10 +111,7 @@ public sealed class CandidateEventProposer
             if (localNps > targetNps)
                 score *= Math.Max(0.1, 1.0 - (localNps - targetNps) / targetNps * 0.3);
 
-            if (score < threshold)
-                continue;
-
-            proposed.Add(new ProposedEvent(
+            scored.Add(new ProposedEvent(
                 candidate,
                 score,
                 ChooseSuggestedHand(prediction, ctx),
@@ -120,7 +119,48 @@ public sealed class CandidateEventProposer
                 prediction));
         }
 
+        double threshold = DetermineAdaptiveThreshold(scored, ctx, baseThreshold);
+        var proposed = new List<ProposedEvent>(scored.Count);
+        foreach (var ev in scored)
+        {
+            if (ev.PlacementScore >= threshold)
+                proposed.Add(ev);
+        }
+
         return proposed;
+    }
+
+    private static double DetermineAdaptiveThreshold(
+        List<ProposedEvent> scored,
+        GenerationContext ctx,
+        double baseThreshold)
+    {
+        if (scored.Count == 0)
+            return baseThreshold;
+
+        double minThreshold = ctx.Profile.Difficulty switch
+        {
+            DifficultyLevel.Easy       => 0.05,
+            DifficultyLevel.Normal     => 0.045,
+            DifficultyLevel.Hard       => 0.04,
+            DifficultyLevel.Expert     => 0.035,
+            DifficultyLevel.ExpertPlus => 0.03,
+            _                          => 0.04
+        };
+
+        double durationSeconds = Math.Max(1.0, ctx.AudioAnalysis.DurationSeconds);
+        double estimatedFinalNotes = durationSeconds * ctx.Profile.TargetNps;
+        int desiredProposals = (int)Math.Round(estimatedFinalNotes * 1.8);
+        desiredProposals = Math.Clamp(desiredProposals, 24, Math.Max(24, (int)Math.Round(scored.Count * 0.35)));
+        desiredProposals = Math.Min(desiredProposals, scored.Count);
+
+        var sortedScores = scored
+            .Select(e => e.PlacementScore)
+            .OrderByDescending(s => s)
+            .ToList();
+
+        double quantileThreshold = sortedScores[desiredProposals - 1];
+        return Math.Clamp(Math.Min(baseThreshold, quantileThreshold), minThreshold, baseThreshold);
     }
 
     internal static NeuralPlacementContext BuildNeuralContext(

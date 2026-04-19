@@ -1,6 +1,7 @@
 using BeatSaber.AutoMapper.Audio;
 using BeatSaber.AutoMapper.Canonical;
 using BeatSaber.AutoMapper.Training.Features;
+using BeatSaber.AutoMapper.Training.Patterns;
 using BeatSaber.AutoMapper.Utilities;
 
 namespace BeatSaber.AutoMapper.Training.SelfSupervised;
@@ -240,6 +241,17 @@ public sealed class SelfSupervisedExampleGenerator
         double rightRecentTravel = MappingFeatureEngineering.RecentTravel(prev2Right, lastRight);
         double recentLaneSpan4 = MappingFeatureEngineering.RecentLaneSpan(history, beat, 4.0);
         double recentRowSpan4 = MappingFeatureEngineering.RecentRowSpan(history, beat, 4.0);
+        int patternTypeId = hasNote
+            ? (int)PatternModeling.DerivePatternType(
+                beat,
+                [new CanonicalNote(
+                    beat,
+                    Math.Max(0, noteLane),
+                    Math.Max(0, noteRow),
+                    noteHand == 1 ? NoteColor.Blue : NoteColor.Red,
+                    noteCutDir >= 0 ? (CutDirection)noteCutDir : CutDirection.Down)],
+                history)
+            : (int)PatternType.Isolated;
 
         return new TrainingExample(
             Beat:                   beat,
@@ -282,6 +294,7 @@ public sealed class SelfSupervisedExampleGenerator
             NoteLane:               noteLane,
             NoteRow:                noteRow,
             NoteCutDir:             noteCutDir,
+            PatternTypeId:          patternTypeId,
             Weight:                 weight,
             FutureEnergy4:          futureEnergy4,
             FutureEnergy8:          futureEnergy8,

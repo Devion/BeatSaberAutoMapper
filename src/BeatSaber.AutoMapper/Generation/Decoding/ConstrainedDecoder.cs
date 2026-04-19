@@ -1,4 +1,6 @@
 using BeatSaber.AutoMapper.Canonical.Derived;
+using BeatSaber.AutoMapper.Training.Patterns;
+using BeatSaber.AutoMapper.Validation;
 
 namespace BeatSaber.AutoMapper.Generation.Decoding;
 
@@ -132,6 +134,10 @@ public sealed class ConstrainedDecoder
                     var chordNote = selector.SelectAttributes(chordProposed, chordCtx);
                     if (chordNote is null || chordNote.Hand == note.Hand)
                         continue;
+                    if (PlayabilityHeuristics.IsHandclap(note, chordNote) ||
+                        PlayabilityHeuristics.IsVisionBlock(note, chordNote) ||
+                        PlayabilityHeuristics.IsHitboxPath(note, chordNote))
+                        continue;
 
                     var chordTransition = ParityAnalyzer.ClassifyTransition(
                         chordNote.Hand == NoteHand.Left ? singleState.LastLeft : singleState.LastRight,
@@ -228,10 +234,15 @@ public sealed class ConstrainedDecoder
         double currentBeatCount = MappingFeatureEngineering.NotesAtCurrentBeatSoFar(ctx.PlacedNotes, candidate.Timing.Beat);
         if (currentBeatCount >= 1)
             return false;
+        if (recentChordRate > 0.18)
+            return false;
 
         double rightMass = prediction.HasValue && prediction.Value.HandLaneProbs is { Length: 8 } handLane
             ? handLane[4] + handLane[5] + handLane[6] + handLane[7]
             : proposed.HandScore;
+        PatternType patternType = PredictPatternType(prediction);
+        if (patternType is PatternType.Stream or PatternType.Anchor or PatternType.Reset)
+            return false;
         double handAmbiguity = 1.0 - Math.Abs(rightMass - 0.5) * 2.0;
 
         double propensity = 0.38 * placement
@@ -252,6 +263,19 @@ public sealed class ConstrainedDecoder
         };
 
         return propensity >= 0.50;
+    }
+
+    private static PatternType PredictPatternType(NeuralMapPrediction? prediction)
+    {
+        if (!prediction.HasValue || prediction.Value.PatternTypeProbs is not { Length: >= 6 } probs)
+            return PatternType.Isolated;
+        int best = 0;
+        for (int i = 1; i < probs.Length; i++)
+        {
+            if (probs[i] > probs[best])
+                best = i;
+        }
+        return (PatternType)best;
     }
 
     private static double ScoreChordBonus(ProposedEvent candidate, GenerationContext ctx)

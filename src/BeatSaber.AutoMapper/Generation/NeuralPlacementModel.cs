@@ -15,6 +15,7 @@ public readonly struct NeuralMapPrediction
     public double[] LaneProbs      { get; init; }  // softmax over 4 lanes (0-3)
     public double[] RowProbs       { get; init; }  // softmax over 3 rows  (0-2)
     public double[] HandLaneProbs  { get; init; }  // softmax over 8 classes (L0..L3,R0..R3)
+    public double[] PatternTypeProbs { get; init; } // softmax over 6 pattern classes
 }
 
 /// <summary>
@@ -116,6 +117,7 @@ public sealed class NeuralPlacementModel : IBatchedMultiTaskPlacementModel, IDis
         using var lnSm   = softmax(out_.narrow(1, 11, 4), dim: 1);  // [1, 4]
         using var rwSm   = softmax(out_.narrow(1, 15, 3), dim: 1);  // [1, 3]
         using var hlSm   = softmax(out_.narrow(1, 18, 8), dim: 1);  // [1, 8]
+        using var ptSm   = softmax(out_.narrow(1, 26, 6), dim: 1);  // [1, 6]
         out_.Dispose();
 
         return new NeuralMapPrediction
@@ -126,6 +128,7 @@ public sealed class NeuralPlacementModel : IBatchedMultiTaskPlacementModel, IDis
             LaneProbs      = ToDoubleArray(lnSm.squeeze(0)),
             RowProbs       = ToDoubleArray(rwSm.squeeze(0)),
             HandLaneProbs  = ToDoubleArray(hlSm.squeeze(0)),
+            PatternTypeProbs = ToDoubleArray(ptSm.squeeze(0)),
         };
     }
 

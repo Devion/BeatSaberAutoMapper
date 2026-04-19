@@ -34,10 +34,20 @@ public sealed class RepairEngine
                     repaired = TryRepairParityBreak(current, issue, out string? desc);
                     if (repaired is not null) applied.Add(desc ?? "Parity repair");
                 }
+                else if (issue.RuleName is "DoubleDirectional" or "SwingSpeed" or "HitboxPath")
+                {
+                    repaired = TryRemoveOffendingNote(current, issue, out string? desc3);
+                    if (repaired is not null) applied.Add(desc3 ?? "Flow repair");
+                }
                 else if (issue.RuleName == "Density")
                 {
                     repaired = TryRepairDensitySpike(current, issue, out string? desc2);
                     if (repaired is not null) applied.Add(desc2 ?? "Density repair");
+                }
+                else if (issue.RuleName is "ExcessiveDouble" or "Handclap" or "VisionBlock")
+                {
+                    repaired = TryThinBeatPattern(current, issue, out string? desc4);
+                    if (repaired is not null) applied.Add(desc4 ?? "Chord thinning repair");
                 }
 
                 if (repaired is not null)
@@ -97,6 +107,50 @@ public sealed class RepairEngine
 
         var newNotes = beatmap.Notes.Where(n => !toRemove.Contains(n)).ToList();
         description = $"Thinned {toRemove.Count} notes near beat {center:F2} to reduce density spike.";
+        return CloneWith(beatmap, newNotes);
+    }
+
+    private CanonicalBeatmap? TryRemoveOffendingNote(
+        CanonicalBeatmap beatmap, ValidationIssue issue, out string? description)
+    {
+        description = null;
+        if (issue.Beat is null)
+            return null;
+
+        double beat = issue.Beat.Value;
+        var candidate = beatmap.Notes
+            .Where(n => Math.Abs(n.Beat - beat) < PlayabilityHeuristics.BeatTolerance &&
+                        (issue.Hand is null || n.Hand == issue.Hand))
+            .OrderByDescending(n => n.Row)
+            .ThenByDescending(n => Math.Abs(n.Lane - 1.5))
+            .FirstOrDefault();
+
+        if (candidate is null)
+            return null;
+
+        var newNotes = beatmap.Notes.Where(n => n != candidate).ToList();
+        description = $"Removed note at beat {candidate.Beat:F2} for {issue.RuleName}.";
+        return CloneWith(beatmap, newNotes);
+    }
+
+    private CanonicalBeatmap? TryThinBeatPattern(
+        CanonicalBeatmap beatmap, ValidationIssue issue, out string? description)
+    {
+        description = null;
+        if (issue.Beat is null)
+            return null;
+
+        double beat = issue.Beat.Value;
+        var notesAtBeat = beatmap.Notes
+            .Where(n => Math.Abs(n.Beat - beat) < PlayabilityHeuristics.BeatTolerance)
+            .ToList();
+
+        var toRemove = PlayabilityHeuristics.PickNoteToRemoveAtBeat(notesAtBeat);
+        if (toRemove is null)
+            return null;
+
+        var newNotes = beatmap.Notes.Where(n => n != toRemove).ToList();
+        description = $"Removed one note from beat {beat:F2} to resolve {issue.RuleName}.";
         return CloneWith(beatmap, newNotes);
     }
 

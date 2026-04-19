@@ -4,6 +4,8 @@ namespace BeatSaber.AutoMapper.Beatmap;
 
 public sealed class BeatmapExporter
 {
+    private const double DefaultNoteJumpMovementSpeed = 12.0;
+
     // v3 beatmap files use explicit [JsonPropertyName] attrs – camelCase policy is harmless.
     private static readonly JsonSerializerOptions _writeOpts = new()
     {
@@ -53,7 +55,7 @@ public sealed class BeatmapExporter
                     Difficulty = d.Desc.Difficulty.ToString(),
                     DifficultyRank = DifficultyToRank(d.Desc.Difficulty),
                     BeatmapFilename = d.Filename,
-                    NoteJumpMovementSpeed = d.Desc.NoteJumpMovementSpeed ?? 16,
+                    NoteJumpMovementSpeed = d.Desc.NoteJumpMovementSpeed ?? DefaultNoteJumpMovementSpeed,
                     NoteJumpStartBeatOffset = d.Desc.NoteJumpStartBeatOffset ?? 0.0
                 }).ToList()
             }).ToList();

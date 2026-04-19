@@ -105,8 +105,15 @@ public sealed class TrainingPipeline : IDisposable
         double AvgDecodeRate,
         double AvgRepairedNotes,
         double AvgScoreAllPairs,
+        double AvgSyntheticExamplesPerAcceptedPair,
         Dictionary<DifficultyLevel, double> AvgGeneratedNotesByDifficulty,
         Dictionary<DifficultyLevel, double> DiffScores);
+
+    private readonly record struct SyntheticBudget(
+        int MaxSequenceCount,
+        int MaxExampleCount,
+        double FractionOfRealExamples,
+        int StableRefreshStreak);
 
     public void Run(TrainingOptions options)
     {
@@ -114,9 +121,10 @@ public sealed class TrainingPipeline : IDisposable
         Directory.CreateDirectory(options.ArtifactsOutputPath);
 
         // Warm-start from existing checkpoint
-        bool warmStarted = _placementTrainer.TryLoadCheckpoint(options.ArtifactsOutputPath);
+        var loadedCheckpointKind = _placementTrainer.TryLoadCheckpoint(options.ArtifactsOutputPath);
+        bool warmStarted = loadedCheckpointKind != TorchPlacementTrainer.LoadedCheckpointKind.None;
         if (warmStarted)
-            Console.WriteLine("[Training] Warm-start: loaded existing checkpoint. LR reduced 0.3x for fine-tuning.");
+            Console.WriteLine($"[Training] Warm-start: loaded {loadedCheckpointKind} checkpoint.");
 
         // ----------------------------------------------------------------
         // 1. Resolve map folders
@@ -401,7 +409,16 @@ public sealed class TrainingPipeline : IDisposable
         // ----------------------------------------------------------------
         // 5. Placement model — epoch loop with shuffle + parallel mini-batch GD
         // ----------------------------------------------------------------
-        double lr = warmStarted ? options.InitialLearningRate * 0.3 : options.InitialLearningRate;
+        double lr = loadedCheckpointKind switch
+        {
+            TorchPlacementTrainer.LoadedCheckpointKind.Current => options.InitialLearningRate,
+            TorchPlacementTrainer.LoadedCheckpointKind.Best => options.InitialLearningRate * 0.5,
+            TorchPlacementTrainer.LoadedCheckpointKind.Legacy => options.InitialLearningRate * 0.5,
+            _ => options.InitialLearningRate
+        };
+        Console.WriteLine(
+            $"[Training] LR setup: requested={options.InitialLearningRate:G4}  effective={lr:G4}  " +
+            $"checkpoint={loadedCheckpointKind}");
         const double MinLr   = 1e-5;
         const double LrDecay = 0.5;
         // Reduce LR after this many consecutive stagnation epochs.
@@ -413,6 +430,9 @@ public sealed class TrainingPipeline : IDisposable
         Console.WriteLine(
             $"[Training] Training GRU placement model {BeatSaberMappingNet.InputDim}→GRU({BeatSaberMappingNet.GruHiddenDim}×{BeatSaberMappingNet.GruLayers})→{BeatSaberMappingNet.MlpHidden} " +
             $"({options.Epochs} epochs max, Adam lr={lr:G4}, patience={options.EarlyStopPatience}, lr-patience={lrPatience})...[warmStart={warmStarted}]");
+        Console.WriteLine(
+            $"[Training] Synthetic training: enabled={options.EnableSyntheticTraining}  " +
+            $"unlockCoreQ={options.SyntheticUnlockCoreQ:F3}  warmup={options.SelfSupervisedWarmupEpochs}");
 
         double bestQuality     = -1.0;
         double smoothedQuality = -1.0;
@@ -425,6 +445,7 @@ public sealed class TrainingPipeline : IDisposable
         var genQHistory = new List<double>(SlopeWindow + 1);
 
         _placementTrainer.SaveBestWeights();
+        int stableSyntheticRefreshes = 0;
 
         var epochRng = new Random((int)(options.RandomSeed & int.MaxValue));
 
@@ -440,14 +461,20 @@ public sealed class TrainingPipeline : IDisposable
             var shuffledSeqs = FisherYatesShuffleSeqs(trainSeqs, epochRng.Next());
             bool syntheticMerged = false;
 
-            if (currentSyntheticSeqs.Count > 0 && epoch >= options.SelfSupervisedWarmupEpochs)
+            bool syntheticTrainingUnlocked = options.EnableSyntheticTraining &&
+                stableSyntheticRefreshes > 0;
+
+            if (syntheticTrainingUnlocked &&
+                currentSyntheticSeqs.Count > 0 &&
+                epoch >= options.SelfSupervisedWarmupEpochs)
             {
+                var syntheticBudget = ComputeSyntheticBudget(trainSeqs, stableSyntheticRefreshes);
                 shuffledSeqs = MergeSequences(
                     shuffledSeqs,
                     LimitSyntheticSequencesBalanced(
                         currentSyntheticSeqs,
-                        shuffledSeqs.Count / 2,
-                        Math.Max(512, shuffledSeqs.Sum(s => s.Count) / 4),
+                        syntheticBudget.MaxSequenceCount,
+                        syntheticBudget.MaxExampleCount,
                         epochRng.Next()),
                     epochRng.Next());
                 syntheticMerged = true;
@@ -494,14 +521,32 @@ public sealed class TrainingPipeline : IDisposable
                 // Each batch from a generated map becomes one sequence (sorted by beat).
                 if ((epoch + 1) % Math.Max(1, options.SelfSupervisedEveryNEpochs) == 0)
                 {
-                    if (ShouldAcceptSyntheticRefresh(coreQualityScore, fullQualityScore, diagnostics))
+                    if (ShouldAcceptSyntheticRefresh(coreQualityScore, fullQualityScore, diagnostics) &&
+                        options.EnableSyntheticTraining &&
+                        coreQualityScore >= options.SyntheticUnlockCoreQ)
                     {
-                        currentSyntheticSeqs = new List<List<TrainingExample>>(newSynthetics);
+                        stableSyntheticRefreshes++;
+                        var syntheticBudget = ComputeSyntheticBudget(trainSeqs, stableSyntheticRefreshes);
+                        currentSyntheticSeqs = LimitSyntheticSequencesBalanced(
+                            new List<List<TrainingExample>>(newSynthetics),
+                            syntheticBudget.MaxSequenceCount,
+                            syntheticBudget.MaxExampleCount,
+                            epochRng.Next());
+                        Console.WriteLine(
+                            $"[Training]   synthetic refresh accepted: streak={stableSyntheticRefreshes}  " +
+                            $"budgetSeq={syntheticBudget.MaxSequenceCount}  budgetEx={syntheticBudget.MaxExampleCount}  " +
+                            $"frac={syntheticBudget.FractionOfRealExamples:F3}");
                     }
                     else
                     {
+                        stableSyntheticRefreshes = 0;
+                        string reason = !options.EnableSyntheticTraining
+                            ? "disabled"
+                            : coreQualityScore < options.SyntheticUnlockCoreQ
+                                ? $"coreQ<{options.SyntheticUnlockCoreQ:F3}"
+                                : "quality gate";
                         Console.WriteLine(
-                            $"[Training]   synthetic refresh skipped: coreQ={coreQualityScore:F3}  " +
+                            $"[Training]   synthetic refresh skipped: reason={reason}  coreQ={coreQualityScore:F3}  " +
                             $"fullQ={fullQualityScore:F3}  okPairs={diagnostics.SuccessfulPairs}/{diagnostics.TotalPairs}");
                     }
                 }
@@ -514,8 +559,11 @@ public sealed class TrainingPipeline : IDisposable
             {
                 bestQuality = coreQualityScore;
                 _placementTrainer.SaveBestWeights();
+                _placementTrainer.SaveBestArtifact(options.ArtifactsOutputPath);
                 _placementTrainer.SaveWeights(options.ArtifactsOutputPath);
             }
+
+            _placementTrainer.SaveCurrentWeights(options.ArtifactsOutputPath);
 
             // EMA for display only (no longer drives LR/stop decisions)
             smoothedQuality = smoothedQuality < 0
@@ -566,8 +614,14 @@ public sealed class TrainingPipeline : IDisposable
 
             if (validationPlan is not null)
             {
+                var epochSyntheticBudget = ComputeSyntheticBudget(trainSeqs, stableSyntheticRefreshes);
                 Console.WriteLine(
                     $"[Training]   validation stage: coreSongs={validationPlan.CoreSongCount}  activeFullSongs={activeValidationSongs}/{validationPlan.FullSongCap}");
+                Console.WriteLine(
+                    $"[Training]   synthetic budget: enabled={options.EnableSyntheticTraining}  " +
+                    $"streak={stableSyntheticRefreshes}  " +
+                    $"seqCap={epochSyntheticBudget.MaxSequenceCount}  exCap={epochSyntheticBudget.MaxExampleCount}  " +
+                    $"frac={epochSyntheticBudget.FractionOfRealExamples:F3}");
                 if (diagnostics is not null)
                 {
                     var noteParts = diagnostics.AvgGeneratedNotesByDifficulty.Count > 0
@@ -580,7 +634,7 @@ public sealed class TrainingPipeline : IDisposable
                         $"coreOk={diagnostics.CoreSuccessfulPairs}/{Math.Max(1, diagnostics.CoreSuccessfulPairs + diagnostics.CoreFailedPairs)}  " +
                         $"avgAll={diagnostics.AvgScoreAllPairs:F3}  cand->prop={diagnostics.AvgCandidateSurvival:F3}  " +
                         $"prop->notes={diagnostics.AvgDecodeRate:F3}  repairedNotes={diagnostics.AvgRepairedNotes:F1}  " +
-                        $"newSynthEx={diagnostics.TotalSyntheticExamples}");
+                        $"newSynthEx={diagnostics.TotalSyntheticExamples}  synth/pair={diagnostics.AvgSyntheticExamplesPerAcceptedPair:F1}");
                     Console.WriteLine($"[Training]   val notes by diff: {noteParts}");
                 }
             }
@@ -624,7 +678,9 @@ public sealed class TrainingPipeline : IDisposable
         // ----------------------------------------------------------------
         // 6. Save artifacts
         // ----------------------------------------------------------------
+        _placementTrainer.SaveBestArtifact(options.ArtifactsOutputPath);
         _placementTrainer.SaveWeights(options.ArtifactsOutputPath);
+        _placementTrainer.SaveCurrentWeights(options.ArtifactsOutputPath);
 
         // ----------------------------------------------------------------
         // 7. Final test-set evaluation
@@ -672,6 +728,7 @@ public sealed class TrainingPipeline : IDisposable
                         TargetDifficulty: cached.Pair.ReferenceMap.Difficulty.Difficulty,
                         AllowBombs:       false,
                         AllowObstacles:   false,
+                        AllowFieldMovement: false,
                         RandomSeed:       options.RandomSeed,
                         UseLearned:       true,
                         ArtifactsPath:    null);
@@ -754,6 +811,7 @@ public sealed class TrainingPipeline : IDisposable
             AvgDecodeRate: avgDecodeRate,
             AvgRepairedNotes: avgRepairedNotes,
             AvgScoreAllPairs: avgScoreAllPairs,
+            AvgSyntheticExamplesPerAcceptedPair: valid.Length > 0 ? valid.Average(x => x.SyntheticExampleCount) : 0,
             AvgGeneratedNotesByDifficulty: avgGeneratedNotesByDifficulty,
             DiffScores: diffScores);
 
@@ -962,42 +1020,70 @@ public sealed class TrainingPipeline : IDisposable
             (copy[i], copy[j]) = (copy[j], copy[i]);
         }
 
+        int targetCount = Math.Max(1, maxCount);
+        int targetExamples = Math.Max(128, maxExamples);
         var result = new List<List<TrainingExample>>();
         int exampleCount = 0;
-        var uncoveredDiffs = Enum.GetValues<DifficultyLevel>().Cast<int>().ToHashSet();
+        var difficulties = Enum.GetValues<DifficultyLevel>().Cast<int>().ToArray();
+        var byDifficulty = copy
+            .Select(seq => (Seq: seq, Diff: TryGetSequenceDifficulty(seq) ?? -1))
+            .Where(x => x.Diff >= 0)
+            .GroupBy(x => x.Diff)
+            .ToDictionary(
+                g => g.Key,
+                g => g.Select(x => x.Seq).ToList());
+        int perDiffCountCap = Math.Max(1, (int)Math.Ceiling(targetCount / (double)Math.Max(1, difficulties.Length)));
+        int perDiffExampleCap = Math.Max(64, (int)Math.Ceiling(targetExamples / (double)Math.Max(1, difficulties.Length)));
+        var diffCounts = difficulties.ToDictionary(d => d, _ => 0);
+        var diffExamples = difficulties.ToDictionary(d => d, _ => 0);
 
-        foreach (var seq in copy)
+        foreach (int diff in difficulties)
         {
-            if (uncoveredDiffs.Count == 0)
-                break;
-
-            int? diff = TryGetSequenceDifficulty(seq);
-            if (diff is null || !uncoveredDiffs.Contains(diff.Value))
-                continue;
-            if (result.Count >= Math.Max(1, maxCount))
-                break;
-            if (result.Count > 0 && exampleCount + seq.Count > maxExamples)
+            if (!byDifficulty.TryGetValue(diff, out var seqs))
                 continue;
 
-            result.Add(seq);
-            exampleCount += seq.Count;
-            uncoveredDiffs.Remove(diff.Value);
+            foreach (var seq in seqs)
+            {
+                if (result.Count >= targetCount)
+                    break;
+                if (exampleCount + seq.Count > targetExamples && result.Count > 0)
+                    continue;
+                if (diffCounts[diff] >= perDiffCountCap || diffExamples[diff] + seq.Count > perDiffExampleCap)
+                    continue;
+
+                result.Add(seq);
+                exampleCount += seq.Count;
+                diffCounts[diff]++;
+                diffExamples[diff] += seq.Count;
+                break;
+            }
         }
 
         foreach (var seq in copy)
         {
-            if (result.Count >= Math.Max(1, maxCount))
+            if (result.Count >= targetCount)
                 break;
             if (result.Contains(seq))
                 continue;
-            if (result.Count > 0 && exampleCount + seq.Count > maxExamples)
+            if (result.Count > 0 && exampleCount + seq.Count > targetExamples)
                 continue;
+
+            int? diff = TryGetSequenceDifficulty(seq);
+            if (diff is not null && diffCounts.TryGetValue(diff.Value, out int diffCount))
+            {
+                if (diffCount >= perDiffCountCap * 2)
+                    continue;
+                if (diffExamples[diff.Value] + seq.Count > perDiffExampleCap * 2)
+                    continue;
+                diffCounts[diff.Value] = diffCount + 1;
+                diffExamples[diff.Value] += seq.Count;
+            }
 
             result.Add(seq);
             exampleCount += seq.Count;
         }
 
-        return result.Count > 0 ? result : copy.Take(Math.Max(1, maxCount)).ToList();
+        return result.Count > 0 ? result : copy.Take(targetCount).ToList();
     }
 
     /// <summary>Fisher-Yates in-place shuffle of a copy, using the given seed.</summary>
@@ -1026,7 +1112,56 @@ public sealed class TrainingPipeline : IDisposable
             return false;
         if (diagnostics.AvgCandidateSurvival < 0.01 || diagnostics.AvgDecodeRate < 0.10)
             return false;
+        if (diagnostics.AvgCandidateSurvival > 0.28 || diagnostics.AvgDecodeRate > 1.70)
+            return false;
+        if (diagnostics.AvgSyntheticExamplesPerAcceptedPair > 700)
+            return false;
+        foreach (var kv in diagnostics.AvgGeneratedNotesByDifficulty)
+        {
+            double ceiling = kv.Key switch
+            {
+                DifficultyLevel.Easy => 180,
+                DifficultyLevel.Normal => 320,
+                DifficultyLevel.Hard => 520,
+                DifficultyLevel.Expert => 800,
+                DifficultyLevel.ExpertPlus => 1200,
+                _ => 800,
+            };
+            if (kv.Value > ceiling)
+                return false;
+        }
         return true;
+    }
+
+    private static SyntheticBudget ComputeSyntheticBudget(
+        IReadOnlyList<IReadOnlyList<TrainingExample>> realTrainSequences,
+        int stableRefreshStreak)
+    {
+        int realSeqCount = realTrainSequences.Count;
+        int realExampleCount = realTrainSequences.Sum(s => s.Count);
+
+        double fraction = stableRefreshStreak switch
+        {
+            <= 0 => 0.015,
+            1 => 0.020,
+            2 => 0.030,
+            3 => 0.040,
+            4 => 0.055,
+            _ => 0.070,
+        };
+
+        int seqCap = stableRefreshStreak switch
+        {
+            <= 0 => Math.Max(8, realSeqCount / 40),
+            1 => Math.Max(10, realSeqCount / 32),
+            2 => Math.Max(12, realSeqCount / 28),
+            3 => Math.Max(16, realSeqCount / 24),
+            4 => Math.Max(20, realSeqCount / 20),
+            _ => Math.Max(24, realSeqCount / 16),
+        };
+
+        int exampleCap = Math.Max(512, (int)Math.Round(realExampleCount * fraction));
+        return new SyntheticBudget(seqCap, exampleCap, fraction, stableRefreshStreak);
     }
 
     private static SequenceDifficultySnapshot SummarizeSequences(IReadOnlyList<IReadOnlyList<TrainingExample>> sequences)

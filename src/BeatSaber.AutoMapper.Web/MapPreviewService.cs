@@ -1,5 +1,6 @@
 using System.IO.Compression;
 using System.Text.Json;
+using BeatSaber.AutoMapper.Utilities;
 
 namespace BeatSaber.AutoMapper.Web;
 
@@ -9,6 +10,8 @@ namespace BeatSaber.AutoMapper.Web;
 /// </summary>
 internal static class MapPreviewService
 {
+    private record struct TimingPointDto(double b, double t, double m);
+
     public static IResult GetPreview(string zipPath)
     {
         try
@@ -32,7 +35,7 @@ internal static class MapPreviewService
             if (bpm <= 0) bpm = 120;
 
             var diffs  = new List<object>();
-            double maxBeat = 0;
+            double maxDuration = 0;
 
             foreach (var set in infoRoot.GetProperty("_difficultyBeatmapSets").EnumerateArray())
             {
@@ -56,18 +59,18 @@ internal static class MapPreviewService
                         bmJson = sr.ReadToEnd();
 
                     var notes = ParseNotes(bmJson);
-                    if (notes.Length > 0)
-                        maxBeat = Math.Max(maxBeat, notes[^1].b);
+                    var timingPoints = ParseTimingPoints(bmJson, bpm);
+                    double diffDuration = EstimateDurationSeconds(notes, timingPoints);
+                    maxDuration = Math.Max(maxDuration, diffDuration);
 
-                    diffs.Add(new { name = diffName, notes });
+                    diffs.Add(new { name = diffName, duration = diffDuration, timingPoints, notes });
                 }
             }
 
             if (diffs.Count == 0)
                 return Results.Problem("No Standard difficulties found.");
 
-            // Estimate duration from last note + small tail (8 beats)
-            double duration = maxBeat > 0 ? (maxBeat + 8.0) * 60.0 / bpm : 60.0;
+            double duration = maxDuration > 0 ? maxDuration : 60.0;
 
             return Results.Json(new { bpm, duration, difficulties = diffs });
         }
@@ -81,6 +84,79 @@ internal static class MapPreviewService
 
     // Compact note record — serialises to {b,x,y,c,d} which the JS reads directly.
     private record struct NoteDto(double b, int x, int y, int c, int d);
+
+    private static TimingPointDto[] ParseTimingPoints(string json, double baseBpm)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+
+            var timingPoints = new List<TimingPointDto>
+            {
+                new(0.0, 0.0, baseBpm > 0 ? baseBpm : 120.0)
+            };
+
+            if (!root.TryGetProperty("bpmEvents", out var bpmEvents))
+                return timingPoints.ToArray();
+
+            double currentBeat = 0.0;
+            double currentTime = 0.0;
+            double currentBpm = timingPoints[0].m;
+
+            foreach (var ev in bpmEvents.EnumerateArray()
+                         .Select(e => new
+                         {
+                             Beat = e.GetProperty("b").GetDouble(),
+                             Bpm = e.GetProperty("m").GetDouble()
+                         })
+                         .Where(e => e.Bpm > 0)
+                         .OrderBy(e => e.Beat))
+            {
+                if (ev.Beat <= currentBeat)
+                {
+                    currentBeat = ev.Beat;
+                    currentBpm = ev.Bpm;
+                    timingPoints[^1] = new TimingPointDto(currentBeat, currentTime, currentBpm);
+                    continue;
+                }
+
+                currentTime += MathHelpers.BeatToSeconds(ev.Beat - currentBeat, currentBpm);
+                currentBeat = ev.Beat;
+                currentBpm = ev.Bpm;
+                timingPoints.Add(new TimingPointDto(currentBeat, currentTime, currentBpm));
+            }
+
+            return timingPoints.ToArray();
+        }
+        catch
+        {
+            return [new(0.0, 0.0, baseBpm > 0 ? baseBpm : 120.0)];
+        }
+    }
+
+    private static double EstimateDurationSeconds(NoteDto[] notes, TimingPointDto[] timingPoints)
+    {
+        if (notes.Length == 0)
+            return 60.0;
+
+        return BeatToSeconds(notes[^1].b + 8.0, timingPoints);
+    }
+
+    private static double BeatToSeconds(double beat, TimingPointDto[] timingPoints)
+    {
+        if (timingPoints.Length == 0)
+            return 0.0;
+
+        var tp = timingPoints[0];
+        foreach (var point in timingPoints)
+        {
+            if (point.b <= beat) tp = point;
+            else break;
+        }
+
+        return tp.t + MathHelpers.BeatToSeconds(beat - tp.b, tp.m);
+    }
 
     private static NoteDto[] ParseNotes(string json)
     {
