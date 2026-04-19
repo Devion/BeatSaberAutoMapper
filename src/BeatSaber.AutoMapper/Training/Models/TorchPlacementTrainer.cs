@@ -600,14 +600,24 @@ public sealed class TorchPlacementTrainer : IBatchedMultiTaskPlacementModel, IDi
         IReadOnlyList<IReadOnlyList<TrainingExample>> sequences,
         int batchSize)
     {
-        var ordered = sequences
-            .Where(seq => seq.Count > 0)
-            .OrderByDescending(seq => seq.Count)
-            .ToList();
+        var ordered = new List<IReadOnlyList<TrainingExample>>(sequences.Count);
+        foreach (var seq in sequences)
+        {
+            if (seq.Count > 0)
+                ordered.Add(seq);
+        }
+
+        ordered.Sort((a, b) => b.Count.CompareTo(a.Count));
 
         var batches = new List<IReadOnlyList<IReadOnlyList<TrainingExample>>>();
         for (int i = 0; i < ordered.Count; i += batchSize)
-            batches.Add(ordered.Skip(i).Take(batchSize).ToList());
+        {
+            int count = Math.Min(batchSize, ordered.Count - i);
+            var batch = new List<IReadOnlyList<TrainingExample>>(count);
+            for (int j = 0; j < count; j++)
+                batch.Add(ordered[i + j]);
+            batches.Add(batch);
+        }
         return batches;
     }
 
@@ -631,6 +641,9 @@ public sealed class TorchPlacementTrainer : IBatchedMultiTaskPlacementModel, IDi
 
     private void SyncCpuShadow()
     {
+        if (_useGpuInference)
+            return;
+
         _gpu.eval();
         string tmp = Path.GetTempFileName() + ".pt";
         try

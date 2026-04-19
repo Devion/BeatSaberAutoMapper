@@ -10,6 +10,12 @@ namespace BeatSaber.AutoMapper.Generation;
 
 public sealed class MapGenerationService
 {
+    public sealed record GenerationTelemetry(
+        int CandidateCount,
+        int ProposedCount,
+        int DecodedNoteCount,
+        int RepairedNoteCount);
+
     private readonly AudioFeatureExtractor _audioExtractor = new();
     private readonly TimingGridBuilder     _gridBuilder    = new();
     private readonly CandidateEventProposer _proposer      = new();
@@ -22,7 +28,8 @@ public sealed class MapGenerationService
         CanonicalBeatmap Beatmap,
         AudioAnalysisResult AudioAnalysis,
         ValidationReport ValidationReport,
-        RepairEngine.RepairResult RepairResult
+        RepairEngine.RepairResult RepairResult,
+        GenerationTelemetry Telemetry
     );
 
     /// <summary>Generate from an audio file path (audio is analysed on the fly).</summary>
@@ -161,11 +168,17 @@ public sealed class MapGenerationService
 
         var validationReport = _validator.Validate(beatmap);
         var repairResult     = _repair.Repair(beatmap);
+        var telemetry = new GenerationTelemetry(
+            CandidateCount: grid.Length,
+            ProposedCount: proposed.Count,
+            DecodedNoteCount: notes.Count,
+            RepairedNoteCount: repairResult.RepairedBeatmap.Notes.Count);
 
         return new GenerationResult(
             repairResult.RepairedBeatmap,
             audio,
             validationReport,
-            repairResult);
+            repairResult,
+            telemetry);
     }
 }

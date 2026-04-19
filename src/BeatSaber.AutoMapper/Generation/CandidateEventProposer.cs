@@ -37,11 +37,13 @@ public sealed class CandidateEventProposer
         double threshold = ctx.PlacementScorer is not null
             ? ctx.Profile.Difficulty switch
             {
-                DifficultyLevel.Easy       => 0.68,
-                DifficultyLevel.Normal     => 0.62,
-                DifficultyLevel.Hard       => 0.56,
-                DifficultyLevel.Expert     => 0.50,
-                DifficultyLevel.ExpertPlus => 0.44,
+                // Density control already prunes the candidate set, so keep
+                // the proposal gate slightly looser to reduce collapse epochs.
+                DifficultyLevel.Easy       => 0.64,
+                DifficultyLevel.Normal     => 0.59,
+                DifficultyLevel.Hard       => 0.54,
+                DifficultyLevel.Expert     => 0.48,
+                DifficultyLevel.ExpertPlus => 0.42,
                 _                          => 0.56
             }
             : 0.15;
@@ -434,13 +436,18 @@ public sealed class CandidateEventProposer
     private static IReadOnlyList<ProposedEvent> ApplyDensityControl(
         List<ProposedEvent> events, GenerationContext ctx)
     {
+        if (events.Count <= 1)
+            return events;
+
         double windowBeats = 4.0;
+        double halfWindow  = windowBeats / 2;
         double windowSec   = MathHelpers.BeatToSeconds(windowBeats, ctx.Song.BeatsPerMinute);
         double maxNps      = ctx.Profile.MaxNps;
 
         // Sort by score descending so highest-value candidates survive density pruning first
         var sorted = events.OrderByDescending(e => e.PlacementScore).ToList();
         var kept   = new List<ProposedEvent>();
+        var keptBeats = new List<double>(sorted.Count);
 
         foreach (var ev in sorted)
         {
@@ -450,14 +457,44 @@ public sealed class CandidateEventProposer
             double energyFactor = 0.6 + 0.8 * energy;          // [0.6, 1.4]
             double effectiveMax = maxNps * energyFactor;
 
-            double countInWindow = kept.Count(k =>
-                Math.Abs(k.Timing.Beat - ev.Timing.Beat) <= windowBeats / 2);
+            int start = LowerBound(keptBeats, ev.Timing.Beat - halfWindow);
+            int end = UpperBound(keptBeats, ev.Timing.Beat + halfWindow);
+            double countInWindow = end - start;
 
             if (windowSec > 0 && (countInWindow + 1) / windowSec <= effectiveMax)
+            {
                 kept.Add(ev);
+                keptBeats.Insert(UpperBound(keptBeats, ev.Timing.Beat), ev.Timing.Beat);
+            }
         }
 
         // Restore chronological order for the beam decoder
         return kept.OrderBy(e => e.Timing.Beat).ToList();
+    }
+
+    private static int LowerBound(List<double> values, double target)
+    {
+        int lo = 0;
+        int hi = values.Count;
+        while (lo < hi)
+        {
+            int mid = lo + ((hi - lo) >> 1);
+            if (values[mid] < target) lo = mid + 1;
+            else hi = mid;
+        }
+        return lo;
+    }
+
+    private static int UpperBound(List<double> values, double target)
+    {
+        int lo = 0;
+        int hi = values.Count;
+        while (lo < hi)
+        {
+            int mid = lo + ((hi - lo) >> 1);
+            if (values[mid] <= target) lo = mid + 1;
+            else hi = mid;
+        }
+        return lo;
     }
 }

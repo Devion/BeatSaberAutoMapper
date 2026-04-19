@@ -79,6 +79,35 @@ public sealed class TrainingPipeline : IDisposable
         string[] CoreFolderPaths,
         string[] FullFolderPaths);
 
+    private sealed record SequenceDifficultySnapshot(
+        int SequenceCount,
+        int ExampleCount,
+        string Mix);
+
+    private sealed record ValidationPairOutcome(
+        DifficultyLevel Difficulty,
+        double Score,
+        int CandidateCount,
+        int ProposedCount,
+        int DecodedNoteCount,
+        int RepairedNoteCount,
+        int SyntheticExampleCount,
+        bool Failed);
+
+    private sealed record ValidationDiagnostics(
+        int TotalPairs,
+        int SuccessfulPairs,
+        int FailedPairs,
+        int CoreSuccessfulPairs,
+        int CoreFailedPairs,
+        int TotalSyntheticExamples,
+        double AvgCandidateSurvival,
+        double AvgDecodeRate,
+        double AvgRepairedNotes,
+        double AvgScoreAllPairs,
+        Dictionary<DifficultyLevel, double> AvgGeneratedNotesByDifficulty,
+        Dictionary<DifficultyLevel, double> DiffScores);
+
     public void Run(TrainingOptions options)
     {
         Guard.NotNull(options, nameof(options));
@@ -138,10 +167,18 @@ public sealed class TrainingPipeline : IDisposable
             return;
         }
 
-        var (trainFolders, valFolders, testFolders) = CreateDifficultyAwareSplit(
+        var (trainFoldersRaw, valFoldersRaw, testFoldersRaw) = CreateDifficultyAwareSplit(
             folderInfos,
             splitPlan,
             options.RandomSeed);
+        var (trainFolders, valFolders, testFolders, coverageMoves) = EnsureTrainingDifficultyCoverage(
+            folderInfos,
+            trainFoldersRaw,
+            valFoldersRaw,
+            testFoldersRaw);
+
+        foreach (string move in coverageMoves)
+            Console.WriteLine($"[Training] Coverage fix: {move}");
 
         Console.WriteLine(
             $"[Training] Split: {trainFolders.Length} train / " +
@@ -245,6 +282,10 @@ public sealed class TrainingPipeline : IDisposable
         if (allSequences.Count == 0) return;
 
         var trainSeqs = allSequences;
+        var realTrainSnapshot = SummarizeSequences(trainSeqs);
+        Console.WriteLine(
+            $"[Training] Real train mix: seq={realTrainSnapshot.SequenceCount}  ex={realTrainSnapshot.ExampleCount}  " +
+            $"{realTrainSnapshot.Mix}");
 
         // Build test examples from held-out test folders (used only for final evaluation)
         var testEx = testFolders.Length > 0
@@ -397,16 +438,23 @@ public sealed class TrainingPipeline : IDisposable
 
             // Shuffle sequences (not individual examples) each epoch
             var shuffledSeqs = FisherYatesShuffleSeqs(trainSeqs, epochRng.Next());
+            bool syntheticMerged = false;
 
             if (currentSyntheticSeqs.Count > 0 && epoch >= options.SelfSupervisedWarmupEpochs)
+            {
                 shuffledSeqs = MergeSequences(
                     shuffledSeqs,
-                    LimitSyntheticSequences(
+                    LimitSyntheticSequencesBalanced(
                         currentSyntheticSeqs,
                         shuffledSeqs.Count / 2,
                         Math.Max(512, shuffledSeqs.Sum(s => s.Count) / 4),
                         epochRng.Next()),
                     epochRng.Next());
+                syntheticMerged = true;
+            }
+
+            var epochMix = SummarizeSequences(shuffledSeqs);
+            ValidateDifficultyCoverageOrThrow(epochMix);
 
             var trainStopwatch = Stopwatch.StartNew();
             var (loss, plBce) = _placementTrainer.TrainEpoch(shuffledSeqs, lr);
@@ -417,6 +465,7 @@ public sealed class TrainingPipeline : IDisposable
             double validationSeconds = 0;
             int activeValidationPairs = 0;
             int activeValidationSongs = 0;
+            ValidationDiagnostics? diagnostics = null;
             if (validationPlan is not null)
             {
                 var validationStopwatch = Stopwatch.StartNew();
@@ -425,16 +474,17 @@ public sealed class TrainingPipeline : IDisposable
                 activeValidationPairs = CountPairsForSongs(validationPlan.FullPairs, activeValidationSongs);
                 var activePairs = validationPlan.FullPairs.Take(activeValidationPairs).ToArray();
                 int corePairCount = Math.Min(validationPlan.CorePairs.Length, activePairs.Length);
-                var (coreScore, fullScore, newSynthetics, diffScores) =
+                var (coreScore, fullScore, newSynthetics, newDiagnostics) =
                     RunGenerationValidationWithFeedback(activePairs, corePairCount, options);
                 coreQualityScore = coreScore;
                 fullQualityScore = fullScore;
+                diagnostics = newDiagnostics;
                 validationSeconds = validationStopwatch.Elapsed.TotalSeconds;
 
                 // Per-difficulty breakdown (logged after the main epoch line)
-                if (diffScores.Count > 1)
+                if (diagnostics.DiffScores.Count > 1)
                 {
-                    var parts = diffScores
+                    var parts = diagnostics.DiffScores
                         .OrderBy(kv => (int)kv.Key)
                         .Select(kv => $"{kv.Key}={kv.Value:F3}");
                     Console.WriteLine($"[Training]   genQ by diff: {string.Join("  ", parts)}");
@@ -443,7 +493,18 @@ public sealed class TrainingPipeline : IDisposable
                 // Refresh synthetic pool on the configured cadence.
                 // Each batch from a generated map becomes one sequence (sorted by beat).
                 if ((epoch + 1) % Math.Max(1, options.SelfSupervisedEveryNEpochs) == 0)
-                    currentSyntheticSeqs = new List<List<TrainingExample>>(newSynthetics);
+                {
+                    if (ShouldAcceptSyntheticRefresh(coreQualityScore, fullQualityScore, diagnostics))
+                    {
+                        currentSyntheticSeqs = new List<List<TrainingExample>>(newSynthetics);
+                    }
+                    else
+                    {
+                        Console.WriteLine(
+                            $"[Training]   synthetic refresh skipped: coreQ={coreQualityScore:F3}  " +
+                            $"fullQ={fullQualityScore:F3}  okPairs={diagnostics.SuccessfulPairs}/{diagnostics.TotalPairs}");
+                    }
+                }
             }
 
             // ── Improvement check (raw quality) ──────────────────────────────────
@@ -499,10 +560,29 @@ public sealed class TrainingPipeline : IDisposable
                 (currentSyntheticSeqs.Count > 0 ? $"  synthEx={currentSyntheticSeqs.Sum(s => s.Count)}" : string.Empty) +
                 statusTag);
 
+            Console.WriteLine(
+                $"[Training]   train mix: seq={epochMix.SequenceCount}  ex={epochMix.ExampleCount}  " +
+                $"synthetic={(syntheticMerged ? "on" : "off")}  {epochMix.Mix}");
+
             if (validationPlan is not null)
             {
                 Console.WriteLine(
                     $"[Training]   validation stage: coreSongs={validationPlan.CoreSongCount}  activeFullSongs={activeValidationSongs}/{validationPlan.FullSongCap}");
+                if (diagnostics is not null)
+                {
+                    var noteParts = diagnostics.AvgGeneratedNotesByDifficulty.Count > 0
+                        ? string.Join("  ", diagnostics.AvgGeneratedNotesByDifficulty
+                            .OrderBy(kv => (int)kv.Key)
+                            .Select(kv => $"{kv.Key}Notes={kv.Value:F1}"))
+                        : "none";
+                    Console.WriteLine(
+                        $"[Training]   val diag: ok={diagnostics.SuccessfulPairs}/{diagnostics.TotalPairs}  " +
+                        $"coreOk={diagnostics.CoreSuccessfulPairs}/{Math.Max(1, diagnostics.CoreSuccessfulPairs + diagnostics.CoreFailedPairs)}  " +
+                        $"avgAll={diagnostics.AvgScoreAllPairs:F3}  cand->prop={diagnostics.AvgCandidateSurvival:F3}  " +
+                        $"prop->notes={diagnostics.AvgDecodeRate:F3}  repairedNotes={diagnostics.AvgRepairedNotes:F1}  " +
+                        $"newSynthEx={diagnostics.TotalSyntheticExamples}");
+                    Console.WriteLine($"[Training]   val notes by diff: {noteParts}");
+                }
             }
 
             // ── Stagnation-driven LR reduction and early stop ────────────────────
@@ -569,12 +649,13 @@ public sealed class TrainingPipeline : IDisposable
     // ----------------------------------------------------------------
 
     private (double CoreQuality, double FullQuality, IReadOnlyList<List<TrainingExample>> Synthetics,
-             Dictionary<DifficultyLevel, double> DiffScores)
+             ValidationDiagnostics Diagnostics)
         RunGenerationValidationWithFeedback(CachedPair[] cachedPairs, int corePairCount, TrainingOptions options)
     {
-        var scores   = new double[cachedPairs.Length];
+        var outcomes = new ValidationPairOutcome[cachedPairs.Length];
         var synthBag = new ConcurrentBag<List<TrainingExample>>();
         int validationParallelism = _placementTrainer.UsesGpuInference ? 1 : Environment.ProcessorCount;
+        const double MinSyntheticQuality = 0.24;
 
         Parallel.For(0, cachedPairs.Length,
             new ParallelOptions { MaxDegreeOfParallelism = validationParallelism },
@@ -601,7 +682,7 @@ public sealed class TrainingPipeline : IDisposable
                         settings,
                         placementScorer: _placementTrainer);
 
-                    scores[i] = eval.Evaluate(result.Beatmap, cached.Pair.ReferenceMap).OverallScore;
+                    double score = eval.Evaluate(result.Beatmap, cached.Pair.ReferenceMap).OverallScore;
 
                     // Derive synthetic training examples from this generation pass
                     var synthetics = gen.Generate(
@@ -611,26 +692,72 @@ public sealed class TrainingPipeline : IDisposable
                         options.SelfSupervisedPositiveWeight,
                         options.SelfSupervisedNegativeWeight);
 
-                    if (synthetics.Count > 0)
+                    if (score >= MinSyntheticQuality && synthetics.Count > 0)
                         synthBag.Add(synthetics.OrderBy(s => s.Beat).ToList());
+
+                    outcomes[i] = new ValidationPairOutcome(
+                        cached.Pair.ReferenceMap.Difficulty.Difficulty,
+                        score,
+                        result.Telemetry.CandidateCount,
+                        result.Telemetry.ProposedCount,
+                        result.Telemetry.DecodedNoteCount,
+                        result.Telemetry.RepairedNoteCount,
+                        score >= MinSyntheticQuality ? synthetics.Count : 0,
+                        Failed: false);
                 }
-                catch { scores[i] = 0; }
+                catch
+                {
+                    outcomes[i] = new ValidationPairOutcome(
+                        cached.Pair.ReferenceMap.Difficulty.Difficulty,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        Failed: true);
+                }
             });
 
-        var valid = scores.Where(s => s > 0).ToArray();
-        double fullQuality = valid.Length > 0 ? valid.Average() : 0;
+        var valid = outcomes.Where(o => !o.Failed && o.Score > 0).ToArray();
+        double fullQuality = valid.Length > 0 ? valid.Average(x => x.Score) : 0;
 
-        var coreValid = scores.Take(Math.Min(corePairCount, scores.Length)).Where(s => s > 0).ToArray();
-        double coreQuality = coreValid.Length > 0 ? coreValid.Average() : 0;
+        var coreOutcomes = outcomes.Take(Math.Min(corePairCount, outcomes.Length)).ToArray();
+        var coreValid = coreOutcomes.Where(o => !o.Failed && o.Score > 0).ToArray();
+        double coreQuality = coreValid.Length > 0 ? coreValid.Average(x => x.Score) : 0;
 
         // Per-difficulty breakdown
-        var diffScores = scores
-            .Select((s, i) => (Score: s, Diff: cachedPairs[i].Pair.ReferenceMap.Difficulty.Difficulty))
-            .Where(x => x.Score > 0)
-            .GroupBy(x => x.Diff)
+        var diffScores = valid
+            .GroupBy(x => x.Difficulty)
             .ToDictionary(g => g.Key, g => g.Average(x => x.Score));
 
-        return (coreQuality, fullQuality, synthBag.ToList(), diffScores);
+        double avgCandidateSurvival = valid.Length > 0
+            ? valid.Average(x => x.CandidateCount > 0 ? x.ProposedCount / (double)x.CandidateCount : 0)
+            : 0;
+        double avgDecodeRate = valid.Length > 0
+            ? valid.Average(x => x.ProposedCount > 0 ? x.DecodedNoteCount / (double)x.ProposedCount : 0)
+            : 0;
+        double avgRepairedNotes = valid.Length > 0 ? valid.Average(x => x.RepairedNoteCount) : 0;
+        double avgScoreAllPairs = outcomes.Length > 0 ? outcomes.Average(x => x.Score) : 0;
+        var avgGeneratedNotesByDifficulty = valid
+            .GroupBy(x => x.Difficulty)
+            .ToDictionary(g => g.Key, g => g.Average(x => x.RepairedNoteCount));
+
+        var diagnostics = new ValidationDiagnostics(
+            TotalPairs: outcomes.Length,
+            SuccessfulPairs: outcomes.Count(x => !x.Failed && x.Score > 0),
+            FailedPairs: outcomes.Count(x => x.Failed || x.Score <= 0),
+            CoreSuccessfulPairs: coreOutcomes.Count(x => !x.Failed && x.Score > 0),
+            CoreFailedPairs: coreOutcomes.Count(x => x.Failed || x.Score <= 0),
+            TotalSyntheticExamples: outcomes.Sum(x => x.SyntheticExampleCount),
+            AvgCandidateSurvival: avgCandidateSurvival,
+            AvgDecodeRate: avgDecodeRate,
+            AvgRepairedNotes: avgRepairedNotes,
+            AvgScoreAllPairs: avgScoreAllPairs,
+            AvgGeneratedNotesByDifficulty: avgGeneratedNotesByDifficulty,
+            DiffScores: diffScores);
+
+        return (coreQuality, fullQuality, synthBag.ToList(), diagnostics);
     }
 
     // ----------------------------------------------------------------
@@ -818,7 +945,7 @@ public sealed class TrainingPipeline : IDisposable
         return merged;
     }
 
-    private static List<List<TrainingExample>> LimitSyntheticSequences(
+    private static List<List<TrainingExample>> LimitSyntheticSequencesBalanced(
         List<List<TrainingExample>> synthetics,
         int maxCount,
         int maxExamples,
@@ -837,10 +964,32 @@ public sealed class TrainingPipeline : IDisposable
 
         var result = new List<List<TrainingExample>>();
         int exampleCount = 0;
+        var uncoveredDiffs = Enum.GetValues<DifficultyLevel>().Cast<int>().ToHashSet();
+
+        foreach (var seq in copy)
+        {
+            if (uncoveredDiffs.Count == 0)
+                break;
+
+            int? diff = TryGetSequenceDifficulty(seq);
+            if (diff is null || !uncoveredDiffs.Contains(diff.Value))
+                continue;
+            if (result.Count >= Math.Max(1, maxCount))
+                break;
+            if (result.Count > 0 && exampleCount + seq.Count > maxExamples)
+                continue;
+
+            result.Add(seq);
+            exampleCount += seq.Count;
+            uncoveredDiffs.Remove(diff.Value);
+        }
+
         foreach (var seq in copy)
         {
             if (result.Count >= Math.Max(1, maxCount))
                 break;
+            if (result.Contains(seq))
+                continue;
             if (result.Count > 0 && exampleCount + seq.Count > maxExamples)
                 continue;
 
@@ -862,6 +1011,62 @@ public sealed class TrainingPipeline : IDisposable
             (copy[i], copy[j]) = (copy[j], copy[i]);
         }
         return copy;
+    }
+
+    private static bool ShouldAcceptSyntheticRefresh(
+        double coreQuality,
+        double fullQuality,
+        ValidationDiagnostics diagnostics)
+    {
+        if (diagnostics.SuccessfulPairs < Math.Max(4, diagnostics.TotalPairs / 3))
+            return false;
+        if (diagnostics.TotalSyntheticExamples <= 0)
+            return false;
+        if (coreQuality < 0.20 || fullQuality < 0.20)
+            return false;
+        if (diagnostics.AvgCandidateSurvival < 0.01 || diagnostics.AvgDecodeRate < 0.10)
+            return false;
+        return true;
+    }
+
+    private static SequenceDifficultySnapshot SummarizeSequences(IReadOnlyList<IReadOnlyList<TrainingExample>> sequences)
+    {
+        var counts = Enum.GetValues<DifficultyLevel>()
+            .ToDictionary(d => (int)d, _ => 0);
+        int exampleCount = 0;
+        int sequenceCount = 0;
+
+        foreach (var seq in sequences)
+        {
+            if (seq.Count == 0)
+                continue;
+
+            sequenceCount++;
+            exampleCount += seq.Count;
+            int diff = seq[0].DifficultyLevel;
+            if (!counts.TryAdd(diff, seq.Count))
+                counts[diff] += seq.Count;
+        }
+
+        string mix = string.Join("  ",
+            counts.Where(kv => kv.Value > 0)
+                  .OrderBy(kv => kv.Key)
+                  .Select(kv => $"{(DifficultyLevel)kv.Key}={kv.Value}"));
+
+        return new SequenceDifficultySnapshot(sequenceCount, exampleCount, mix.Length > 0 ? mix : "none");
+    }
+
+    private static int? TryGetSequenceDifficulty(IReadOnlyList<TrainingExample> sequence)
+    {
+        if (sequence.Count == 0)
+            return null;
+        return sequence[0].DifficultyLevel;
+    }
+
+    private static void ValidateDifficultyCoverageOrThrow(SequenceDifficultySnapshot snapshot)
+    {
+        if (snapshot.Mix == "none")
+            throw new InvalidOperationException("Training epoch contains no examples.");
     }
 
     private static SongFolderInfo[] InspectSongFolders(IReadOnlyList<string> folders)
@@ -1008,6 +1213,45 @@ public sealed class TrainingPipeline : IDisposable
         }
 
         return (train.ToArray(), val.ToArray(), test.ToArray());
+    }
+
+    private static (string[] TrainFolders, string[] ValidationFolders, string[] TestFolders, IReadOnlyList<string> Moves)
+        EnsureTrainingDifficultyCoverage(
+            IReadOnlyList<SongFolderInfo> folderInfos,
+            string[] trainFolders,
+            string[] validationFolders,
+            string[] testFolders)
+    {
+        var byFolder = folderInfos.ToDictionary(x => x.FolderPath, StringComparer.OrdinalIgnoreCase);
+        var train = new List<string>(trainFolders);
+        var val = new List<string>(validationFolders);
+        var test = new List<string>(testFolders);
+        var moves = new List<string>();
+
+        var allDiffs = folderInfos
+            .SelectMany(x => x.Difficulties)
+            .Distinct()
+            .OrderBy(x => (int)x)
+            .ToArray();
+
+        foreach (var diff in allDiffs)
+        {
+            if (train.Any(folder => byFolder.TryGetValue(folder, out var info) && info.Difficulties.Contains(diff)))
+                continue;
+
+            string? donor = val.FirstOrDefault(folder => byFolder.TryGetValue(folder, out var info) && info.Difficulties.Contains(diff))
+                ?? test.FirstOrDefault(folder => byFolder.TryGetValue(folder, out var info) && info.Difficulties.Contains(diff));
+            if (donor is null)
+                continue;
+
+            if (val.Remove(donor) || test.Remove(donor))
+            {
+                train.Add(donor);
+                moves.Add($"moved '{Path.GetFileName(donor)}' into train to cover {diff}");
+            }
+        }
+
+        return (train.ToArray(), val.ToArray(), test.ToArray(), moves);
     }
 
     private static int AllocateBucketShare(int bucketCount, int remainingTarget, int remainingSongs)

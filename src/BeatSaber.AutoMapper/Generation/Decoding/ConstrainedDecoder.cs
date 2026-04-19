@@ -6,6 +6,8 @@ internal sealed record BeamState(
     ImmutableList<CanonicalNote> Notes,
     SwingContext LeftCtx,
     SwingContext RightCtx,
+    CanonicalNote? LastLeft,
+    CanonicalNote? LastRight,
     GruState? Hidden,
     double Score
 );
@@ -28,6 +30,8 @@ public sealed class ConstrainedDecoder
                 ImmutableList<CanonicalNote>.Empty,
                 new SwingContext(NoteHand.Left),
                 new SwingContext(NoteHand.Right),
+                null,
+                null,
                 ctx.GruHiddenState?.Clone(),
                 0.0)
         };
@@ -63,8 +67,8 @@ public sealed class ConstrainedDecoder
                         var nctx = CandidateEventProposer.BuildNeuralContext(
                             candidate.Timing,
                             tempCtx,
-                            GetLastNote(state, NoteHand.Left),
-                            GetLastNote(state, NoteHand.Right),
+                            state.LastLeft,
+                            state.LastRight,
                             state.LeftCtx,
                             state.RightCtx,
                             updatedHidden);
@@ -79,7 +83,7 @@ public sealed class ConstrainedDecoder
                     Score = state.Score - placementScore * 0.15
                 });
 
-                if (placementScore < 0.20)
+                if (placementScore < 0.18)
                     continue;
 
                 foreach (var hand in GetHandOrder(candidate, beamPred))
@@ -97,7 +101,7 @@ public sealed class ConstrainedDecoder
                         continue;
 
                     var transition = ParityAnalyzer.ClassifyTransition(
-                        GetLastNote(state, note.Hand),
+                        note.Hand == NoteHand.Left ? state.LastLeft : state.LastRight,
                         note,
                         note.Hand == NoteHand.Left ? state.LeftCtx : state.RightCtx);
 
@@ -113,6 +117,8 @@ public sealed class ConstrainedDecoder
                         state.Notes.Add(note),
                         newLeft,
                         newRight,
+                        note.Hand == NoteHand.Left ? note : state.LastLeft,
+                        note.Hand == NoteHand.Right ? note : state.LastRight,
                         updatedHidden?.Clone(),
                         state.Score + ScoreState(proposed, note, transition));
                     nextBeam.Add(singleState);
@@ -128,7 +134,7 @@ public sealed class ConstrainedDecoder
                         continue;
 
                     var chordTransition = ParityAnalyzer.ClassifyTransition(
-                        GetLastNote(singleState, chordNote.Hand),
+                        chordNote.Hand == NoteHand.Left ? singleState.LastLeft : singleState.LastRight,
                         chordNote,
                         chordNote.Hand == NoteHand.Left ? singleState.LeftCtx : singleState.RightCtx);
                     if (chordTransition.Transition == ParityTransition.Invalid)
@@ -143,6 +149,8 @@ public sealed class ConstrainedDecoder
                         singleState.Notes.Add(chordNote),
                         chordLeft,
                         chordRight,
+                        chordNote.Hand == NoteHand.Left ? chordNote : singleState.LastLeft,
+                        chordNote.Hand == NoteHand.Right ? chordNote : singleState.LastRight,
                         updatedHidden?.Clone(),
                         singleState.Score + ScoreState(chordProposed, chordNote, chordTransition) + ScoreChordBonus(candidate, tempCtx)));
                 }
@@ -174,8 +182,8 @@ public sealed class ConstrainedDecoder
             contexts[i] = CandidateEventProposer.BuildNeuralContext(
                 candidate.Timing,
                 tempCtx,
-                GetLastNote(state, NoteHand.Left),
-                GetLastNote(state, NoteHand.Right),
+                state.LastLeft,
+                state.LastRight,
                 state.LeftCtx,
                 state.RightCtx,
                 updatedHidden);
@@ -258,9 +266,6 @@ public sealed class ConstrainedDecoder
             bonus += 0.08;
         return bonus;
     }
-
-    private static CanonicalNote? GetLastNote(BeamState state, NoteHand hand) =>
-        state.Notes.Where(n => n.Hand == hand).OrderByDescending(n => n.Beat).FirstOrDefault();
 
     private static GenerationContext CloneContextWith(GenerationContext original, BeamState state)
     {
