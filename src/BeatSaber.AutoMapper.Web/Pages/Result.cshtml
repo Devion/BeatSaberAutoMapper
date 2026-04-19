@@ -18,6 +18,11 @@
                         <th>Notes</th>
                         <th>BPM</th>
                         <th>Quality</th>
+                        <th>Left/Right</th>
+                        <th>Center</th>
+                        <th>Top</th>
+                        <th>Dots</th>
+                        <th>Diag</th>
                         <th>Errors</th>
                         <th>Warnings</th>
                         <th>Repairs</th>
@@ -33,6 +38,11 @@
                             <td>@s.NoteCount</td>
                             <td>@s.Bpm.ToString("F1")</td>
                             <td><span class="quality-badge @qualityClass">@s.ValidationScore.ToString("P0")</span></td>
+                            <td>@s.LeftHandPercent.ToString("P0") / @s.RightHandPercent.ToString("P0")</td>
+                            <td>@s.CenterLanePercent.ToString("P0")</td>
+                            <td>@s.TopRowPercent.ToString("P0")</td>
+                            <td>@s.DotPercent.ToString("P0")</td>
+                            <td>@s.DiagonalPercent.ToString("P0")</td>
                             <td class="@(s.ErrorCount > 0 ? "cell-error" : "")">@s.ErrorCount</td>
                             <td class="@(s.WarningCount > 0 ? "cell-warn" : "")">@s.WarningCount</td>
                             <td>@s.RepairCount</td>

@@ -19,7 +19,7 @@ public sealed class AudioDecoder
 
         return ext switch
         {
-            ".ogg" or ".egg" => DecodeOgg(filePath, targetSampleRate, mono),
+            ".ogg" or ".egg" => DecodeOggWithFallback(filePath, targetSampleRate, mono),
             _ => DecodeNAudio(filePath, targetSampleRate, mono)
         };
     }
@@ -68,6 +68,26 @@ public sealed class AudioDecoder
         };
     }
 
+    private static (float[] Samples, int SampleRate, double Duration) DecodeOggWithFallback(
+        string filePath, int targetSampleRate, bool mono)
+    {
+        try
+        {
+            return DecodeOgg(filePath, targetSampleRate, mono);
+        }
+        catch (Exception ex)
+        {
+            var converter = new AudioConverter();
+            if (!converter.IsFfmpegAvailable())
+                throw new InvalidOperationException(
+                    $"Failed to decode OGG/EGG directly ({ex.Message}). " +
+                    "This file may contain a non-Vorbis or mixed Ogg bitstream, and ffmpeg is not available for fallback decoding.",
+                    ex);
+
+            return DecodeWithFfmpegFallback(filePath, targetSampleRate, mono, ex.Message);
+        }
+    }
+
     private static (float[] Samples, int SampleRate, double Duration) DecodeOgg(
         string filePath, int targetSampleRate, bool mono)
     {
@@ -96,6 +116,38 @@ public sealed class AudioDecoder
             srcArr = Resample(srcArr, srcRate, targetSampleRate);
 
         return (srcArr, targetSampleRate, duration);
+    }
+
+    private static (float[] Samples, int SampleRate, double Duration) DecodeWithFfmpegFallback(
+        string filePath,
+        int targetSampleRate,
+        bool mono,
+        string originalError)
+    {
+        string tempWav = Path.Combine(Path.GetTempPath(), $"bsam_decode_{Guid.NewGuid():N}.wav");
+        try
+        {
+            var converter = new AudioConverter();
+            converter.ConvertToWav(filePath, tempWav, targetSampleRate);
+            return DecodeNAudio(tempWav, targetSampleRate, mono);
+        }
+        catch (Exception ffmpegEx)
+        {
+            throw new InvalidOperationException(
+                $"Failed to decode OGG/EGG directly ({originalError}) and ffmpeg fallback also failed ({ffmpegEx.Message}).",
+                ffmpegEx);
+        }
+        finally
+        {
+            try
+            {
+                if (File.Exists(tempWav))
+                    File.Delete(tempWav);
+            }
+            catch
+            {
+            }
+        }
     }
 
     private static float[] DownMixToMono(float[] interleaved, int channels)

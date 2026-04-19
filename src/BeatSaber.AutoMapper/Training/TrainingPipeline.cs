@@ -367,7 +367,11 @@ public sealed class TrainingPipeline : IDisposable
             if (currentSyntheticSeqs.Count > 0 && epoch >= options.SelfSupervisedWarmupEpochs)
                 shuffledSeqs = MergeSequences(
                     shuffledSeqs,
-                    LimitSyntheticSequences(currentSyntheticSeqs, shuffledSeqs.Count / 2, epochRng.Next()),
+                    LimitSyntheticSequences(
+                        currentSyntheticSeqs,
+                        shuffledSeqs.Count / 2,
+                        Math.Max(512, shuffledSeqs.Sum(s => s.Count) / 4),
+                        epochRng.Next()),
                     epochRng.Next());
 
             var trainStopwatch = Stopwatch.StartNew();
@@ -612,9 +616,12 @@ public sealed class TrainingPipeline : IDisposable
     private static List<List<TrainingExample>> LimitSyntheticSequences(
         List<List<TrainingExample>> synthetics,
         int maxCount,
+        int maxExamples,
         int seed)
     {
-        if (synthetics.Count <= maxCount) return synthetics;
+        if (synthetics.Count <= maxCount && synthetics.Sum(s => s.Count) <= maxExamples)
+            return synthetics;
+
         var copy = new List<List<TrainingExample>>(synthetics);
         var rng = new Random(seed);
         for (int i = copy.Count - 1; i > 0; i--)
@@ -622,7 +629,21 @@ public sealed class TrainingPipeline : IDisposable
             int j = rng.Next(i + 1);
             (copy[i], copy[j]) = (copy[j], copy[i]);
         }
-        return copy.Take(Math.Max(1, maxCount)).ToList();
+
+        var result = new List<List<TrainingExample>>();
+        int exampleCount = 0;
+        foreach (var seq in copy)
+        {
+            if (result.Count >= Math.Max(1, maxCount))
+                break;
+            if (result.Count > 0 && exampleCount + seq.Count > maxExamples)
+                continue;
+
+            result.Add(seq);
+            exampleCount += seq.Count;
+        }
+
+        return result.Count > 0 ? result : copy.Take(Math.Max(1, maxCount)).ToList();
     }
 
     /// <summary>Fisher-Yates in-place shuffle of a copy, using the given seed.</summary>

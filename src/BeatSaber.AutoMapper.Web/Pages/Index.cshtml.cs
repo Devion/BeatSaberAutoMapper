@@ -123,6 +123,14 @@ public class IndexModel(JobStore jobStore, IConfiguration config) : PageModel
                 string datFile  = $"{diffName}.dat";
                 BeatmapExporter.ExportV3(r.Beatmap, Path.Combine(mapDir, datFile));
                 diffFiles.Add((r.Beatmap.Difficulty, datFile));
+                int totalNotes = Math.Max(1, r.Beatmap.Notes.Count);
+                int leftCount = r.Beatmap.Notes.Count(n => n.Color == NoteColor.Red);
+                int rightCount = r.Beatmap.Notes.Count(n => n.Color == NoteColor.Blue);
+                int centerCount = r.Beatmap.Notes.Count(n => n.Lane is 1 or 2);
+                int topRowCount = r.Beatmap.Notes.Count(n => n.Row == 2);
+                int dotCount = r.Beatmap.Notes.Count(n => n.CutDirection == CutDirection.Dot);
+                int diagonalCount = r.Beatmap.Notes.Count(n =>
+                    n.CutDirection is CutDirection.UpLeft or CutDirection.UpRight or CutDirection.DownLeft or CutDirection.DownRight);
 
                 stats.Add(new DifficultyStats(
                     Difficulty:      diffName,
@@ -131,7 +139,13 @@ public class IndexModel(JobStore jobStore, IConfiguration config) : PageModel
                     ValidationScore: r.ValidationReport.Score,
                     ErrorCount:      r.ValidationReport.ErrorCount,
                     WarningCount:    r.ValidationReport.WarningCount,
-                    RepairCount:     r.RepairResult.AppliedRepairs.Count));
+                    RepairCount:     r.RepairResult.AppliedRepairs.Count,
+                    LeftHandPercent: leftCount / (double)totalNotes,
+                    RightHandPercent: rightCount / (double)totalNotes,
+                    CenterLanePercent: centerCount / (double)totalNotes,
+                    TopRowPercent: topRowCount / (double)totalNotes,
+                    DotPercent: dotCount / (double)totalNotes,
+                    DiagonalPercent: diagonalCount / (double)totalNotes));
             }
 
             BeatmapExporter.ExportInfoDat(song, diffFiles, mapDir);

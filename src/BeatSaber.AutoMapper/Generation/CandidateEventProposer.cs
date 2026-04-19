@@ -64,9 +64,7 @@ public sealed class CandidateEventProposer
                 out var neuralPred);
             if (score < threshold) continue;
 
-            var hand = neuralPred.HasValue && neuralPred.Value.HandScore >= 0.5
-                ? NoteHand.Right
-                : NoteHand.Left;
+            var hand = ChooseSuggestedHand(neuralPred, ctx);
 
             proposed.Add(new ProposedEvent(candidate, score, hand, neuralPred?.HandScore ?? score, neuralPred));
         }
@@ -101,8 +99,9 @@ public sealed class CandidateEventProposer
         {
             var candidate = ctx.CandidateGrid[i];
             var prediction = predictions[i];
-            double score = prediction.PlacementScore;
-            double localNps = contexts[i].LocalNps;
+            var nctx = contexts[i];
+            double score = ApplyMusicalityPrior(prediction.PlacementScore, in nctx, ctx);
+            double localNps = nctx.LocalNps;
             double targetNps = ctx.Profile.TargetNps;
 
             if (localNps > targetNps)
@@ -114,7 +113,7 @@ public sealed class CandidateEventProposer
             proposed.Add(new ProposedEvent(
                 candidate,
                 score,
-                prediction.HandScore >= 0.5 ? NoteHand.Right : NoteHand.Left,
+                ChooseSuggestedHand(prediction, ctx),
                 prediction.HandScore,
                 prediction));
         }
@@ -260,7 +259,7 @@ public sealed class CandidateEventProposer
         double localNps  = EstimateLocalNps(candidate.Beat, ctx);
         double targetNps = ctx.Profile.TargetNps;
 
-        if (ctx.MultiTaskModel is not null || ctx.PlacementScorer is not null)
+            if (ctx.MultiTaskModel is not null || ctx.PlacementScorer is not null)
         {
             var nctx = BuildNeuralContext(candidate, ctx, lastLeft, lastRight, leftCtx, rightCtx, gruState);
             double score;
@@ -275,6 +274,8 @@ public sealed class CandidateEventProposer
                 neuralPred = null;
                 score = ctx.PlacementScorer!.ScorePlacement(in nctx);
             }
+
+            score = ApplyMusicalityPrior(score, in nctx, ctx);
 
             if (localNps > targetNps)
                 score *= Math.Max(0.1, 1.0 - (localNps - targetNps) / targetNps * 0.3);
@@ -315,6 +316,47 @@ public sealed class CandidateEventProposer
             score -= (localNps - targetNps) / targetNps * 0.3;
 
         return Math.Max(0, score);
+    }
+
+    private static double ApplyMusicalityPrior(double score, in NeuralPlacementContext ctx, GenerationContext genCtx)
+    {
+        double onset = Math.Clamp(ctx.OnsetStrength, 0.0, 1.0);
+        double transient = Math.Clamp(ctx.TransientStrength, 0.0, 1.0);
+        double energy = Math.Clamp(ctx.EnergyLevel, 0.0, 1.0);
+        double emphasis = 0.55 * onset + 0.30 * transient + 0.15 * energy;
+
+        if (emphasis < 0.12)
+            score *= 0.18;
+        else if (emphasis < 0.20)
+            score *= 0.40;
+        else if (emphasis < 0.30)
+            score *= 0.68;
+
+        if (ctx.SectionTypeIndex is 0 or 6 && emphasis < 0.28) // intro/outro
+            score *= 0.78;
+
+        if (ctx.SectionTypeIndex == 1 && emphasis < 0.22) // verse
+            score *= 0.88;
+
+        return score;
+    }
+
+    private static NoteHand ChooseSuggestedHand(NeuralMapPrediction? prediction, GenerationContext ctx)
+    {
+        if (!prediction.HasValue)
+            return NoteHand.Left;
+
+        double handScore = prediction.Value.HandScore;
+        double jointRightMass = 0.5;
+        if (prediction.Value.HandLaneProbs is { Length: 8 } handLane)
+            jointRightMass = handLane[4] + handLane[5] + handLane[6] + handLane[7];
+
+        double blended = 0.40 * handScore + 0.60 * jointRightMass;
+        double recentRightBias = MappingFeatureEngineering.RecentHandBalance(ctx.PlacedNotes, ctx.PlacedNotes.Count > 0 ? ctx.PlacedNotes[^1].Beat : 0, 8.0);
+        double handBalanceAdjust = (0.5 - recentRightBias) * 0.18;
+        double adjusted = Math.Clamp(blended + handBalanceAdjust, 0.0, 1.0);
+
+        return adjusted >= 0.5 ? NoteHand.Right : NoteHand.Left;
     }
 
     // Beat strength based solely on beat position within a 4/4 measure

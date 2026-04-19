@@ -10,6 +10,8 @@ public sealed class GenerationQualityEvaluator
 {
     public sealed record QualityMetrics(
         double PlacementF1,        // note-beat alignment with reference
+        double AttributeAgreement, // hand/lane/row/direction agreement on matched notes
+        double DensitySimilarity,  // note count similarity to reference
         double NpsCorrelation,     // Pearson correlation of 4-beat NPS profiles
         double ParityBreakRate,    // parity breaks per note (lower is better)
         double ValidationScore,    // BeatmapValidator score 0-1
@@ -23,21 +25,22 @@ public sealed class GenerationQualityEvaluator
         Guard.NotNull(generated,  nameof(generated));
         Guard.NotNull(reference,  nameof(reference));
 
-        double placementF1    = ComputePlacementF1(generated, reference);
-        double npsCorr        = ComputeNpsCorrelation(generated, reference);
-        double parityRate     = ComputeParityBreakRate(generated);
-        double valScore       = _validator.Validate(generated).Score / 100.0;
-        double laneDiversity  = ComputeLaneDiversityScore(generated);
-        double rowDiversity   = ComputeRowDiversityScore(generated);
+        double placementF1       = ComputePlacementF1(generated, reference);
+        double attributeAgreement = ComputeAttributeAgreement(generated, reference);
+        double densitySimilarity = ComputeDensitySimilarity(generated, reference);
+        double npsCorr           = ComputeNpsCorrelation(generated, reference);
+        double parityRate        = ComputeParityBreakRate(generated);
+        double valScore          = _validator.Validate(generated).Score / 100.0;
 
-        // Weighted combination — lane/row diversity now explicit (20%)
-        double overall = 0.35 * placementF1
-                       + 0.15 * Math.Max(0, npsCorr)
-                       + 0.15 * (1.0 - parityRate)
-                       + 0.15 * valScore
-                       + 0.20 * (laneDiversity * 0.6 + rowDiversity * 0.4);
+        // Reward direct agreement with the reference map much more than generic diversity.
+        double overall = 0.38 * placementF1
+                       + 0.24 * attributeAgreement
+                       + 0.16 * densitySimilarity
+                       + 0.10 * Math.Max(0, npsCorr)
+                       + 0.07 * (1.0 - parityRate)
+                       + 0.05 * valScore;
 
-        return new QualityMetrics(placementF1, npsCorr, parityRate, valScore,
+        return new QualityMetrics(placementF1, attributeAgreement, densitySimilarity, npsCorr, parityRate, valScore,
                                   Math.Clamp(overall, 0, 1));
     }
 
@@ -45,7 +48,7 @@ public sealed class GenerationQualityEvaluator
 
     private static double ComputePlacementF1(CanonicalBeatmap gen, CanonicalBeatmap refer)
     {
-        const double window = 0.25; // beats
+        const double window = 0.125; // beats
         var genBeats = gen.Notes.Select(n => n.Beat).OrderBy(b => b).ToList();
         var refBeats = refer.Notes.Select(n => n.Beat).OrderBy(b => b).ToList();
         if (refBeats.Count == 0 || genBeats.Count == 0) return 0;
@@ -69,6 +72,63 @@ public sealed class GenerationQualityEvaluator
         double precision = tp / (double)genBeats.Count;
         double recall    = tp / (double)refBeats.Count;
         return (precision + recall) > 0 ? 2 * precision * recall / (precision + recall) : 0;
+    }
+
+    private static double ComputeAttributeAgreement(CanonicalBeatmap gen, CanonicalBeatmap refer)
+    {
+        const double window = 0.125;
+        var generated = gen.Notes.OrderBy(n => n.Beat).ToList();
+        var reference = refer.Notes.OrderBy(n => n.Beat).ToList();
+        if (generated.Count == 0 || reference.Count == 0)
+            return 0;
+
+        var matchedGenerated = new HashSet<int>();
+        double totalScore = 0;
+        int matched = 0;
+
+        foreach (var r in reference)
+        {
+            int bestIdx = -1;
+            double bestDist = double.MaxValue;
+            for (int i = 0; i < generated.Count; i++)
+            {
+                if (matchedGenerated.Contains(i))
+                    continue;
+
+                double dist = Math.Abs(generated[i].Beat - r.Beat);
+                if (dist <= window && dist < bestDist)
+                {
+                    bestDist = dist;
+                    bestIdx = i;
+                }
+            }
+
+            if (bestIdx < 0)
+                continue;
+
+            matchedGenerated.Add(bestIdx);
+            matched++;
+            var g = generated[bestIdx];
+
+            double score = 0;
+            if (g.Hand == r.Hand) score += 0.25;
+            if (g.Lane == r.Lane) score += 0.30;
+            if (g.Row == r.Row) score += 0.20;
+            if (g.CutDirection == r.CutDirection) score += 0.25;
+            totalScore += score;
+        }
+
+        return matched > 0 ? totalScore / matched : 0;
+    }
+
+    private static double ComputeDensitySimilarity(CanonicalBeatmap gen, CanonicalBeatmap refer)
+    {
+        int genCount = gen.Notes.Count;
+        int refCount = refer.Notes.Count;
+        if (genCount == 0 || refCount == 0)
+            return 0;
+
+        return Math.Min(genCount, refCount) / (double)Math.Max(genCount, refCount);
     }
 
     private static double ComputeNpsCorrelation(CanonicalBeatmap gen, CanonicalBeatmap refer)
@@ -128,37 +188,4 @@ public sealed class GenerationQualityEvaluator
         return dx * dy > 0 ? num / (dx * dy) : 0;
     }
 
-    /// <summary>Normalised entropy of lane usage (0 = all one lane, 1 = perfectly uniform).</summary>
-    private static double ComputeLaneDiversityScore(CanonicalBeatmap beatmap)
-    {
-        if (beatmap.Notes.Count == 0) return 0;
-        var counts = new int[4];
-        foreach (var n in beatmap.Notes)
-            if (n.Lane >= 0 && n.Lane < 4) counts[n.Lane]++;
-        double total = beatmap.Notes.Count;
-        double entropy = 0;
-        foreach (int c in counts)
-        {
-            double p = c / total;
-            if (p > 0) entropy -= p * Math.Log2(p);
-        }
-        return entropy / 2.0;  // max entropy for 4 uniform classes = log2(4) = 2
-    }
-
-    /// <summary>Normalised entropy of row usage (0 = all one row, 1 = perfectly uniform).</summary>
-    private static double ComputeRowDiversityScore(CanonicalBeatmap beatmap)
-    {
-        if (beatmap.Notes.Count == 0) return 0;
-        var counts = new int[3];
-        foreach (var n in beatmap.Notes)
-            if (n.Row >= 0 && n.Row < 3) counts[n.Row]++;
-        double total = beatmap.Notes.Count;
-        double entropy = 0;
-        foreach (int c in counts)
-        {
-            double p = c / total;
-            if (p > 0) entropy -= p * Math.Log2(p);
-        }
-        return entropy / Math.Log2(3);  // max entropy for 3 uniform classes = log2(3)
-    }
 }

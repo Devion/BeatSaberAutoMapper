@@ -109,12 +109,42 @@ public sealed class ConstrainedDecoder
                     if (note.Hand == NoteHand.Left) newLeft.Update(note);
                     else newRight.Update(note);
 
-                    nextBeam.Add(new BeamState(
+                    var singleState = new BeamState(
                         state.Notes.Add(note),
                         newLeft,
                         newRight,
                         updatedHidden?.Clone(),
-                        state.Score + ScoreState(proposed, note, transition)));
+                        state.Score + ScoreState(proposed, note, transition));
+                    nextBeam.Add(singleState);
+
+                    if (!ShouldAttemptChord(candidate, proposed, beamPred, tempCtx))
+                        continue;
+
+                    var chordCtx = CloneContextWith(ctx, singleState);
+                    var oppositeHand = hand == NoteHand.Left ? NoteHand.Right : NoteHand.Left;
+                    var chordProposed = proposed with { SuggestedHand = oppositeHand };
+                    var chordNote = selector.SelectAttributes(chordProposed, chordCtx);
+                    if (chordNote is null || chordNote.Hand == note.Hand)
+                        continue;
+
+                    var chordTransition = ParityAnalyzer.ClassifyTransition(
+                        GetLastNote(singleState, chordNote.Hand),
+                        chordNote,
+                        chordNote.Hand == NoteHand.Left ? singleState.LeftCtx : singleState.RightCtx);
+                    if (chordTransition.Transition == ParityTransition.Invalid)
+                        continue;
+
+                    var chordLeft = singleState.LeftCtx.Clone();
+                    var chordRight = singleState.RightCtx.Clone();
+                    if (chordNote.Hand == NoteHand.Left) chordLeft.Update(chordNote);
+                    else chordRight.Update(chordNote);
+
+                    nextBeam.Add(new BeamState(
+                        singleState.Notes.Add(chordNote),
+                        chordLeft,
+                        chordRight,
+                        updatedHidden?.Clone(),
+                        singleState.Score + ScoreState(chordProposed, chordNote, chordTransition) + ScoreChordBonus(candidate, tempCtx)));
                 }
             }
 
@@ -163,9 +193,70 @@ public sealed class ConstrainedDecoder
         if (!prediction.HasValue)
             return [candidate.SuggestedHand];
 
-        return prediction.Value.HandScore >= 0.5
+        double rightMass = prediction.Value.HandLaneProbs is { Length: 8 } handLane
+            ? handLane[4] + handLane[5] + handLane[6] + handLane[7]
+            : prediction.Value.HandScore;
+
+        return rightMass >= 0.5
             ? [NoteHand.Right, NoteHand.Left]
             : [NoteHand.Left, NoteHand.Right];
+    }
+
+    private static bool ShouldAttemptChord(
+        ProposedEvent candidate,
+        ProposedEvent proposed,
+        NeuralMapPrediction? prediction,
+        GenerationContext ctx)
+    {
+        double placement = proposed.PlacementScore;
+        if (placement < 0.48)
+            return false;
+
+        double onset = Math.Clamp(candidate.Timing.OnsetStrength, 0.0, 1.0);
+        double energy = Math.Clamp(candidate.Timing.EnergyLevel, 0.0, 1.0);
+        double beatPhase = candidate.Timing.Beat - Math.Floor(candidate.Timing.Beat);
+        bool strongBeat = beatPhase < 0.01 || Math.Abs(beatPhase - 0.5) < 0.01;
+        double recentChordRate = MappingFeatureEngineering.RecentChordRate(ctx.PlacedNotes, candidate.Timing.Beat, 4.0);
+        double currentBeatCount = MappingFeatureEngineering.NotesAtCurrentBeatSoFar(ctx.PlacedNotes, candidate.Timing.Beat);
+        if (currentBeatCount >= 1)
+            return false;
+
+        double rightMass = prediction.HasValue && prediction.Value.HandLaneProbs is { Length: 8 } handLane
+            ? handLane[4] + handLane[5] + handLane[6] + handLane[7]
+            : proposed.HandScore;
+        double handAmbiguity = 1.0 - Math.Abs(rightMass - 0.5) * 2.0;
+
+        double propensity = 0.38 * placement
+            + 0.20 * onset
+            + 0.12 * energy
+            + 0.16 * recentChordRate
+            + 0.14 * handAmbiguity;
+
+        if (strongBeat)
+            propensity += 0.08;
+
+        propensity -= ctx.Profile.Difficulty switch
+        {
+            DifficultyLevel.Easy => 0.28,
+            DifficultyLevel.Normal => 0.20,
+            DifficultyLevel.Hard => 0.10,
+            _ => 0.0
+        };
+
+        return propensity >= 0.50;
+    }
+
+    private static double ScoreChordBonus(ProposedEvent candidate, GenerationContext ctx)
+    {
+        double onset = Math.Clamp(candidate.Timing.OnsetStrength, 0.0, 1.0);
+        double recentChordRate = MappingFeatureEngineering.RecentChordRate(ctx.PlacedNotes, candidate.Timing.Beat, 4.0);
+        double phase = candidate.Timing.Beat - Math.Floor(candidate.Timing.Beat);
+        bool strongBeat = phase < 0.01 || Math.Abs(phase - 0.5) < 0.01;
+
+        double bonus = 0.12 + 0.20 * onset + 0.12 * recentChordRate;
+        if (strongBeat)
+            bonus += 0.08;
+        return bonus;
     }
 
     private static CanonicalNote? GetLastNote(BeamState state, NoteHand hand) =>

@@ -31,9 +31,15 @@ public sealed class NoteAttributeSelector
         // Neural model: sample from learned cut-direction distribution
         if (proposed.NeuralPrediction.HasValue)
         {
-            var probs = proposed.NeuralPrediction.Value.CutDirProbs;
-            var dir   = (CutDirection)SampleFromProbs(probs, ctx.Rng);
-            if (dir == CutDirection.Dot || IsParityValid(dir, ctx.GetContext(hand)))
+            var probs = AdjustCutDirectionProbabilities(
+                proposed.NeuralPrediction.Value.CutDirProbs,
+                ctx,
+                hand,
+                proposed);
+            var dir   = (CutDirection)SampleFromProbs(probs, ctx.Rng, temperature: 0.92);
+            if (dir != CutDirection.Dot && IsParityValid(dir, ctx.GetContext(hand)))
+                return dir;
+            if (dir == CutDirection.Dot && probs[(int)CutDirection.Dot] >= 0.28)
                 return dir;
             // Find best parity-valid direction from neural distribution
             var valid = CutDirectionsByParity(ctx.GetContext(hand).CurrentParity);
@@ -52,8 +58,19 @@ public sealed class NoteAttributeSelector
         // Neural model: sample lane/row from learned distributions with temperature scaling.
         if (proposed.NeuralPrediction.HasValue)
         {
-            int lane = SampleFromProbs(proposed.NeuralPrediction.Value.LaneProbs, ctx.Rng, temperature: 1.4);
-            int row  = SampleFromProbs(proposed.NeuralPrediction.Value.RowProbs,  ctx.Rng, temperature: 1.3);
+            var laneProbs = AdjustLaneProbabilities(
+                proposed.NeuralPrediction.Value,
+                hand,
+                proposed,
+                ctx);
+            var rowProbs = AdjustRowProbabilities(
+                proposed.NeuralPrediction.Value.RowProbs,
+                dir,
+                proposed,
+                ctx);
+
+            int lane = SampleFromProbs(laneProbs, ctx.Rng, temperature: 1.08);
+            int row  = SampleFromProbs(rowProbs,  ctx.Rng, temperature: 1.02);
             return (lane, row);
         }
 
@@ -101,6 +118,163 @@ public sealed class NoteAttributeSelector
         double r = rng.NextDouble(), cum = 0;
         for (int i = 0; i < probs.Length; i++) { cum += probs[i]; if (r < cum) return i; }
         return probs.Length - 1;
+    }
+
+    private static double[] AdjustCutDirectionProbabilities(
+        double[] probs,
+        GenerationContext ctx,
+        NoteHand hand,
+        ProposedEvent proposed)
+    {
+        var adjusted = (double[])probs.Clone();
+        double localNps = EstimateLocalNps(proposed.Timing.Beat, ctx);
+
+        // Dot notes are often over-produced by immature models; keep them available but expensive.
+        adjusted[(int)CutDirection.Dot] *= 0.18;
+
+        // Slightly prefer parity-respecting directional cadence over neutral notes.
+        foreach (var dir in CutDirectionsByParity(ctx.GetContext(hand).CurrentParity))
+            adjusted[(int)dir] *= 1.08;
+
+        // Diagonals are useful seasoning, but should not dominate normal flow.
+        adjusted[(int)CutDirection.UpLeft]    *= 0.82;
+        adjusted[(int)CutDirection.UpRight]   *= 0.82;
+        adjusted[(int)CutDirection.DownLeft]  *= 0.82;
+        adjusted[(int)CutDirection.DownRight] *= 0.82;
+
+        // In denser sections, prefer cleaner directional cadence and reduce dots further.
+        if (localNps >= Math.Max(2.5, ctx.Profile.TargetNps * 0.75))
+        {
+            adjusted[(int)CutDirection.Dot] *= 0.55;
+            adjusted[(int)CutDirection.UpLeft]    *= 0.90;
+            adjusted[(int)CutDirection.UpRight]   *= 0.90;
+            adjusted[(int)CutDirection.DownLeft]  *= 0.90;
+            adjusted[(int)CutDirection.DownRight] *= 0.90;
+        }
+
+        double sum = adjusted.Sum();
+        if (sum <= 0)
+            return probs;
+
+        for (int i = 0; i < adjusted.Length; i++)
+            adjusted[i] /= sum;
+        return adjusted;
+    }
+
+    private static double[] AdjustLaneProbabilities(
+        NeuralMapPrediction prediction,
+        NoteHand hand,
+        ProposedEvent proposed,
+        GenerationContext ctx)
+    {
+        var adjusted = BuildLaneDistribution(prediction, hand);
+        double localNps = EstimateLocalNps(proposed.Timing.Beat, ctx);
+        bool dense = localNps >= Math.Max(2.5, ctx.Profile.TargetNps * 0.75);
+
+        // Wrong-side placements should be rare.
+        if (hand == NoteHand.Left)
+        {
+            adjusted[0] *= 1.18;
+            adjusted[1] *= 0.92; // center-left still possible, but less dominant
+            adjusted[2] *= 0.36;
+            adjusted[3] *= 0.12;
+        }
+        else
+        {
+            adjusted[0] *= 0.12;
+            adjusted[1] *= 0.36;
+            adjusted[2] *= 0.92; // center-right still possible, but less dominant
+            adjusted[3] *= 1.18;
+        }
+
+        // Center lanes block vision more often; discourage them globally.
+        adjusted[1] *= dense ? 0.68 : 0.80;
+        adjusted[2] *= dense ? 0.68 : 0.80;
+        adjusted[0] *= 1.06;
+        adjusted[3] *= 1.06;
+
+        // If hands are already crossing, strongly pull back toward sane sides.
+        var lastLeft = ctx.PlacedNotes.LastOrDefault(n => n.Hand == NoteHand.Left);
+        var lastRight = ctx.PlacedNotes.LastOrDefault(n => n.Hand == NoteHand.Right);
+        bool crossed = lastLeft is not null && lastRight is not null && lastLeft.Lane > lastRight.Lane;
+        if (crossed)
+        {
+            if (hand == NoteHand.Left)
+            {
+                adjusted[0] *= 1.12;
+                adjusted[3] *= 0.40;
+            }
+            else
+            {
+                adjusted[3] *= 1.12;
+                adjusted[0] *= 0.40;
+            }
+        }
+
+        Normalize(adjusted, prediction.LaneProbs);
+        return adjusted;
+    }
+
+    private static double[] BuildLaneDistribution(NeuralMapPrediction prediction, NoteHand hand)
+    {
+        var adjusted = new double[4];
+        bool hasJoint = prediction.HandLaneProbs is { Length: 8 };
+        int offset = hand == NoteHand.Left ? 0 : 4;
+
+        for (int lane = 0; lane < 4; lane++)
+        {
+            double marginal = prediction.LaneProbs.Length > lane
+                ? prediction.LaneProbs[lane]
+                : 0.25;
+            double joint = hasJoint ? prediction.HandLaneProbs[offset + lane] : marginal;
+            adjusted[lane] = 0.35 * marginal + 0.65 * joint;
+        }
+
+        return adjusted;
+    }
+
+    private static double[] AdjustRowProbabilities(
+        double[] probs,
+        CutDirection dir,
+        ProposedEvent proposed,
+        GenerationContext ctx)
+    {
+        var adjusted = (double[])probs.Clone();
+        double localNps = EstimateLocalNps(proposed.Timing.Beat, ctx);
+        bool dense = localNps >= Math.Max(2.5, ctx.Profile.TargetNps * 0.75);
+
+        // Top row gets uncomfortable quickly; discourage it, especially in dense sections.
+        adjusted[2] *= dense
+            ? (dir == CutDirection.Dot ? 0.68 : 0.38)
+            : (dir == CutDirection.Dot ? 0.90 : 0.62);
+
+        // Prefer middle row as the ergonomic default.
+        adjusted[1] *= 1.14;
+
+        Normalize(adjusted, probs);
+        return adjusted;
+    }
+
+    private static double EstimateLocalNps(double beat, GenerationContext ctx)
+    {
+        double half = 2.0;
+        int count = ctx.PlacedNotes.Count(n => n.Beat >= beat - half && n.Beat <= beat + half);
+        double windowSec = MathHelpers.BeatToSeconds(half * 2.0, ctx.Song.BeatsPerMinute);
+        return windowSec > 0 ? count / windowSec : 0;
+    }
+
+    private static void Normalize(double[] adjusted, double[] fallback)
+    {
+        double sum = adjusted.Sum();
+        if (sum <= 0)
+        {
+            Array.Copy(fallback, adjusted, fallback.Length);
+            sum = adjusted.Sum();
+            if (sum <= 0) return;
+        }
+
+        for (int i = 0; i < adjusted.Length; i++)
+            adjusted[i] /= sum;
     }
     private static bool IsParityValid(CutDirection dir, SwingContext handCtx) =>
         ParityAnalyzer.CutDirectionParity(dir) == handCtx.CurrentParity;

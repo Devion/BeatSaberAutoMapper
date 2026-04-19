@@ -121,10 +121,12 @@ public sealed class TorchPlacementTrainer : IBatchedMultiTaskPlacementModel, IDi
                 var yCdArr    = new long[batchCount * len];
                 var yLnArr    = new long[batchCount * len];
                 var yRwArr    = new long[batchCount * len];
+                var yHlArr    = new long[batchCount * len];
                 var hasMask   = new float[batchCount * len];
                 var cdMask    = new float[batchCount * len];
                 var lnMask    = new float[batchCount * len];
                 var rwMask    = new float[batchCount * len];
+                var hlMask    = new float[batchCount * len];
                 var exWtArr   = new float[batchCount * len];
                 var validMask = new float[batchCount * len];
 
@@ -138,16 +140,25 @@ public sealed class TorchPlacementTrainer : IBatchedMultiTaskPlacementModel, IDi
                     {
                         var ex = seq[start + t];
                         int idx = b * len + t;
+                        bool validHand = ex.NoteHand is 0 or 1;
+                        bool validCut = ex.NoteCutDir is >= 0 and <= 8;
+                        bool validLane = ex.NoteLane is >= 0 and <= 3;
+                        bool validRow = ex.NoteRow is >= 0 and <= 2;
+                        bool validHandLane = validHand && validLane;
                         FillFeaturesFromExample(ex, xArr, idx * D);
                         yPlArr[idx]    = ex.HasNote ? 1f : 0f;
                         yHaArr[idx]    = ex.NoteHand == 1 ? 1f : 0f;
-                        yCdArr[idx]    = ex.NoteCutDir >= 0 ? ex.NoteCutDir : 0;
-                        yLnArr[idx]    = ex.NoteLane   >= 0 ? ex.NoteLane   : 0;
-                        yRwArr[idx]    = ex.NoteRow    >= 0 ? ex.NoteRow    : 0;
-                        hasMask[idx]   = ex.HasNote && ex.NoteHand   >= 0 ? 1f : 0f;
-                        cdMask[idx]    = ex.HasNote && ex.NoteCutDir >= 0 ? 1f : 0f;
-                        lnMask[idx]    = ex.HasNote && ex.NoteLane   >= 0 ? 1f : 0f;
-                        rwMask[idx]    = ex.HasNote && ex.NoteRow    >= 0 ? 1f : 0f;
+                        yCdArr[idx]    = validCut ? ex.NoteCutDir : 0;
+                        yLnArr[idx]    = validLane ? ex.NoteLane : 0;
+                        yRwArr[idx]    = validRow ? ex.NoteRow : 0;
+                        yHlArr[idx]    = ex.HasNote && validHandLane
+                            ? ex.NoteHand * 4 + ex.NoteLane
+                            : 0;
+                        hasMask[idx]   = ex.HasNote && validHand ? 1f : 0f;
+                        cdMask[idx]    = ex.HasNote && validCut ? 1f : 0f;
+                        lnMask[idx]    = ex.HasNote && validLane ? 1f : 0f;
+                        rwMask[idx]    = ex.HasNote && validRow ? 1f : 0f;
+                        hlMask[idx]    = ex.HasNote && validHandLane ? 1f : 0f;
                         exWtArr[idx]   = (float)Math.Max(0.05, ex.Weight);
                         validMask[idx] = 1f;
                     }
@@ -160,11 +171,13 @@ public sealed class TorchPlacementTrainer : IBatchedMultiTaskPlacementModel, IDi
                 using var yCdT    = tensor(yCdArr,  new long[] { N },          device: _device);
                 using var yLnT    = tensor(yLnArr,  new long[] { N },          device: _device);
                 using var yRwT    = tensor(yRwArr,  new long[] { N },          device: _device);
+                using var yHlT    = tensor(yHlArr,  new long[] { N },          device: _device);
                 using var posWtT  = tensor(posWt,                             device: _device);
                 using var haMaskT = tensor(hasMask, new long[] { N },         device: _device);
                 using var cdMaskT = tensor(cdMask,  new long[] { N },         device: _device);
                 using var lnMaskT = tensor(lnMask,  new long[] { N },         device: _device);
                 using var rwMaskT = tensor(rwMask,  new long[] { N },         device: _device);
+                using var hlMaskT = tensor(hlMask,  new long[] { N },         device: _device);
                 using var exWtT   = tensor(exWtArr, new long[] { N },         device: _device);
                 using var validT  = tensor(validMask, new long[] { N },       device: _device);
 
@@ -178,6 +191,7 @@ public sealed class TorchPlacementTrainer : IBatchedMultiTaskPlacementModel, IDi
                 using var cdLgt = outT.narrow(1, 2,  9);
                 using var lnLgt = outT.narrow(1, 11, 4);
                 using var rwLgt = outT.narrow(1, 15, 3);
+                using var hlLgt = outT.narrow(1, 18, 8);
 
                 var plBceTens = MaskedBinaryCrossEntropyWithLogits(plLgt, yPlT, exWtT, validT, posWtT);
                 totalPlaceBce += plBceTens.item<float>();
@@ -221,6 +235,16 @@ public sealed class TorchPlacementTrainer : IBatchedMultiTaskPlacementModel, IDi
                     using var rwSelW    = exWtT.index_select(0, rwMaskIdx);
                     var rwLoss          = 0.8 * WeightedCrossEntropy(rwSelLgt, rwSelY, rwSelW);
                     lossTerms.Add(rwLoss);
+                }
+
+                using var hlMaskIdx = (hlMaskT > 0.5f).nonzero().squeeze(1);
+                if (hlMaskIdx.shape[0] > 0)
+                {
+                    using var hlSelLgt = hlLgt.index_select(0, hlMaskIdx);
+                    using var hlSelY   = yHlT.index_select(0, hlMaskIdx);
+                    using var hlSelW   = exWtT.index_select(0, hlMaskIdx);
+                    var hlLoss         = 1.5 * WeightedCrossEntropy(hlSelLgt, hlSelY, hlSelW);
+                    lossTerms.Add(hlLoss);
                 }
 
                 Tensor loss;
@@ -353,6 +377,7 @@ public sealed class TorchPlacementTrainer : IBatchedMultiTaskPlacementModel, IDi
         using var cdSm   = softmax(outT.narrow(1, 2,  9), dim: 1);
         using var lnSm   = softmax(outT.narrow(1, 11, 4), dim: 1);
         using var rwSm   = softmax(outT.narrow(1, 15, 3), dim: 1);
+        using var hlSm   = softmax(outT.narrow(1, 18, 8), dim: 1);
         outT.Dispose();
 
         return new NeuralMapPrediction
@@ -362,6 +387,7 @@ public sealed class TorchPlacementTrainer : IBatchedMultiTaskPlacementModel, IDi
             CutDirProbs    = ToDoubleArray(cdSm.squeeze(0)),
             LaneProbs      = ToDoubleArray(lnSm.squeeze(0)),
             RowProbs       = ToDoubleArray(rwSm.squeeze(0)),
+            HandLaneProbs  = ToDoubleArray(hlSm.squeeze(0)),
         };
     }
 
@@ -418,6 +444,7 @@ public sealed class TorchPlacementTrainer : IBatchedMultiTaskPlacementModel, IDi
             using var cdSm   = softmax(outT.narrow(1, 2,  9), dim: 1);
             using var lnSm   = softmax(outT.narrow(1, 11, 4), dim: 1);
             using var rwSm   = softmax(outT.narrow(1, 15, 3), dim: 1);
+            using var hlSm   = softmax(outT.narrow(1, 18, 8), dim: 1);
             outT.Dispose();
 
             return new NeuralMapPrediction
@@ -427,6 +454,7 @@ public sealed class TorchPlacementTrainer : IBatchedMultiTaskPlacementModel, IDi
                 CutDirProbs    = ToDoubleArray(cdSm.squeeze(0)),
                 LaneProbs      = ToDoubleArray(lnSm.squeeze(0)),
                 RowProbs       = ToDoubleArray(rwSm.squeeze(0)),
+                HandLaneProbs  = ToDoubleArray(hlSm.squeeze(0)),
             };
         }
     }
@@ -504,12 +532,14 @@ public sealed class TorchPlacementTrainer : IBatchedMultiTaskPlacementModel, IDi
             using var cdSm   = softmax(outT.narrow(1, 2,  9), dim: 1);
             using var lnSm   = softmax(outT.narrow(1, 11, 4), dim: 1);
             using var rwSm   = softmax(outT.narrow(1, 15, 3), dim: 1);
+            using var hlSm   = softmax(outT.narrow(1, 18, 8), dim: 1);
 
             var plData = plProb.data<float>();
             var haData = haProb.data<float>();
             var cdData = cdSm.data<float>().ToArray();
             var lnData = lnSm.data<float>().ToArray();
             var rwData = rwSm.data<float>().ToArray();
+            var hlData = hlSm.data<float>().ToArray();
 
             var results = new NeuralMapPrediction[batchSize];
             for (int i = 0; i < batchSize; i++)
@@ -521,6 +551,7 @@ public sealed class TorchPlacementTrainer : IBatchedMultiTaskPlacementModel, IDi
                     CutDirProbs    = SliceToDoubleArray(cdData, i * 9, 9),
                     LaneProbs      = SliceToDoubleArray(lnData, i * 4, 4),
                     RowProbs       = SliceToDoubleArray(rwData, i * 3, 3),
+                    HandLaneProbs  = SliceToDoubleArray(hlData, i * 8, 8),
                 };
             }
 

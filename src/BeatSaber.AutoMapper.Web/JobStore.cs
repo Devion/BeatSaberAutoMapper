@@ -47,4 +47,10 @@ public sealed record DifficultyStats(
     double ValidationScore,
     int    ErrorCount,
     int    WarningCount,
-    int    RepairCount);
+    int    RepairCount,
+    double LeftHandPercent,
+    double RightHandPercent,
+    double CenterLanePercent,
+    double TopRowPercent,
+    double DotPercent,
+    double DiagonalPercent);
