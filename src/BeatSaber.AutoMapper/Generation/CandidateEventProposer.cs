@@ -46,6 +46,11 @@ public sealed class CandidateEventProposer
             }
             : 0.15;
 
+        if (ctx.MultiTaskModel is IBatchedMultiTaskPlacementModel batchedModel)
+            return ApplyDensityControl(
+                ProposeEventsBatched(ctx, batchedModel, lastLeft, lastRight, threshold),
+                ctx);
+
         foreach (var candidate in ctx.CandidateGrid)
         {
             double score = ScoreCandidate(
@@ -67,6 +72,54 @@ public sealed class CandidateEventProposer
         }
 
         return ApplyDensityControl(proposed, ctx);
+    }
+
+    private List<ProposedEvent> ProposeEventsBatched(
+        GenerationContext ctx,
+        IBatchedMultiTaskPlacementModel batchedModel,
+        CanonicalNote? lastLeft,
+        CanonicalNote? lastRight,
+        double threshold)
+    {
+        var contexts = new NeuralPlacementContext[ctx.CandidateGrid.Length];
+        for (int i = 0; i < ctx.CandidateGrid.Length; i++)
+        {
+            contexts[i] = BuildNeuralContext(
+                ctx.CandidateGrid[i],
+                ctx,
+                lastLeft,
+                lastRight,
+                ctx.LeftHandContext,
+                ctx.RightHandContext,
+                ctx.GruHiddenState?.Clone());
+        }
+
+        var predictions = batchedModel.PredictAllBatch(contexts);
+        var proposed = new List<ProposedEvent>(predictions.Count);
+
+        for (int i = 0; i < predictions.Count; i++)
+        {
+            var candidate = ctx.CandidateGrid[i];
+            var prediction = predictions[i];
+            double score = prediction.PlacementScore;
+            double localNps = contexts[i].LocalNps;
+            double targetNps = ctx.Profile.TargetNps;
+
+            if (localNps > targetNps)
+                score *= Math.Max(0.1, 1.0 - (localNps - targetNps) / targetNps * 0.3);
+
+            if (score < threshold)
+                continue;
+
+            proposed.Add(new ProposedEvent(
+                candidate,
+                score,
+                prediction.HandScore >= 0.5 ? NoteHand.Right : NoteHand.Left,
+                prediction.HandScore,
+                prediction));
+        }
+
+        return proposed;
     }
 
     internal static NeuralPlacementContext BuildNeuralContext(

@@ -21,7 +21,7 @@ public readonly struct NeuralMapPrediction
 /// Uses single-step GRU inference (<see cref="BeatSaberMappingNet.ForwardStep"/>) with
 /// <see cref="GruState"/> carried between steps to maintain temporal context.
 /// </summary>
-public sealed class NeuralPlacementModel : IMultiTaskPlacementModel, IDisposable
+public sealed class NeuralPlacementModel : IBatchedMultiTaskPlacementModel, IDisposable
 {
     private readonly BeatSaberMappingNet _net;
 
@@ -124,6 +124,17 @@ public sealed class NeuralPlacementModel : IMultiTaskPlacementModel, IDisposable
             LaneProbs      = ToDoubleArray(lnSm.squeeze(0)),
             RowProbs       = ToDoubleArray(rwSm.squeeze(0)),
         };
+    }
+
+    public IReadOnlyList<NeuralMapPrediction> PredictAllBatch(IReadOnlyList<NeuralPlacementContext> contexts)
+    {
+        var results = new NeuralMapPrediction[contexts.Count];
+        for (int i = 0; i < contexts.Count; i++)
+        {
+            var ctx = contexts[i];
+            results[i] = PredictAll(in ctx);
+        }
+        return results;
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

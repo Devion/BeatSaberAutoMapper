@@ -115,8 +115,8 @@ var trainDatasetOpt = new Option<string>("--dataset") { Description = "Path to d
 var trainProfileOpt = new Option<string>("--profile") { Description = "Training profile name", DefaultValueFactory = _ => "baseline" };
 var trainArtifactsOpt = new Option<string>("--artifacts") { Description = "Artifacts output directory", DefaultValueFactory = _ => "artifacts" };
 var trainEpochsOpt = new Option<int>("--epochs") { Description = "Max training epochs", DefaultValueFactory = _ => 100 };
-var trainValSongsOpt = new Option<int>("--validation-songs") { Description = "Validation songs to use per epoch (randomly sampled from cache pool)", DefaultValueFactory = _ => 3 };
-var trainValCacheSizeOpt = new Option<int>("--validation-cache-size") { Description = "Max validation songs to pre-analyse and cache (≥ --validation-songs). Grow once, reuse across restarts.", DefaultValueFactory = _ => 0 };
+var trainValSongsOpt = new Option<int>("--validation-songs") { Description = "Validation songs to use per epoch (0 = auto from dataset size)", DefaultValueFactory = _ => 0 };
+var trainValCacheSizeOpt = new Option<int>("--validation-cache-size") { Description = "Max validation songs to pre-analyse and cache (0 = auto from dataset size, always ≥ --validation-songs)", DefaultValueFactory = _ => 0 };
 var trainLrOpt = new Option<double>("--learning-rate") { Description = "Adam initial learning rate", DefaultValueFactory = _ => 0.001 };
 var trainEarlyStopOpt = new Option<int>("--early-stop") { Description = "Stop after N epochs without improvement (0 = disabled)", DefaultValueFactory = _ => 50 };
 var trainSsWarmupOpt = new Option<int>("--ss-warmup") { Description = "Epochs before self-supervised examples start being injected", DefaultValueFactory = _ => 5 };

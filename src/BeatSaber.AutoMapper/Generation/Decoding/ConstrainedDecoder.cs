@@ -37,6 +37,10 @@ public sealed class ConstrainedDecoder
         foreach (var candidate in candidates)
         {
             var nextBeam = new List<BeamState>();
+            var batchedPredictions = ctx.MultiTaskModel is IBatchedMultiTaskPlacementModel batchedModel
+                ? PredictBeamBatch(candidate, beam, ctx, batchedModel)
+                : null;
+            int beamPredictionIndex = 0;
 
             foreach (var state in beam)
             {
@@ -47,16 +51,26 @@ public sealed class ConstrainedDecoder
 
                 if (ctx.MultiTaskModel is not null)
                 {
-                    var nctx = CandidateEventProposer.BuildNeuralContext(
-                        candidate.Timing,
-                        tempCtx,
-                        GetLastNote(state, NoteHand.Left),
-                        GetLastNote(state, NoteHand.Right),
-                        state.LeftCtx,
-                        state.RightCtx,
-                        updatedHidden);
-                    beamPred = ctx.MultiTaskModel.PredictAll(in nctx);
-                    placementScore = beamPred.Value.PlacementScore;
+                    if (batchedPredictions is not null)
+                    {
+                        var prediction = batchedPredictions[beamPredictionIndex++];
+                        beamPred = prediction.Prediction;
+                        updatedHidden = prediction.Hidden;
+                        placementScore = prediction.Prediction.PlacementScore;
+                    }
+                    else
+                    {
+                        var nctx = CandidateEventProposer.BuildNeuralContext(
+                            candidate.Timing,
+                            tempCtx,
+                            GetLastNote(state, NoteHand.Left),
+                            GetLastNote(state, NoteHand.Right),
+                            state.LeftCtx,
+                            state.RightCtx,
+                            updatedHidden);
+                        beamPred = ctx.MultiTaskModel.PredictAll(in nctx);
+                        placementScore = beamPred.Value.PlacementScore;
+                    }
                 }
 
                 nextBeam.Add(state with
@@ -109,6 +123,39 @@ public sealed class ConstrainedDecoder
 
         var best = beam.OrderByDescending(s => s.Score).First();
         return best.Notes.OrderBy(n => n.Beat).ToList();
+    }
+
+    private static IReadOnlyList<(NeuralMapPrediction Prediction, GruState? Hidden)> PredictBeamBatch(
+        ProposedEvent candidate,
+        IReadOnlyList<BeamState> beam,
+        GenerationContext ctx,
+        IBatchedMultiTaskPlacementModel batchedModel)
+    {
+        var contexts = new NeuralPlacementContext[beam.Count];
+        var hiddenStates = new GruState?[beam.Count];
+
+        for (int i = 0; i < beam.Count; i++)
+        {
+            var state = beam[i];
+            var tempCtx = CloneContextWith(ctx, state);
+            var updatedHidden = state.Hidden?.Clone();
+            hiddenStates[i] = updatedHidden;
+
+            contexts[i] = CandidateEventProposer.BuildNeuralContext(
+                candidate.Timing,
+                tempCtx,
+                GetLastNote(state, NoteHand.Left),
+                GetLastNote(state, NoteHand.Right),
+                state.LeftCtx,
+                state.RightCtx,
+                updatedHidden);
+        }
+
+        var predictions = batchedModel.PredictAllBatch(contexts);
+        var results = new (NeuralMapPrediction Prediction, GruState? Hidden)[beam.Count];
+        for (int i = 0; i < beam.Count; i++)
+            results[i] = (predictions[i], hiddenStates[i]);
+        return results;
     }
 
     private static NoteHand[] GetHandOrder(ProposedEvent candidate, NeuralMapPrediction? prediction)

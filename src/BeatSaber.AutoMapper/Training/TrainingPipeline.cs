@@ -14,6 +14,21 @@ namespace BeatSaber.AutoMapper.Training;
 
 public sealed class TrainingPipeline : IDisposable
 {
+    private sealed record SongFolderInfo(
+        string FolderPath,
+        IReadOnlyList<DifficultyLevel> Difficulties)
+    {
+        public DifficultyLevel HighestDifficulty =>
+            Difficulties.Count > 0 ? Difficulties.Max() : DifficultyLevel.Easy;
+    }
+
+    private sealed record SplitPlan(
+        int TrainSongs,
+        int ValidationSongs,
+        int TestSongs,
+        int ValidationSongsPerEpoch,
+        int ValidationCachePoolSize);
+
     private readonly CorpusIngestionService _ingestion        = new();
     private readonly TrainingExampleBuilder _exampleBuilder   = new();
     private readonly DatasetManifestBuilder _manifestBuilder  = new();
@@ -78,39 +93,34 @@ public sealed class TrainingPipeline : IDisposable
 
         // ----------------------------------------------------------------
         // 2. Song-level train / val / test split
-        //    Shuffle all map folders deterministically, then partition so that
-        //    validation and test songs are never seen during training.
+        //    Splits are difficulty-aware and remain song-separated:
+        //    one map folder and all its difficulties stay in exactly one split.
         // ----------------------------------------------------------------
-        var splitRng      = new Random((int)(options.RandomSeed & int.MaxValue));
-        var shuffledFolders = FisherYatesShuffleFolders(mapFolders, splitRng);
-        int totalSongs    = shuffledFolders.Length;
+        int totalSongs = mapFolders.Length;
+        var folderInfos = InspectSongFolders(mapFolders);
+        var splitPlan = ResolveSplitPlan(totalSongs, options);
 
-        // Number of songs to reserve for the validation pool.
-        // Prefer the explicit ValidationCachePoolSize if given; otherwise use the fraction.
-        int valPoolSize = options.ValidationCachePoolSize > 0
-            ? options.ValidationCachePoolSize
-            : Math.Max(
-                options.ValidationSongsPerEpoch,
-                (int)(totalSongs * options.ValidationFraction));
-        valPoolSize = Math.Min(valPoolSize, totalSongs / 4);   // cap at 25% of songs
-
-        int testSongCount  = Math.Max(0, (int)(totalSongs * options.TestFraction));
-        int trainSongCount = totalSongs - valPoolSize - testSongCount;
-
-        if (trainSongCount <= 0)
+        if (splitPlan.TrainSongs <= 0)
         {
             Console.WriteLine("[Training] Not enough songs to split into train / val / test. Aborting.");
             return;
         }
 
-        var trainFolders = shuffledFolders[..trainSongCount];
-        var valFolders   = shuffledFolders[trainSongCount..(trainSongCount + valPoolSize)];
-        var testFolders  = shuffledFolders[(trainSongCount + valPoolSize)..];
+        var (trainFolders, valFolders, testFolders) = CreateDifficultyAwareSplit(
+            folderInfos,
+            splitPlan,
+            options.RandomSeed);
 
         Console.WriteLine(
             $"[Training] Split: {trainFolders.Length} train / " +
             $"{valFolders.Length} val / {testFolders.Length} test songs " +
-            $"(total {totalSongs}).");
+            $"(total {totalSongs}, val-songs/epoch={splitPlan.ValidationSongsPerEpoch}, " +
+            $"validation-cache-size={splitPlan.ValidationCachePoolSize}).");
+
+        Console.WriteLine(
+            $"[Training] Difficulty mix: train[{FormatDifficultyMix(trainFolders)}]  " +
+            $"val[{FormatDifficultyMix(valFolders)}]  " +
+            $"test[{FormatDifficultyMix(testFolders)}]");
 
         // ----------------------------------------------------------------
         // 3. Build training examples — parallel across trainFolders only
@@ -216,10 +226,10 @@ public sealed class TrainingPipeline : IDisposable
         // Each song contributes ALL its valid difficulties as separate pairs.
         // 'songsPerEpoch' is sampled from the pool once and fixed for the whole run.
         // ----------------------------------------------------------------
-        int songsPerEpoch = Math.Max(1, options.ValidationSongsPerEpoch);
+        int songsPerEpoch = splitPlan.ValidationSongsPerEpoch;
 
         var poolGroups = new ValidationSongFinder()
-            .Find(valFolders, valFolders.Length, options.RandomSeed);
+            .Find(valFolders, splitPlan.ValidationCachePoolSize, options.RandomSeed);
 
         CachedPair[] cachedPairs = [];
         if (poolGroups.Count > 0)
@@ -349,6 +359,8 @@ public sealed class TrainingPipeline : IDisposable
 
         for (int epoch = 0; epoch < options.Epochs; epoch++)
         {
+            var epochStopwatch = Stopwatch.StartNew();
+
             // Shuffle sequences (not individual examples) each epoch
             var shuffledSeqs = FisherYatesShuffleSeqs(trainSeqs, epochRng.Next());
 
@@ -358,14 +370,19 @@ public sealed class TrainingPipeline : IDisposable
                     LimitSyntheticSequences(currentSyntheticSeqs, shuffledSeqs.Count / 2, epochRng.Next()),
                     epochRng.Next());
 
+            var trainStopwatch = Stopwatch.StartNew();
             var (loss, plBce) = _placementTrainer.TrainEpoch(shuffledSeqs, lr);
+            double trainSeconds = trainStopwatch.Elapsed.TotalSeconds;
 
             double qualityScore = 0;
+            double validationSeconds = 0;
             if (cachedPairs.Length > 0)
             {
+                var validationStopwatch = Stopwatch.StartNew();
                 var (score, newSynthetics, diffScores) =
                     RunGenerationValidationWithFeedback(cachedPairs, options);
                 qualityScore = score;
+                validationSeconds = validationStopwatch.Elapsed.TotalSeconds;
 
                 // Per-difficulty breakdown (logged after the main epoch line)
                 if (diffScores.Count > 1)
@@ -430,6 +447,7 @@ public sealed class TrainingPipeline : IDisposable
                 $"loss={loss:F4}  plBCE={plBce:F4}  " +
                 $"genQ={qualityScore:F3}  best={bestQuality:F3}  sm={smoothedQuality:F3}  lr={lr:G4}" +
                 $"  lSlp={lossSlope:+0.0000;-0.0000}  qSlp={genQSlope:+0.0000;-0.0000}" +
+                $"  train={trainSeconds:F1}s  val={validationSeconds:F1}s  epoch={epochStopwatch.Elapsed.TotalSeconds:F1}s" +
                 (currentSyntheticSeqs.Count > 0 ? $"  synthEx={currentSyntheticSeqs.Sum(s => s.Count)}" : string.Empty) +
                 statusTag);
 
@@ -499,9 +517,10 @@ public sealed class TrainingPipeline : IDisposable
     {
         var scores   = new double[cachedPairs.Length];
         var synthBag = new ConcurrentBag<List<TrainingExample>>();
+        int validationParallelism = _placementTrainer.UsesGpuInference ? 1 : Environment.ProcessorCount;
 
         Parallel.For(0, cachedPairs.Length,
-            new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount },
+            new ParallelOptions { MaxDegreeOfParallelism = validationParallelism },
             i =>
             {
                 var cached = cachedPairs[i];
@@ -619,16 +638,188 @@ public sealed class TrainingPipeline : IDisposable
         return copy;
     }
 
-    /// <summary>Fisher-Yates shuffle of a string array, returning a new shuffled copy.</summary>
-    private static string[] FisherYatesShuffleFolders(string[] source, Random rng)
+    private static SongFolderInfo[] InspectSongFolders(IReadOnlyList<string> folders)
     {
-        var arr = (string[])source.Clone();
-        for (int i = arr.Length - 1; i > 0; i--)
+        var result = new SongFolderInfo[folders.Count];
+
+        Parallel.For(0, folders.Count,
+            new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount },
+            i =>
+            {
+                var folder = folders[i];
+                try
+                {
+                    var difficulties = BeatmapImporter.Import(folder)
+                        .Select(m => m.Difficulty.Difficulty)
+                        .Distinct()
+                        .OrderBy(d => (int)d)
+                        .ToArray();
+                    result[i] = new SongFolderInfo(folder, difficulties);
+                }
+                catch
+                {
+                    result[i] = new SongFolderInfo(folder, []);
+                }
+            });
+
+        return result;
+    }
+
+    private static SplitPlan ResolveSplitPlan(int totalSongs, TrainingOptions options)
+    {
+        if (totalSongs <= 1)
+            return new SplitPlan(totalSongs, 0, 0, 0, 0);
+
+        int minVal = totalSongs >= 8 ? 1 : 0;
+        int minTest = totalSongs >= 12 ? 1 : 0;
+
+        int autoVal = Math.Clamp(
+            (int)Math.Round(totalSongs * 0.14, MidpointRounding.AwayFromZero),
+            minVal,
+            Math.Max(minVal, totalSongs / 5));
+
+        int autoTest = Math.Clamp(
+            (int)Math.Round(totalSongs * 0.10, MidpointRounding.AwayFromZero),
+            minTest,
+            Math.Max(minTest, totalSongs / 6));
+
+        int valPoolSize = options.ValidationCachePoolSize > 0
+            ? options.ValidationCachePoolSize
+            : autoVal;
+
+        int testSongCount = autoTest;
+        int trainSongCount = totalSongs - valPoolSize - testSongCount;
+
+        int minTrain = Math.Max(1, (int)Math.Ceiling(totalSongs * 0.70));
+        while (trainSongCount < minTrain && (valPoolSize > minVal || testSongCount > minTest))
         {
-            int j = rng.Next(i + 1);
-            (arr[i], arr[j]) = (arr[j], arr[i]);
+            if (valPoolSize >= testSongCount && valPoolSize > minVal)
+                valPoolSize--;
+            else if (testSongCount > minTest)
+                testSongCount--;
+            else
+                break;
+
+            trainSongCount = totalSongs - valPoolSize - testSongCount;
         }
-        return arr;
+
+        if (trainSongCount <= 0)
+            trainSongCount = Math.Max(1, totalSongs - valPoolSize - testSongCount);
+
+        valPoolSize = Math.Max(0, Math.Min(valPoolSize, totalSongs - trainSongCount - testSongCount));
+        int maxSongsPerEpoch = Math.Min(valPoolSize, 16);
+        int songsPerEpoch = options.ValidationSongsPerEpoch > 0
+            ? options.ValidationSongsPerEpoch
+            : (valPoolSize <= 0 ? 0 : Math.Clamp((int)Math.Ceiling(Math.Sqrt(valPoolSize)), 1, maxSongsPerEpoch));
+
+        if (valPoolSize > 0)
+            songsPerEpoch = Math.Clamp(songsPerEpoch, 1, valPoolSize);
+
+        return new SplitPlan(
+            TrainSongs: trainSongCount,
+            ValidationSongs: valPoolSize,
+            TestSongs: testSongCount,
+            ValidationSongsPerEpoch: songsPerEpoch,
+            ValidationCachePoolSize: Math.Max(valPoolSize > 0 ? 1 : 0, Math.Max(songsPerEpoch, valPoolSize)));
+    }
+
+    private static (string[] TrainFolders, string[] ValidationFolders, string[] TestFolders)
+        CreateDifficultyAwareSplit(
+            IReadOnlyList<SongFolderInfo> folderInfos,
+            SplitPlan plan,
+            long seed)
+    {
+        var train = new List<string>(plan.TrainSongs);
+        var val = new List<string>(plan.ValidationSongs);
+        var test = new List<string>(plan.TestSongs);
+
+        var rng = new Random((int)(seed & int.MaxValue));
+        var buckets = folderInfos
+            .GroupBy(info => info.HighestDifficulty)
+            .OrderBy(_ => rng.Next())
+            .ToList();
+
+        int remainingSongs = folderInfos.Count;
+        int remainingTrain = plan.TrainSongs;
+        int remainingVal = plan.ValidationSongs;
+        int remainingTest = plan.TestSongs;
+
+        foreach (var bucket in buckets)
+        {
+            var shuffled = bucket.OrderBy(_ => rng.Next()).ToList();
+            int bucketCount = shuffled.Count;
+            if (bucketCount == 0)
+                continue;
+
+            int trainTake = AllocateBucketShare(bucketCount, remainingTrain, remainingSongs);
+            int valTake = AllocateBucketShare(bucketCount, remainingVal, remainingSongs);
+            trainTake = Math.Min(trainTake, bucketCount);
+            valTake = Math.Min(valTake, bucketCount - trainTake);
+            int testTake = Math.Min(bucketCount - trainTake - valTake, remainingTest);
+
+            int assigned = trainTake + valTake + testTake;
+            while (assigned < bucketCount)
+            {
+                if (remainingTrain - trainTake >= remainingVal - valTake &&
+                    remainingTrain - trainTake >= remainingTest - testTake)
+                    trainTake++;
+                else if (remainingVal - valTake >= remainingTest - testTake)
+                    valTake++;
+                else
+                    testTake++;
+
+                assigned++;
+            }
+
+            train.AddRange(shuffled.Take(trainTake).Select(x => x.FolderPath));
+            val.AddRange(shuffled.Skip(trainTake).Take(valTake).Select(x => x.FolderPath));
+            test.AddRange(shuffled.Skip(trainTake + valTake).Take(testTake).Select(x => x.FolderPath));
+
+            remainingSongs -= bucketCount;
+            remainingTrain -= trainTake;
+            remainingVal -= valTake;
+            remainingTest -= testTake;
+        }
+
+        return (train.ToArray(), val.ToArray(), test.ToArray());
+    }
+
+    private static int AllocateBucketShare(int bucketCount, int remainingTarget, int remainingSongs)
+    {
+        if (bucketCount <= 0 || remainingTarget <= 0 || remainingSongs <= 0)
+            return 0;
+
+        return (int)Math.Round(
+            bucketCount * (remainingTarget / (double)remainingSongs),
+            MidpointRounding.AwayFromZero);
+    }
+
+    private static string FormatDifficultyMix(IReadOnlyList<string> folders)
+    {
+        if (folders.Count == 0)
+            return "none";
+
+        var counts = Enum.GetValues<DifficultyLevel>()
+            .ToDictionary(d => d, _ => 0);
+
+        foreach (var folder in folders)
+        {
+            try
+            {
+                foreach (var diff in BeatmapImporter.Import(folder)
+                    .Select(m => m.Difficulty.Difficulty)
+                    .Distinct())
+                    counts[diff]++;
+            }
+            catch
+            {
+            }
+        }
+
+        return string.Join("  ",
+            counts.Where(kv => kv.Value > 0)
+                  .OrderBy(kv => (int)kv.Key)
+                  .Select(kv => $"{kv.Key}={kv.Value}"));
     }
 
     /// <summary>

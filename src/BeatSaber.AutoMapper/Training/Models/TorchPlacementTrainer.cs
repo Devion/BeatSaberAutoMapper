@@ -12,32 +12,39 @@ namespace BeatSaber.AutoMapper.Training.Models;
 /// A shadow CPU model is kept in sync after each epoch for inference during generation
 /// quality validation — no disk I/O on the hot path.
 /// </summary>
-public sealed class TorchPlacementTrainer : IMultiTaskPlacementModel, IDisposable
+public sealed class TorchPlacementTrainer : IBatchedMultiTaskPlacementModel, IDisposable
 {
     private readonly BeatSaberMappingNet _gpu;
     private readonly BeatSaberMappingNet _cpu;
     private readonly Device              _device;
+    private readonly bool                _useGpuInference;
+    private readonly object              _gpuInferenceLock = new();
     private          optim.Optimizer?    _optimizer;
     private          double              _optimizerLr = -1;
     private          string?             _bestWeightsTmp;
 
-    // Sequence training hyper-parameters
-    private const int WindowSize  = 64;
-    private const int WindowStride = 64;
+    // Larger windows reduce host-side tensor/setup overhead and keep the GPU busier.
+    private const int WindowSize  = 256;
+    private const int WindowStride = 256;
+    private const int BatchSize   = 32;
 
     public TorchPlacementTrainer()
     {
-        _device = cuda.is_available() ? CUDA : CPU;
-        string deviceInfo = cuda.is_available()
+        _useGpuInference = cuda.is_available();
+        _device = _useGpuInference ? CUDA : CPU;
+        string deviceInfo = _useGpuInference
             ? $"CUDA ({cuda.device_count()} device(s))"
             : "CPU";
         Console.WriteLine($"[TorchSharp] Device: {deviceInfo}");
+        Console.WriteLine($"[TorchSharp] Validation inference: {(_useGpuInference ? "GPU" : "CPU")}");
 
         _gpu = new BeatSaberMappingNet();
         _gpu.to(_device);
         _cpu = new BeatSaberMappingNet();
         _cpu.eval();
     }
+
+    public bool UsesGpuInference => _useGpuInference;
 
     // ── Checkpoint ────────────────────────────────────────────────────────────
 
@@ -63,7 +70,7 @@ public sealed class TorchPlacementTrainer : IMultiTaskPlacementModel, IDisposabl
     // ── Epoch training ────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Sequence-based training epoch over W=16 beat windows with BPTT.
+    /// Sequence-based training epoch over contiguous beat windows with BPTT.
     /// Each inner list is one (song, difficulty) pair in beat order.
     /// </summary>
     public (double Loss, double PlaceBce) TrainEpoch(
@@ -95,44 +102,59 @@ public sealed class TorchPlacementTrainer : IMultiTaskPlacementModel, IDisposabl
         double totalLoss = 0, totalPlaceBce = 0;
         int totalChunks = 0;
 
-        foreach (var seq in sequences)
+        foreach (var batch in BuildSequenceBatches(sequences, BatchSize))
         {
-            if (seq.Count == 0) continue;
-            Tensor? hidden = null;
-            for (int start = 0; start < seq.Count; start += WindowStride)
-            {
-                int len = Math.Min(WindowSize, seq.Count - start);
-                var xArr    = new float[len * D];
-                var yPlArr  = new float[len];
-                var yHaArr  = new float[len];
-                var yCdArr  = new long[len];
-                var yLnArr  = new long[len];
-                var yRwArr  = new long[len];
-                var hasMask = new float[len];
-                var cdMask  = new float[len];
-                var lnMask  = new float[len];
-                var rwMask  = new float[len];
-                var exWtArr = new float[len];
+            int batchCount = batch.Count;
+            if (batchCount == 0) continue;
 
-                for (int t = 0; t < len; t++)
+            int maxSeqLen = batch.Max(s => s.Count);
+            Tensor? hidden = null;
+
+            for (int start = 0; start < maxSeqLen; start += WindowStride)
+            {
+                int len = Math.Min(WindowSize, Math.Max(0, maxSeqLen - start));
+                if (len <= 0) break;
+
+                var xArr      = new float[batchCount * len * D];
+                var yPlArr    = new float[batchCount * len];
+                var yHaArr    = new float[batchCount * len];
+                var yCdArr    = new long[batchCount * len];
+                var yLnArr    = new long[batchCount * len];
+                var yRwArr    = new long[batchCount * len];
+                var hasMask   = new float[batchCount * len];
+                var cdMask    = new float[batchCount * len];
+                var lnMask    = new float[batchCount * len];
+                var rwMask    = new float[batchCount * len];
+                var exWtArr   = new float[batchCount * len];
+                var validMask = new float[batchCount * len];
+
+                for (int b = 0; b < batchCount; b++)
                 {
-                    var ex  = seq[start + t];
-                    int idx = t;
-                    FillFeaturesFromExample(ex, xArr, idx * D);
-                    yPlArr[idx]  = ex.HasNote ? 1f : 0f;
-                    yHaArr[idx]  = ex.NoteHand == 1 ? 1f : 0f;
-                    yCdArr[idx]  = ex.NoteCutDir >= 0 ? ex.NoteCutDir : 0;
-                    yLnArr[idx]  = ex.NoteLane   >= 0 ? ex.NoteLane   : 0;
-                    yRwArr[idx]  = ex.NoteRow    >= 0 ? ex.NoteRow    : 0;
-                    hasMask[idx] = ex.HasNote && ex.NoteHand   >= 0 ? 1f : 0f;
-                    cdMask[idx]  = ex.HasNote && ex.NoteCutDir >= 0 ? 1f : 0f;
-                    lnMask[idx]  = ex.HasNote && ex.NoteLane   >= 0 ? 1f : 0f;
-                    rwMask[idx]  = ex.HasNote && ex.NoteRow    >= 0 ? 1f : 0f;
-                    exWtArr[idx] = (float)Math.Max(0.05, ex.Weight);
+                    var seq = batch[b];
+                    int remaining = seq.Count - start;
+                    int seqLen = Math.Min(len, Math.Max(0, remaining));
+
+                    for (int t = 0; t < seqLen; t++)
+                    {
+                        var ex = seq[start + t];
+                        int idx = b * len + t;
+                        FillFeaturesFromExample(ex, xArr, idx * D);
+                        yPlArr[idx]    = ex.HasNote ? 1f : 0f;
+                        yHaArr[idx]    = ex.NoteHand == 1 ? 1f : 0f;
+                        yCdArr[idx]    = ex.NoteCutDir >= 0 ? ex.NoteCutDir : 0;
+                        yLnArr[idx]    = ex.NoteLane   >= 0 ? ex.NoteLane   : 0;
+                        yRwArr[idx]    = ex.NoteRow    >= 0 ? ex.NoteRow    : 0;
+                        hasMask[idx]   = ex.HasNote && ex.NoteHand   >= 0 ? 1f : 0f;
+                        cdMask[idx]    = ex.HasNote && ex.NoteCutDir >= 0 ? 1f : 0f;
+                        lnMask[idx]    = ex.HasNote && ex.NoteLane   >= 0 ? 1f : 0f;
+                        rwMask[idx]    = ex.HasNote && ex.NoteRow    >= 0 ? 1f : 0f;
+                        exWtArr[idx]   = (float)Math.Max(0.05, ex.Weight);
+                        validMask[idx] = 1f;
+                    }
                 }
 
-                long N = len;
-                using var xT      = tensor(xArr,    new long[] { 1, len, D }, device: _device);
+                long N = batchCount * len;
+                using var xT      = tensor(xArr,    new long[] { batchCount, len, D }, device: _device);
                 using var yPlT    = tensor(yPlArr,  new long[] { N },          device: _device);
                 using var yHaT    = tensor(yHaArr,  new long[] { N },          device: _device);
                 using var yCdT    = tensor(yCdArr,  new long[] { N },          device: _device);
@@ -144,6 +166,7 @@ public sealed class TorchPlacementTrainer : IMultiTaskPlacementModel, IDisposabl
                 using var lnMaskT = tensor(lnMask,  new long[] { N },         device: _device);
                 using var rwMaskT = tensor(rwMask,  new long[] { N },         device: _device);
                 using var exWtT   = tensor(exWtArr, new long[] { N },         device: _device);
+                using var validT  = tensor(validMask, new long[] { N },       device: _device);
 
                 var (outT, hn) = _gpu.ForwardSequence(xT, hidden);
                 using (hidden) { }
@@ -156,7 +179,7 @@ public sealed class TorchPlacementTrainer : IMultiTaskPlacementModel, IDisposabl
                 using var lnLgt = outT.narrow(1, 11, 4);
                 using var rwLgt = outT.narrow(1, 15, 3);
 
-                var plBceTens = functional.binary_cross_entropy_with_logits(plLgt, yPlT, exWtT, Reduction.Mean, posWtT);
+                var plBceTens = MaskedBinaryCrossEntropyWithLogits(plLgt, yPlT, exWtT, validT, posWtT);
                 totalPlaceBce += plBceTens.item<float>();
                 var lossTerms = new List<Tensor> { plBceTens };
 
@@ -241,6 +264,7 @@ public sealed class TorchPlacementTrainer : IMultiTaskPlacementModel, IDisposabl
         if (_bestWeightsTmp is null || !File.Exists(_bestWeightsTmp)) return;
         _gpu.load(_bestWeightsTmp);
         _gpu.to(_device);
+        SyncCpuShadow();
         _optimizer?.Dispose();
         _optimizer   = null;
         _optimizerLr = -1;
@@ -275,12 +299,32 @@ public sealed class TorchPlacementTrainer : IMultiTaskPlacementModel, IDisposabl
 
     public double ScorePlacement(in NeuralPlacementContext ctx)
     {
+        return _useGpuInference
+            ? ScorePlacementGpu(in ctx)
+            : ScorePlacementCpu(in ctx);
+    }
+
+    public NeuralMapPrediction PredictAll(in NeuralPlacementContext ctx)
+        => _useGpuInference
+            ? PredictAllGpu(in ctx)
+            : PredictAllCpu(in ctx);
+
+    public IReadOnlyList<NeuralMapPrediction> PredictAllBatch(IReadOnlyList<NeuralPlacementContext> contexts)
+    {
+        if (contexts.Count == 0)
+            return [];
+
+        return _useGpuInference
+            ? PredictAllBatchGpu(contexts)
+            : PredictAllBatchCpu(contexts);
+    }
+
+    private double ScorePlacementCpu(in NeuralPlacementContext ctx)
+    {
         using var noGrad = no_grad();
         var f = new float[BeatSaberMappingNet.InputDim];
         ctx.FillFeaturesFloat(f);
-        // Single-step inference: wrap as [1, 1, D]
-        using var xT    = tensor(f, new long[] { 1, 1, BeatSaberMappingNet.InputDim });
-        // Use GruState if available; otherwise zeros
+        using var xT = tensor(f, new long[] { 1, 1, BeatSaberMappingNet.InputDim });
         var (outT, _) = ForwardStepCpu(xT, ctx.GruHiddenState);
         using var plProb = sigmoid(outT.select(1, 0));
         double result = plProb.item<float>();
@@ -288,7 +332,7 @@ public sealed class TorchPlacementTrainer : IMultiTaskPlacementModel, IDisposabl
         return result;
     }
 
-    public NeuralMapPrediction PredictAll(in NeuralPlacementContext ctx)
+    private NeuralMapPrediction PredictAllCpu(in NeuralPlacementContext ctx)
     {
         using var noGrad = no_grad();
         var f = new float[BeatSaberMappingNet.InputDim];
@@ -321,6 +365,170 @@ public sealed class TorchPlacementTrainer : IMultiTaskPlacementModel, IDisposabl
         };
     }
 
+    private double ScorePlacementGpu(in NeuralPlacementContext ctx)
+        => PredictAllGpu(in ctx).PlacementScore;
+
+    private IReadOnlyList<NeuralMapPrediction> PredictAllBatchCpu(IReadOnlyList<NeuralPlacementContext> contexts)
+    {
+        var results = new NeuralMapPrediction[contexts.Count];
+        for (int i = 0; i < contexts.Count; i++)
+        {
+            var ctx = contexts[i];
+            results[i] = PredictAllCpu(in ctx);
+        }
+        return results;
+    }
+
+    private NeuralMapPrediction PredictAllGpu(in NeuralPlacementContext ctx)
+    {
+        lock (_gpuInferenceLock)
+        {
+            using var noGrad = no_grad();
+            _gpu.eval();
+
+            var f = new float[BeatSaberMappingNet.InputDim];
+            ctx.FillFeaturesFloat(f);
+
+            using var xT = tensor(
+                f,
+                new long[] { 1, 1, BeatSaberMappingNet.InputDim },
+                device: _device);
+
+            using var h0 = ctx.GruHiddenState is not null
+                ? tensor(
+                    ctx.GruHiddenState.H,
+                    new long[] { BeatSaberMappingNet.GruLayers, 1, BeatSaberMappingNet.GruHiddenDim },
+                    device: _device)
+                : zeros(
+                    new long[] { BeatSaberMappingNet.GruLayers, 1, BeatSaberMappingNet.GruHiddenDim },
+                    device: _device);
+
+            var (outT, hn) = _gpu.ForwardStep(xT, h0);
+
+            if (ctx.GruHiddenState is not null)
+            {
+                var hnData = hn.data<float>();
+                for (int i = 0; i < ctx.GruHiddenState.H.Length; i++)
+                    ctx.GruHiddenState.H[i] = hnData[i];
+            }
+            hn.Dispose();
+
+            using var plProb = sigmoid(outT.select(1, 0));
+            using var haProb = sigmoid(outT.select(1, 1));
+            using var cdSm   = softmax(outT.narrow(1, 2,  9), dim: 1);
+            using var lnSm   = softmax(outT.narrow(1, 11, 4), dim: 1);
+            using var rwSm   = softmax(outT.narrow(1, 15, 3), dim: 1);
+            outT.Dispose();
+
+            return new NeuralMapPrediction
+            {
+                PlacementScore = plProb.item<float>(),
+                HandScore      = haProb.item<float>(),
+                CutDirProbs    = ToDoubleArray(cdSm.squeeze(0)),
+                LaneProbs      = ToDoubleArray(lnSm.squeeze(0)),
+                RowProbs       = ToDoubleArray(rwSm.squeeze(0)),
+            };
+        }
+    }
+
+    private IReadOnlyList<NeuralMapPrediction> PredictAllBatchGpu(IReadOnlyList<NeuralPlacementContext> contexts)
+    {
+        lock (_gpuInferenceLock)
+        {
+            using var noGrad = no_grad();
+            _gpu.eval();
+
+            int batchSize = contexts.Count;
+            int inputDim = BeatSaberMappingNet.InputDim;
+            int hiddenSize = BeatSaberMappingNet.GruHiddenDim;
+            int layers = BeatSaberMappingNet.GruLayers;
+
+            var xArr = new float[batchSize * inputDim];
+            var hArr = new float[layers * batchSize * hiddenSize];
+
+            for (int i = 0; i < batchSize; i++)
+            {
+                var ctx = contexts[i];
+                var features = new float[inputDim];
+                ctx.FillFeaturesFloat(features);
+                Array.Copy(features, 0, xArr, i * inputDim, inputDim);
+
+                if (ctx.GruHiddenState is null)
+                    continue;
+
+                for (int layer = 0; layer < layers; layer++)
+                {
+                    Array.Copy(
+                        ctx.GruHiddenState.H,
+                        layer * hiddenSize,
+                        hArr,
+                        (layer * batchSize + i) * hiddenSize,
+                        hiddenSize);
+                }
+            }
+
+            using var xT = tensor(
+                xArr,
+                new long[] { batchSize, 1, inputDim },
+                device: _device);
+            using var h0 = tensor(
+                hArr,
+                new long[] { layers, batchSize, hiddenSize },
+                device: _device);
+
+            var (outT, hn) = _gpu.ForwardSequence(xT, h0);
+            var hnData = hn.data<float>();
+            var hnArr = hnData.ToArray();
+
+            for (int i = 0; i < batchSize; i++)
+            {
+                var state = contexts[i].GruHiddenState;
+                if (state is null)
+                    continue;
+
+                for (int layer = 0; layer < layers; layer++)
+                {
+                    Array.Copy(
+                        hnArr,
+                        (layer * batchSize + i) * hiddenSize,
+                        state.H,
+                        layer * hiddenSize,
+                        hiddenSize);
+                }
+            }
+
+            hn.Dispose();
+
+            using var plProb = sigmoid(outT.select(1, 0));
+            using var haProb = sigmoid(outT.select(1, 1));
+            using var cdSm   = softmax(outT.narrow(1, 2,  9), dim: 1);
+            using var lnSm   = softmax(outT.narrow(1, 11, 4), dim: 1);
+            using var rwSm   = softmax(outT.narrow(1, 15, 3), dim: 1);
+
+            var plData = plProb.data<float>();
+            var haData = haProb.data<float>();
+            var cdData = cdSm.data<float>().ToArray();
+            var lnData = lnSm.data<float>().ToArray();
+            var rwData = rwSm.data<float>().ToArray();
+
+            var results = new NeuralMapPrediction[batchSize];
+            for (int i = 0; i < batchSize; i++)
+            {
+                results[i] = new NeuralMapPrediction
+                {
+                    PlacementScore = plData[i],
+                    HandScore      = haData[i],
+                    CutDirProbs    = SliceToDoubleArray(cdData, i * 9, 9),
+                    LaneProbs      = SliceToDoubleArray(lnData, i * 4, 4),
+                    RowProbs       = SliceToDoubleArray(rwData, i * 3, 3),
+                };
+            }
+
+            outT.Dispose();
+            return results;
+        }
+    }
+
     private (Tensor output, Tensor hn) ForwardStepCpu(Tensor x, GruState? state)
     {
         using var h0 = state is not null
@@ -339,12 +547,53 @@ public sealed class TorchPlacementTrainer : IMultiTaskPlacementModel, IDisposabl
         return numer / denom;
     }
 
+    private static Tensor MaskedBinaryCrossEntropyWithLogits(
+        Tensor logits,
+        Tensor targets,
+        Tensor weights,
+        Tensor validMask,
+        Tensor posWeight)
+    {
+        using var raw = functional.binary_cross_entropy_with_logits(
+            logits,
+            targets,
+            weights,
+            Reduction.None,
+            posWeight);
+        using var numer = (raw * validMask).sum();
+        using var denom = validMask.sum().clamp_min(1e-6);
+        return numer / denom;
+    }
+
+    private static IReadOnlyList<IReadOnlyList<IReadOnlyList<TrainingExample>>> BuildSequenceBatches(
+        IReadOnlyList<IReadOnlyList<TrainingExample>> sequences,
+        int batchSize)
+    {
+        var ordered = sequences
+            .Where(seq => seq.Count > 0)
+            .OrderByDescending(seq => seq.Count)
+            .ToList();
+
+        var batches = new List<IReadOnlyList<IReadOnlyList<TrainingExample>>>();
+        for (int i = 0; i < ordered.Count; i += batchSize)
+            batches.Add(ordered.Skip(i).Take(batchSize).ToList());
+        return batches;
+    }
+
     private static double[] ToDoubleArray(Tensor t)
     {
         var data = t.data<float>();
         var arr  = new double[data.Count];
         for (int i = 0; i < arr.Length; i++) arr[i] = data[i];
         return arr;
+    }
+
+    private static double[] SliceToDoubleArray(float[] source, int start, int length)
+    {
+        var result = new double[length];
+        for (int i = 0; i < length; i++)
+            result[i] = source[start + i];
+        return result;
     }
 
     // ── CPU shadow sync ───────────────────────────────────────────────────────
