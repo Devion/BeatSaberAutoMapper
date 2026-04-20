@@ -2,6 +2,7 @@ namespace BeatSaber.AutoMapper.Training;
 
 public sealed record TrainingOptions(
     string DatasetPath,
+    string? BadLibraryPath,
     string ProfileName,
     string ArtifactsOutputPath,
     int Epochs,
@@ -41,6 +42,7 @@ public sealed record TrainingOptions(
 {
     public static TrainingOptions Default => new(
         DatasetPath: "dataset",
+        BadLibraryPath: null,
         ProfileName: "baseline",
         ArtifactsOutputPath: "artifacts",
         Epochs: 100,

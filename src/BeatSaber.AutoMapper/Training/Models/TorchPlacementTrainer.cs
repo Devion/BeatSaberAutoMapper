@@ -54,6 +54,7 @@ public sealed class TorchPlacementTrainer : IBatchedMultiTaskPlacementModel, IDi
     private readonly object              _gpuInferenceLock = new();
     private readonly object              _gpuBatchQueueLock = new();
     private readonly IBatchedMultiTaskPlacementModel _cpuInferenceModel;
+    public TrainingConsoleDashboard? Dashboard { get; set; }
     private          optim.Optimizer?    _optimizer;
     private          double              _optimizerLr = -1;
     private          string?             _bestWeightsTmp;
@@ -173,9 +174,12 @@ public sealed class TorchPlacementTrainer : IBatchedMultiTaskPlacementModel, IDi
         var epochStopwatch = Stopwatch.StartNew();
         double lastProgressLogSeconds = 0;
 
-        Console.WriteLine(
-            $"[TorchSharp] TrainEpoch start: seqs={sequences.Count}  batches={totalBatches}  " +
-            $"window={WindowSize}/{WindowStride}  batchSize={BatchSize}");
+        if (Dashboard is not null)
+            Dashboard.OnTrainStarted(totalBatches);
+        else
+            Console.WriteLine(
+                $"[TorchSharp] TrainEpoch start: seqs={sequences.Count}  batches={totalBatches}  " +
+                $"window={WindowSize}/{WindowStride}  batchSize={BatchSize}");
 
         for (int batchIndex = 0; batchIndex < totalBatches; batchIndex++)
         {
@@ -371,9 +375,12 @@ public sealed class TorchPlacementTrainer : IBatchedMultiTaskPlacementModel, IDi
             {
                 lastProgressLogSeconds = elapsed;
                 double pct = totalBatches > 0 ? 100.0 * (batchIndex + 1) / totalBatches : 100.0;
-                Console.WriteLine(
-                    $"[TorchSharp] TrainEpoch progress: {batchIndex + 1}/{totalBatches} batches " +
-                    $"({pct:F0}%)  chunks={totalChunks}  elapsed={elapsed:F0}s");
+                if (Dashboard is not null)
+                    Dashboard.OnTrainProgress(batchIndex + 1, totalBatches, totalChunks, elapsed);
+                else
+                    Console.WriteLine(
+                        $"[TorchSharp] TrainEpoch progress: {batchIndex + 1}/{totalBatches} batches " +
+                        $"({pct:F0}%)  chunks={totalChunks}  elapsed={elapsed:F0}s");
             }
         }
 
@@ -421,7 +428,10 @@ public sealed class TorchPlacementTrainer : IBatchedMultiTaskPlacementModel, IDi
     {
         string path = Path.Combine(artifactsPath, fileName);
         _gpu.save(path);
-        Console.WriteLine($"[TorchSharp] Model saved → {path}");
+        if (Dashboard is not null)
+            Dashboard.AddNotice($"Saved {Path.GetFileName(path)}");
+        else
+            Console.WriteLine($"[TorchSharp] Model saved → {path}");
     }
 
     // ── IPlacementScorer (CPU shadow model) ───────────────────────────────────

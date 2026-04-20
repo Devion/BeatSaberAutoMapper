@@ -36,6 +36,7 @@ public sealed class TrainingPipeline : IDisposable
     private readonly DatasetManifestBuilder _manifestBuilder  = new();
     private readonly TorchPlacementTrainer   _placementTrainer = new();
     private readonly EvaluationRunner       _evaluator        = new();
+    private TrainingConsoleDashboard? _dashboard;
 
     public void Dispose() => _placementTrainer.Dispose();
 
@@ -154,16 +155,25 @@ public sealed class TrainingPipeline : IDisposable
         double FractionOfRealExamples,
         int StableRefreshStreak);
 
+    private readonly record struct NegativeSupervisionBudget(
+        int MaxSequenceCount,
+        int MaxExampleCount,
+        double FractionOfRealExamples);
+
     public void Run(TrainingOptions options)
     {
         Guard.NotNull(options, nameof(options));
         Directory.CreateDirectory(options.ArtifactsOutputPath);
+        TrainingConsoleDashboard? dashboard = null;
 
         // Warm-start from existing checkpoint
         var loadedCheckpointKind = _placementTrainer.TryLoadCheckpoint(options.ArtifactsOutputPath);
         bool warmStarted = loadedCheckpointKind != TorchPlacementTrainer.LoadedCheckpointKind.None;
         if (warmStarted)
-            Console.WriteLine($"[Training] Warm-start: loaded {loadedCheckpointKind} checkpoint.");
+        {
+            if (dashboard is not null) dashboard.AddNotice($"Warm-start from {loadedCheckpointKind}");
+            else Console.WriteLine($"[Training] Warm-start: loaded {loadedCheckpointKind} checkpoint.");
+        }
 
         // ----------------------------------------------------------------
         // 1. Resolve map folders
@@ -334,6 +344,36 @@ public sealed class TrainingPipeline : IDisposable
             $"[Training] Real train mix: seq={realTrainSnapshot.SequenceCount}  ex={realTrainSnapshot.ExampleCount}  " +
             $"{realTrainSnapshot.Mix}");
 
+        var badNegativeSeqs = new List<List<TrainingExample>>();
+        if (!string.IsNullOrWhiteSpace(options.BadLibraryPath))
+        {
+            var badFolders = ResolveMapFolders(
+                options.BadLibraryPath,
+                Path.Combine(options.ArtifactsOutputPath, "bad_library"),
+                "[Training] Bad-lib");
+
+            if (badFolders.Length > 0)
+            {
+                Console.WriteLine(
+                    $"[Training] Building explicit negative supervision from {badFolders.Length} bad-map folders...");
+                badNegativeSeqs = BuildNegativeExamplesFromFolders(
+                    badFolders,
+                    printLock,
+                    trainAudioCache,
+                    options.SelfSupervisedNegativeWeight).ToList();
+
+                var badSnapshot = SummarizeSequences(badNegativeSeqs);
+                var badBudget = ComputeBadNegativeBudget(trainSeqs);
+                Console.WriteLine(
+                    $"[Training] Bad negative pool: seq={badSnapshot.SequenceCount}  ex={badSnapshot.ExampleCount}  " +
+                    $"{badSnapshot.Mix}  cap/epoch={badBudget.MaxSequenceCount} seq {badBudget.MaxExampleCount} ex");
+            }
+            else
+            {
+                Console.WriteLine("[Training] Bad-lib resolved to 0 usable map folders; skipping explicit negative supervision.");
+            }
+        }
+
         // Build test examples from held-out test folders (used only for final evaluation)
         var testEx = testFolders.Length > 0
             ? BuildExamplesFromFolders(testFolders, printLock, trainAudioCache)
@@ -439,15 +479,22 @@ public sealed class TrainingPipeline : IDisposable
 
             SaveValidationSchedule(validationStatePath, options.RandomSeed, validationPlan, resumeEpochOffset);
 
-            Console.WriteLine(
-                $"[Training] Validation schedule: core={validationPlan.CorePairs.Length} pair(s) / {validationPlan.CoreSongCount} song(s), " +
-                $"full-cap={validationPlan.FullPairs.Length} pair(s) / {validationPlan.FullSongCap} song(s), " +
-                $"stage-start={validationPlan.StageStartEpoch}, stage-step={validationPlan.StageStepEpochs}.");
+            if (dashboard is not null)
+                dashboard.AddNotice(
+                    $"Val schedule core {validationPlan.CoreSongCount} full {validationPlan.FullSongCap} pairs {validationPlan.FullPairs.Length}");
+            else
+                Console.WriteLine(
+                    $"[Training] Validation schedule: core={validationPlan.CorePairs.Length} pair(s) / {validationPlan.CoreSongCount} song(s), " +
+                    $"full-cap={validationPlan.FullPairs.Length} pair(s) / {validationPlan.FullSongCap} song(s), " +
+                    $"stage-start={validationPlan.StageStartEpoch}, stage-step={validationPlan.StageStepEpochs}.");
         }
 
         // ----------------------------------------------------------------
         // 5. Placement model — epoch loop with shuffle + parallel mini-batch GD
         // ----------------------------------------------------------------
+        dashboard = TrainingConsoleDashboard.TryCreate();
+        _dashboard = dashboard;
+        _placementTrainer.Dashboard = dashboard;
         double lr = loadedCheckpointKind switch
         {
             TorchPlacementTrainer.LoadedCheckpointKind.Current => options.InitialLearningRate,
@@ -455,10 +502,11 @@ public sealed class TrainingPipeline : IDisposable
             TorchPlacementTrainer.LoadedCheckpointKind.Legacy => options.InitialLearningRate * 0.5,
             _ => options.InitialLearningRate
         };
-        Console.WriteLine(
-            $"[Training] LR setup: requested={ConsoleStyler.Colorize(options.InitialLearningRate.ToString("G4"), ConsoleColor.Cyan)}  " +
-            $"effective={ConsoleStyler.Colorize(lr.ToString("G4"), ConsoleColor.Cyan)}  " +
-            $"checkpoint={FormatCheckpointKind(loadedCheckpointKind)}");
+        if (dashboard is null)
+            Console.WriteLine(
+                $"[Training] LR setup: requested={ConsoleStyler.Colorize(options.InitialLearningRate.ToString("G4"), ConsoleColor.Cyan)}  " +
+                $"effective={ConsoleStyler.Colorize(lr.ToString("G4"), ConsoleColor.Cyan)}  " +
+                $"checkpoint={FormatCheckpointKind(loadedCheckpointKind)}");
         const double MinLr   = 1e-5;
         const double LrDecay = 0.5;
         // Reduce LR after this many consecutive stagnation epochs.
@@ -467,20 +515,42 @@ public sealed class TrainingPipeline : IDisposable
             ? options.LrPatience
             : Math.Max(1, options.EarlyStopPatience / 5);
 
-        Console.WriteLine(
-            $"[Training] Training GRU placement model {BeatSaberMappingNet.InputDim}→GRU({BeatSaberMappingNet.GruHiddenDim}×{BeatSaberMappingNet.GruLayers})→{BeatSaberMappingNet.MlpHidden} " +
-            $"({options.Epochs} epochs max, Adam lr={lr:G4}, patience={options.EarlyStopPatience}, lr-patience={lrPatience})...[warmStart={warmStarted}]");
-        Console.WriteLine(
-            $"[Training] Generation validation cadence: every {Math.Max(1, options.ValidationEveryNEpochs)} epoch(s).");
-        Console.WriteLine(
-            $"[Training] Validation inference device: {(options.ValidationUseGpuInference
-                ? ConsoleStyler.Colorize("GPU", ConsoleColor.Green)
-                : ConsoleStyler.Colorize("CPU", ConsoleColor.Yellow))}.");
-        Console.WriteLine(
-            $"[Training] Plateau restarts: max={options.PlateauRestartCount}  lrScale={options.PlateauRestartLrScale:F2}");
-        Console.WriteLine(
-            $"[Training] Synthetic training: enabled={options.EnableSyntheticTraining}  " +
-            $"unlockCoreQ={options.SyntheticUnlockCoreQ:F3}  warmup={options.SelfSupervisedWarmupEpochs}");
+        if (dashboard is not null)
+        {
+            dashboard.SetConfig(new TrainingConsoleDashboard.Config(
+                Device: _placementTrainer.UsesGpuInference ? "CUDA" : "CPU",
+                ValidationDevice: options.ValidationUseGpuInference ? "GPU" : "CPU",
+                InputDim: BeatSaberMappingNet.InputDim,
+                HiddenDim: BeatSaberMappingNet.GruHiddenDim,
+                Layers: BeatSaberMappingNet.GruLayers,
+                MlpHidden: BeatSaberMappingNet.MlpHidden,
+                LearningRate: lr,
+                Epochs: options.Epochs,
+                ValidationEvery: Math.Max(1, options.ValidationEveryNEpochs),
+                ValidationSongs: validationPlan?.CoreSongCount ?? 0,
+                ValidationPairs: validationPlan?.FullPairs.Length ?? 0,
+                PlateauRestarts: options.PlateauRestartCount,
+                PlateauRestartScale: options.PlateauRestartLrScale,
+                CheckpointKind: loadedCheckpointKind.ToString()));
+            dashboard.AddNotice($"Synthetic {(options.EnableSyntheticTraining ? "on" : "off")} warmup {options.SelfSupervisedWarmupEpochs}");
+        }
+        else
+        {
+            Console.WriteLine(
+                $"[Training] Training GRU placement model {BeatSaberMappingNet.InputDim}→GRU({BeatSaberMappingNet.GruHiddenDim}×{BeatSaberMappingNet.GruLayers})→{BeatSaberMappingNet.MlpHidden} " +
+                $"({options.Epochs} epochs max, Adam lr={lr:G4}, patience={options.EarlyStopPatience}, lr-patience={lrPatience})...[warmStart={warmStarted}]");
+            Console.WriteLine(
+                $"[Training] Generation validation cadence: every {Math.Max(1, options.ValidationEveryNEpochs)} epoch(s).");
+            Console.WriteLine(
+                $"[Training] Validation inference device: {(options.ValidationUseGpuInference
+                    ? ConsoleStyler.Colorize("GPU", ConsoleColor.Green)
+                    : ConsoleStyler.Colorize("CPU", ConsoleColor.Yellow))}.");
+            Console.WriteLine(
+                $"[Training] Plateau restarts: max={options.PlateauRestartCount}  lrScale={options.PlateauRestartLrScale:F2}");
+            Console.WriteLine(
+                $"[Training] Synthetic training: enabled={options.EnableSyntheticTraining}  " +
+                $"unlockCoreQ={options.SyntheticUnlockCoreQ:F3}  warmup={options.SelfSupervisedWarmupEpochs}");
+        }
 
         double bestQuality     = -1.0;
         double smoothedQuality = -1.0;
@@ -498,10 +568,13 @@ public sealed class TrainingPipeline : IDisposable
         double? previousCoreQuality = null;
         double? previousFullQuality = null;
         double? previousValidationSeconds = null;
+        int bestEpochNumber = 0;
 
-        Console.WriteLine("[Training] Saving initial best-weight snapshot...");
+        if (dashboard is not null) dashboard.AddNotice("Saving initial best snapshot");
+        else Console.WriteLine("[Training] Saving initial best-weight snapshot...");
         _placementTrainer.SaveBestWeights();
-        Console.WriteLine("[Training] Initial best-weight snapshot ready.");
+        if (dashboard is not null) dashboard.AddNotice("Initial best snapshot ready");
+        else Console.WriteLine("[Training] Initial best-weight snapshot ready.");
         int stableSyntheticRefreshes = 0;
 
         var epochRng = new Random((int)(options.RandomSeed & int.MaxValue));
@@ -513,10 +586,26 @@ public sealed class TrainingPipeline : IDisposable
         for (int epoch = 0; epoch < options.Epochs; epoch++)
         {
             var epochStopwatch = Stopwatch.StartNew();
+            dashboard?.BeginEpoch(epoch + 1, options.Epochs);
 
             // Shuffle sequences (not individual examples) each epoch
             var shuffledSeqs = FisherYatesShuffleSeqs(trainSeqs, epochRng.Next());
             bool syntheticMerged = false;
+            bool badNegativesMerged = false;
+
+            if (badNegativeSeqs.Count > 0)
+            {
+                var badBudget = ComputeBadNegativeBudget(trainSeqs);
+                shuffledSeqs = MergeSequences(
+                    shuffledSeqs,
+                    LimitSyntheticSequencesBalanced(
+                        badNegativeSeqs,
+                        badBudget.MaxSequenceCount,
+                        badBudget.MaxExampleCount,
+                        epochRng.Next()),
+                    epochRng.Next());
+                badNegativesMerged = true;
+            }
 
             bool syntheticTrainingUnlocked = options.EnableSyntheticTraining &&
                 stableSyntheticRefreshes > 0;
@@ -562,9 +651,12 @@ public sealed class TrainingPipeline : IDisposable
                 var activePairs = currentValidationPlan.FullPairs.Take(activeValidationPairs).ToArray();
                 int corePairCount = Math.Min(currentValidationPlan.CorePairs.Length, activePairs.Length);
                 int validationWorkers = DetermineValidationParallelism(options);
-                Console.WriteLine(
-                    $"[Training] Starting generation validation: pairs={activeValidationPairs}  " +
-                    $"songs={activeValidationSongs}  workers={validationWorkers}");
+                if (dashboard is not null)
+                    dashboard.OnValidationStarted(activeValidationPairs, activeValidationSongs, validationWorkers);
+                else
+                    Console.WriteLine(
+                        $"[Training] Starting generation validation: pairs={activeValidationPairs}  " +
+                        $"songs={activeValidationSongs}  workers={validationWorkers}");
                 var (coreScore, fullScore, newSynthetics, newDiagnostics) =
                     RunGenerationValidationWithFeedback(activePairs, corePairCount, options, previousValidationSnapshots);
                 coreQualityScore = coreScore;
@@ -587,7 +679,8 @@ public sealed class TrainingPipeline : IDisposable
                                 : kv.Value.ToString("F3");
                             return $"{kv.Key}={scoreText}";
                         });
-                    Console.WriteLine($"[Training]   genQ by diff: {string.Join("  ", parts)}");
+                    if (dashboard is null)
+                        Console.WriteLine($"[Training]   genQ by diff: {string.Join("  ", parts)}");
                 }
 
                 // Refresh synthetic pool on the configured cadence.
@@ -605,10 +698,13 @@ public sealed class TrainingPipeline : IDisposable
                             syntheticBudget.MaxSequenceCount,
                             syntheticBudget.MaxExampleCount,
                             epochRng.Next());
-                        Console.WriteLine(
-                            $"[Training]   synthetic refresh accepted: streak={stableSyntheticRefreshes}  " +
-                            $"budgetSeq={syntheticBudget.MaxSequenceCount}  budgetEx={syntheticBudget.MaxExampleCount}  " +
-                            $"frac={syntheticBudget.FractionOfRealExamples:F3}");
+                        if (dashboard is not null)
+                            dashboard.AddNotice($"Synthetic refresh accepted streak {stableSyntheticRefreshes}");
+                        else
+                            Console.WriteLine(
+                                $"[Training]   synthetic refresh accepted: streak={stableSyntheticRefreshes}  " +
+                                $"budgetSeq={syntheticBudget.MaxSequenceCount}  budgetEx={syntheticBudget.MaxExampleCount}  " +
+                                $"frac={syntheticBudget.FractionOfRealExamples:F3}");
                     }
                     else
                     {
@@ -618,16 +714,21 @@ public sealed class TrainingPipeline : IDisposable
                             : coreQualityScore < options.SyntheticUnlockCoreQ
                                 ? $"coreQ<{options.SyntheticUnlockCoreQ:F3}"
                                 : "quality gate";
-                        Console.WriteLine(
-                            $"[Training]   synthetic refresh skipped: reason={reason}  coreQ={coreQualityScore:F3}  " +
-                            $"fullQ={fullQualityScore:F3}  okPairs={diagnostics.SuccessfulPairs}/{diagnostics.TotalPairs}");
+                        if (dashboard is not null)
+                            dashboard.AddNotice($"Synthetic skipped {reason}");
+                        else
+                            Console.WriteLine(
+                                $"[Training]   synthetic refresh skipped: reason={reason}  coreQ={coreQualityScore:F3}  " +
+                                $"fullQ={fullQualityScore:F3}  okPairs={diagnostics.SuccessfulPairs}/{diagnostics.TotalPairs}");
                     }
                 }
             }
             else if (currentValidationPlan is not null)
             {
-                Console.WriteLine(
-                    $"[Training]   validation skipped this epoch (cadence={Math.Max(1, options.ValidationEveryNEpochs)}).");
+                if (dashboard is not null) dashboard.AddNotice("Validation skipped this epoch");
+                else
+                    Console.WriteLine(
+                        $"[Training]   validation skipped this epoch (cadence={Math.Max(1, options.ValidationEveryNEpochs)}).");
             }
 
             // ── Improvement check (raw quality) ──────────────────────────────────
@@ -636,9 +737,11 @@ public sealed class TrainingPipeline : IDisposable
             if (isNewBest)
             {
                 bestQuality = coreQualityScore;
+                bestEpochNumber = epoch + 1;
                 _placementTrainer.SaveBestWeights();
                 _placementTrainer.SaveBestArtifact(options.ArtifactsOutputPath);
                 _placementTrainer.SaveWeights(options.ArtifactsOutputPath);
+                dashboard?.AddNotice($"New best epoch {bestEpochNumber} coreQ {bestQuality:F3}");
             }
 
             _placementTrainer.SaveCurrentWeights(options.ArtifactsOutputPath);
@@ -697,33 +800,14 @@ public sealed class TrainingPipeline : IDisposable
                 ? FormatLowerIsBetter(validationSeconds, previousValidationSeconds, "F1")
                 : validationSeconds.ToString("F1");
 
-            Console.WriteLine(
-                $"[Training] Epoch {epoch + 1}/{options.Epochs}: " +
-                $"loss={lossText}  plBCE={plBceText}  " +
-                $"coreQ={coreQText}  " +
-                $"fullQ={fullQText}  " +
-                $"best={(bestQuality >= 0 ? bestQuality.ToString("F3") : "n/a")}  " +
-                $"sm={(smoothedQuality >= 0 ? smoothedQuality.ToString("F3") : "n/a")}  lr={lr:G4}" +
-                $"  lSlp={lossSlope:+0.0000;-0.0000}  qSlp={genQSlope:+0.0000;-0.0000}" +
-                $"  train={trainSeconds:F1}s  val={valText}s  epoch={epochStopwatch.Elapsed.TotalSeconds:F1}s" +
-                (activeValidationPairs > 0 ? $"  valPairs={activeValidationPairs}" : string.Empty) +
-                (currentSyntheticSeqs.Count > 0 ? $"  synthEx={currentSyntheticSeqs.Sum(s => s.Count)}" : string.Empty) +
-                statusTag);
-
-            Console.WriteLine(
-                $"[Training]   train mix: seq={epochMix.SequenceCount}  ex={epochMix.ExampleCount}  " +
-                $"synthetic={(syntheticMerged ? "on" : "off")}  {epochMix.Mix}");
-
+            string diffLine = string.Empty;
+            string validationInfo = string.Empty;
+            string validationDelta = string.Empty;
             if (currentValidationPlan is not null)
             {
                 var epochSyntheticBudget = ComputeSyntheticBudget(trainSeqs, stableSyntheticRefreshes);
-                Console.WriteLine(
-                    $"[Training]   validation stage: coreSongs={currentValidationPlan.CoreSongCount}  activeFullSongs={activeValidationSongs}/{currentValidationPlan.FullSongCap}");
-                Console.WriteLine(
-                    $"[Training]   synthetic budget: enabled={options.EnableSyntheticTraining}  " +
-                    $"streak={stableSyntheticRefreshes}  " +
-                    $"seqCap={epochSyntheticBudget.MaxSequenceCount}  exCap={epochSyntheticBudget.MaxExampleCount}  " +
-                    $"frac={epochSyntheticBudget.FractionOfRealExamples:F3}");
+                validationInfo =
+                    $"val {activeValidationSongs}/{currentValidationPlan.FullSongCap} synth {epochSyntheticBudget.MaxSequenceCount}/{epochSyntheticBudget.MaxExampleCount}";
                 if (diagnostics is not null)
                 {
                     var noteParts = diagnostics.AvgGeneratedNotesByDifficulty.Count > 0
@@ -731,27 +815,13 @@ public sealed class TrainingPipeline : IDisposable
                             .OrderBy(kv => (int)kv.Key)
                             .Select(kv => $"{kv.Key}Notes={kv.Value:F1}"))
                         : "none";
-                    Console.WriteLine(
-                        $"[Training]   val diag: ok={diagnostics.SuccessfulPairs}/{diagnostics.TotalPairs}  " +
-                        $"coreOk={diagnostics.CoreSuccessfulPairs}/{Math.Max(1, diagnostics.CoreSuccessfulPairs + diagnostics.CoreFailedPairs)}  " +
-                        $"avgAll={diagnostics.AvgScoreAllPairs:F3}  cand->prop={diagnostics.AvgCandidateSurvival:F3}  " +
-                        $"rawQ={diagnostics.AvgRawScore:F3}  repairedQ={diagnostics.AvgRepairedScore:F3}  " +
-                        $"prop->notes={diagnostics.AvgDecodeRate:F3}  rawNotes={diagnostics.AvgRawNotes:F1}  repairedNotes={diagnostics.AvgRepairedNotes:F1}  " +
-                        $"repairs={diagnostics.AvgRepairCount:F1}  noteDelta={diagnostics.AvgRepairNoteDeltaRatio:F3}  " +
-                        $"newSynthEx={diagnostics.TotalSyntheticExamples}  synth/pair={diagnostics.AvgSyntheticExamplesPerAcceptedPair:F1}");
-                    Console.WriteLine($"[Training]   val notes by diff: {noteParts}");
-                    Console.WriteLine(
-                        $"[Training]   val shape: right={diagnostics.AvgRightHandFraction:F3}  " +
-                        $"dot={diagnostics.AvgDotFraction:F3}  chordBeats={diagnostics.AvgChordBeatFraction:F3}");
-                    Console.WriteLine(
-                        $"[Training]   val delta: changed={FormatCountComparison(diagnostics.ChangedPairs)}" +
-                        $"/{diagnostics.TotalPairs}  fpChanged={FormatCountComparison(diagnostics.FingerprintChangedPairs)}  " +
-                        $"notesChanged={FormatCountComparison(diagnostics.NoteCountChangedPairs)}  " +
-                        $"scoreUp={FormatCountComparison(diagnostics.ScoreImprovedPairs)}  " +
-                        $"scoreDown={FormatCountRegression(diagnostics.ScoreWorsenedPairs)}  " +
-                        $"|dScore|={FormatMovementMagnitude(diagnostics.AvgAbsScoreDelta, 0.0005, 0.0050, "F4")}  " +
-                        $"|dRawQ|={FormatMovementMagnitude(diagnostics.AvgAbsRawScoreDelta, 0.0005, 0.0050, "F4")}  " +
-                        $"|dNotes|={FormatMovementMagnitude(diagnostics.AvgAbsRawNoteDelta, 0.1, 2.0, "F1")}");
+                    diffLine = diagnostics.DiffScores.Count > 0
+                        ? string.Join("  ", diagnostics.DiffScores.OrderBy(kv => (int)kv.Key).Select(kv => $"{kv.Key}={kv.Value:F3}"))
+                        : string.Empty;
+                    validationInfo =
+                        $"ok {diagnostics.SuccessfulPairs}/{diagnostics.TotalPairs} cand {diagnostics.AvgCandidateSurvival:F3} notes {diagnostics.AvgDecodeRate:F3}";
+                    validationDelta =
+                        $"chg {diagnostics.ChangedPairs}/{diagnostics.TotalPairs} up {diagnostics.ScoreImprovedPairs} dn {diagnostics.ScoreWorsenedPairs} dQ {diagnostics.AvgAbsScoreDelta:F4}";
                     if (diagnostics.RawIssueCounts.Count > 0)
                     {
                         string topRules = string.Join("  ",
@@ -759,10 +829,103 @@ public sealed class TrainingPipeline : IDisposable
                                 .OrderByDescending(kv => kv.Value)
                                 .Take(5)
                                 .Select(kv => $"{kv.Key}={kv.Value}"));
-                        Console.WriteLine($"[Training]   raw issue mix: {topRules}");
+                        if (dashboard is not null)
+                            dashboard.AddNotice($"Issues {topRules}");
+                        else
+                            Console.WriteLine($"[Training]   raw issue mix: {topRules}");
+                    }
+                    if (dashboard is null)
+                    {
+                        Console.WriteLine(
+                            $"[Training] Epoch {epoch + 1}/{options.Epochs}: " +
+                            $"loss={lossText}  plBCE={plBceText}  " +
+                            $"coreQ={coreQText}  " +
+                            $"fullQ={fullQText}  " +
+                            $"best={(bestQuality >= 0 ? bestQuality.ToString("F3") : "n/a")}  " +
+                            $"sm={(smoothedQuality >= 0 ? smoothedQuality.ToString("F3") : "n/a")}  lr={lr:G4}" +
+                            $"  lSlp={lossSlope:+0.0000;-0.0000}  qSlp={genQSlope:+0.0000;-0.0000}" +
+                            $"  train={trainSeconds:F1}s  val={valText}s  epoch={epochStopwatch.Elapsed.TotalSeconds:F1}s" +
+                            (activeValidationPairs > 0 ? $"  valPairs={activeValidationPairs}" : string.Empty) +
+                            (currentSyntheticSeqs.Count > 0 ? $"  synthEx={currentSyntheticSeqs.Sum(s => s.Count)}" : string.Empty) +
+                            statusTag);
+
+                        Console.WriteLine(
+                            $"[Training]   train mix: seq={epochMix.SequenceCount}  ex={epochMix.ExampleCount}  " +
+                            $"synthetic={(syntheticMerged ? "on" : "off")}  badNeg={(badNegativesMerged ? "on" : "off")}  {epochMix.Mix}");
+                        Console.WriteLine($"[Training]   validation stage: coreSongs={currentValidationPlan.CoreSongCount}  activeFullSongs={activeValidationSongs}/{currentValidationPlan.FullSongCap}");
+                        Console.WriteLine(
+                            $"[Training]   synthetic budget: enabled={options.EnableSyntheticTraining}  " +
+                            $"streak={stableSyntheticRefreshes}  " +
+                            $"seqCap={epochSyntheticBudget.MaxSequenceCount}  exCap={epochSyntheticBudget.MaxExampleCount}  " +
+                            $"frac={epochSyntheticBudget.FractionOfRealExamples:F3}");
+                        Console.WriteLine(
+                            $"[Training]   val diag: ok={diagnostics.SuccessfulPairs}/{diagnostics.TotalPairs}  " +
+                            $"coreOk={diagnostics.CoreSuccessfulPairs}/{Math.Max(1, diagnostics.CoreSuccessfulPairs + diagnostics.CoreFailedPairs)}  " +
+                            $"avgAll={diagnostics.AvgScoreAllPairs:F3}  cand->prop={diagnostics.AvgCandidateSurvival:F3}  " +
+                            $"rawQ={diagnostics.AvgRawScore:F3}  repairedQ={diagnostics.AvgRepairedScore:F3}  " +
+                            $"prop->notes={diagnostics.AvgDecodeRate:F3}  rawNotes={diagnostics.AvgRawNotes:F1}  repairedNotes={diagnostics.AvgRepairedNotes:F1}  " +
+                            $"repairs={diagnostics.AvgRepairCount:F1}  noteDelta={diagnostics.AvgRepairNoteDeltaRatio:F3}  " +
+                            $"newSynthEx={diagnostics.TotalSyntheticExamples}  synth/pair={diagnostics.AvgSyntheticExamplesPerAcceptedPair:F1}");
+                        Console.WriteLine($"[Training]   val notes by diff: {noteParts}");
+                        Console.WriteLine(
+                            $"[Training]   val shape: right={diagnostics.AvgRightHandFraction:F3}  " +
+                            $"dot={diagnostics.AvgDotFraction:F3}  chordBeats={diagnostics.AvgChordBeatFraction:F3}");
+                        Console.WriteLine(
+                            $"[Training]   val delta: changed={FormatCountComparison(diagnostics.ChangedPairs)}" +
+                            $"/{diagnostics.TotalPairs}  fpChanged={FormatCountComparison(diagnostics.FingerprintChangedPairs)}  " +
+                            $"notesChanged={FormatCountComparison(diagnostics.NoteCountChangedPairs)}  " +
+                            $"scoreUp={FormatCountComparison(diagnostics.ScoreImprovedPairs)}  " +
+                            $"scoreDown={FormatCountRegression(diagnostics.ScoreWorsenedPairs)}  " +
+                            $"|dScore|={FormatMovementMagnitude(diagnostics.AvgAbsScoreDelta, 0.0005, 0.0050, "F4")}  " +
+                            $"|dRawQ|={FormatMovementMagnitude(diagnostics.AvgAbsRawScoreDelta, 0.0005, 0.0050, "F4")}  " +
+                            $"|dNotes|={FormatMovementMagnitude(diagnostics.AvgAbsRawNoteDelta, 0.1, 2.0, "F1")}");
                     }
                 }
             }
+            else if (dashboard is null)
+            {
+                Console.WriteLine(
+                    $"[Training] Epoch {epoch + 1}/{options.Epochs}: " +
+                    $"loss={lossText}  plBCE={plBceText}  " +
+                    $"coreQ={coreQText}  " +
+                    $"fullQ={fullQText}  " +
+                    $"best={(bestQuality >= 0 ? bestQuality.ToString("F3") : "n/a")}  " +
+                    $"sm={(smoothedQuality >= 0 ? smoothedQuality.ToString("F3") : "n/a")}  lr={lr:G4}" +
+                    $"  lSlp={lossSlope:+0.0000;-0.0000}  qSlp={genQSlope:+0.0000;-0.0000}" +
+                    $"  train={trainSeconds:F1}s  val={valText}s  epoch={epochStopwatch.Elapsed.TotalSeconds:F1}s" +
+                    (activeValidationPairs > 0 ? $"  valPairs={activeValidationPairs}" : string.Empty) +
+                    (currentSyntheticSeqs.Count > 0 ? $"  synthEx={currentSyntheticSeqs.Sum(s => s.Count)}" : string.Empty) +
+                    statusTag);
+                Console.WriteLine(
+                    $"[Training]   train mix: seq={epochMix.SequenceCount}  ex={epochMix.ExampleCount}  " +
+                    $"synthetic={(syntheticMerged ? "on" : "off")}  badNeg={(badNegativesMerged ? "on" : "off")}  {epochMix.Mix}");
+            }
+
+            dashboard?.CompleteEpoch(new TrainingConsoleDashboard.EpochSummary(
+                Epoch: epoch + 1,
+                Epochs: options.Epochs,
+                ValidationRan: shouldRunValidation,
+                Loss: loss,
+                PlaceBce: plBce,
+                CoreQ: coreQualityScore,
+                FullQ: fullQualityScore,
+                BestQ: bestQuality,
+                SmoothedQ: smoothedQuality,
+                LearningRate: lr,
+                LossSlope: lossSlope,
+                QualitySlope: genQSlope,
+                TrainSeconds: trainSeconds,
+                ValidationSeconds: validationSeconds,
+                EpochSeconds: epochStopwatch.Elapsed.TotalSeconds,
+                ValidationPairs: activeValidationPairs,
+                SyntheticExamples: currentSyntheticSeqs.Sum(s => s.Count),
+                StagnationEpochs: stagnationEpochs,
+                EarlyStopPatience: options.EarlyStopPatience,
+                TrainMix: epochMix.Mix,
+                ValidationInfo: validationInfo,
+                ValidationDelta: validationDelta,
+                DiffScores: diffLine,
+                Status: isNewBest ? $"NEW BEST #{bestEpochNumber}" : (stagnationEpochs > 0 ? $"stagnation {stagnationEpochs}/{options.EarlyStopPatience}" : "running")));
 
             // ── Stagnation-driven LR reduction and early stop ────────────────────
             if (stagnationEpochs > 0)
@@ -771,8 +934,10 @@ public sealed class TrainingPipeline : IDisposable
                 if (options.CheckpointEveryNEpochs > 0
                     && (epoch + 1) % options.CheckpointEveryNEpochs == 0)
                 {
-                    Console.WriteLine(
-                        $"[Training] Checkpoint epoch {epoch + 1} — best so far: {bestQuality:F3}");
+                    if (dashboard is not null) dashboard.AddNotice($"Checkpoint marker epoch {epoch + 1}");
+                    else
+                        Console.WriteLine(
+                            $"[Training] Checkpoint epoch {epoch + 1} — best so far: {bestQuality:F3}");
                 }
 
                 // Reduce LR when stagnation counter hits the lr-patience threshold
@@ -780,8 +945,10 @@ public sealed class TrainingPipeline : IDisposable
                 {
                     lr = Math.Max(lr * LrDecay, MinLr);
                     lrReductions++;
-                    Console.WriteLine(
-                        $"[Training] Stagnation plateau — reducing lr to {lr:G4} (reduction #{lrReductions})");
+                    if (dashboard is not null) dashboard.AddNotice($"LR reduced to {lr:G4} (#{lrReductions})");
+                    else
+                        Console.WriteLine(
+                            $"[Training] Stagnation plateau — reducing lr to {lr:G4} (reduction #{lrReductions})");
                 }
 
                 if (options.EarlyStopPatience > 0 && stagnationEpochs >= options.EarlyStopPatience)
@@ -791,9 +958,12 @@ public sealed class TrainingPipeline : IDisposable
                         plateauRestartsUsed++;
                         double restartScale = Math.Clamp(options.PlateauRestartLrScale, 0.05, 0.95);
                         double restartedLr = Math.Max(lr * restartScale, MinLr);
-                        Console.WriteLine(
-                            $"[Training] Plateau detected at epoch {epoch + 1} — hot restart {plateauRestartsUsed}/{options.PlateauRestartCount} " +
-                            $"from best weights, lr {lr:G4} -> {restartedLr:G4}.");
+                        if (dashboard is not null)
+                            dashboard.AddNotice($"Hot restart {plateauRestartsUsed}/{options.PlateauRestartCount} lr {lr:G4}->{restartedLr:G4}");
+                        else
+                            Console.WriteLine(
+                                $"[Training] Plateau detected at epoch {epoch + 1} — hot restart {plateauRestartsUsed}/{options.PlateauRestartCount} " +
+                                $"from best weights, lr {lr:G4} -> {restartedLr:G4}.");
 
                         _placementTrainer.RestoreBestWeights();
                         _placementTrainer.SaveCurrentWeights(options.ArtifactsOutputPath);
@@ -815,10 +985,12 @@ public sealed class TrainingPipeline : IDisposable
                         continue;
                     }
 
-                    Console.WriteLine(
-                        $"[Training] Early stopping at epoch {epoch + 1} " +
-                        $"(stagnation for {options.EarlyStopPatience} epochs). " +
-                        $"Best genQuality={bestQuality:F3}");
+                    if (dashboard is not null) dashboard.AddNotice($"Early stop epoch {epoch + 1} best {bestQuality:F3}");
+                    else
+                        Console.WriteLine(
+                            $"[Training] Early stopping at epoch {epoch + 1} " +
+                            $"(stagnation for {options.EarlyStopPatience} epochs). " +
+                            $"Best genQuality={bestQuality:F3}");
                     break;
                 }
             }
@@ -857,9 +1029,15 @@ public sealed class TrainingPipeline : IDisposable
                 $"Recall={metrics.PlacementRecall:F3}");
         }
 
-        Console.WriteLine(
-            $"[Training] Done. Best generation quality={bestQuality:F3}. " +
-            $"Artifacts in '{options.ArtifactsOutputPath}'.");
+        if (dashboard is not null)
+            dashboard.MarkComplete($"Done. Best generation quality={bestQuality:F3}");
+        else
+            Console.WriteLine(
+                $"[Training] Done. Best generation quality={bestQuality:F3}. " +
+                $"Artifacts in '{options.ArtifactsOutputPath}'.");
+        dashboard?.Dispose();
+        _dashboard = null;
+        _placementTrainer.Dashboard = null;
     }
 
     // ----------------------------------------------------------------
@@ -999,9 +1177,12 @@ public sealed class TrainingPipeline : IDisposable
                         continue;
 
                     double elapsedSeconds = progressStopwatch.Elapsed.TotalSeconds;
-                    Console.WriteLine(
-                        $"[Training]   validation progress: {done}/{cachedPairs.Length} pair(s)  " +
-                        $"elapsed={elapsedSeconds:F0}s");
+                    if (_dashboard is not null)
+                        _dashboard.OnValidationProgress(done, cachedPairs.Length, elapsedSeconds);
+                    else
+                        Console.WriteLine(
+                            $"[Training]   validation progress: {done}/{cachedPairs.Length} pair(s)  " +
+                            $"elapsed={elapsedSeconds:F0}s");
                     break;
                 }
             });
@@ -1643,6 +1824,17 @@ public sealed class TrainingPipeline : IDisposable
         return new SyntheticBudget(seqCap, exampleCap, fraction, stableRefreshStreak);
     }
 
+    private static NegativeSupervisionBudget ComputeBadNegativeBudget(
+        IReadOnlyList<IReadOnlyList<TrainingExample>> realTrainSequences)
+    {
+        int realSeqCount = realTrainSequences.Count;
+        int realExampleCount = realTrainSequences.Sum(s => s.Count);
+        double fraction = 0.12;
+        int seqCap = Math.Max(8, realSeqCount / 10);
+        int exampleCap = Math.Max(256, (int)Math.Round(realExampleCount * fraction));
+        return new NegativeSupervisionBudget(seqCap, exampleCap, fraction);
+    }
+
     private static SequenceDifficultySnapshot SummarizeSequences(IReadOnlyList<IReadOnlyList<TrainingExample>> sequences)
     {
         var counts = Enum.GetValues<DifficultyLevel>()
@@ -1708,6 +1900,36 @@ public sealed class TrainingPipeline : IDisposable
             });
 
         return result;
+    }
+
+    private string[] ResolveMapFolders(string path, string ingestOutputPath, string logPrefix)
+    {
+        if (string.IsNullOrWhiteSpace(path) || !Directory.Exists(path) && !File.Exists(path))
+            return [];
+
+        if (IsMapFolder(path))
+        {
+            Console.WriteLine($"{logPrefix} Using single map folder '{path}'.");
+            return [path];
+        }
+
+        if (ContainsUnpackedMaps(path))
+        {
+            var folders = Directory.GetDirectories(path)
+                .Where(IsMapFolder)
+                .ToArray();
+            Console.WriteLine($"{logPrefix} Found {folders.Length} unpacked map folders in '{path}'.");
+            return folders;
+        }
+
+        Console.WriteLine($"{logPrefix} Ingesting map archives from '{path}'...");
+        var summary = _ingestion.IngestFolder(path, ingestOutputPath, path);
+        Console.WriteLine(
+            $"{logPrefix} Ingested {summary.Imported} maps, {summary.Skipped} skipped, " +
+            $"{summary.Malformed} malformed, {summary.Duplicate} duplicates.");
+        return Directory.Exists(ingestOutputPath)
+            ? Directory.GetDirectories(ingestOutputPath).Where(IsMapFolder).ToArray()
+            : [];
     }
 
     private static SplitPlan ResolveSplitPlan(int totalSongs, TrainingOptions options)
@@ -1952,6 +2174,96 @@ public sealed class TrainingPipeline : IDisposable
             localList => { lock (listLock) result.AddRange(localList); });
 
         return result;
+    }
+
+    private static IReadOnlyList<List<TrainingExample>> BuildNegativeExamplesFromFolders(
+        string[] folders,
+        object printLock,
+        ValidationAudioCache? audioCache,
+        double baseNegativeWeight)
+    {
+        var result = new List<List<TrainingExample>>();
+        var listLock = new object();
+
+        Parallel.ForEach(
+            folders,
+            new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount },
+            () => new List<List<TrainingExample>>(),
+            (folder, _, localSeqs) =>
+            {
+                try
+                {
+                    var maps = BeatmapImporter.Import(folder);
+                    if (maps.Count == 0)
+                        return localSeqs;
+
+                    string? audioPath = FindAudioFile(folder);
+                    AudioAnalysisResult? audio = null;
+                    if (audioPath != null)
+                    {
+                        audio = audioCache?.TryLoad(audioPath);
+                        if (audio is null)
+                        {
+                            audio = new AudioFeatureExtractor().Extract(audioPath);
+                            audioCache?.Store(audioPath, audio);
+                        }
+                    }
+
+                    var builder = new TrainingExampleBuilder();
+                    foreach (var map in maps)
+                    {
+                        var built = builder.Build(map, audio ?? MakeStubAudio(map));
+                        if (built.Count == 0)
+                            continue;
+
+                        var negativeSeq = built
+                            .Where(ex => ex.HasNote)
+                            .Select(ex => ex with
+                            {
+                                HasNote = false,
+                                NoteHand = -1,
+                                NoteLane = -1,
+                                NoteRow = -1,
+                                NoteCutDir = -1,
+                                Weight = ComputeBadNegativeWeight(ex, baseNegativeWeight)
+                            })
+                            .OrderBy(ex => ex.Beat)
+                            .ToList();
+
+                        if (negativeSeq.Count > 0)
+                            localSeqs.Add(negativeSeq);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    lock (printLock)
+                        Console.WriteLine($"[Training] Warning (bad-lib): '{folder}': {ex.Message}");
+                }
+
+                return localSeqs;
+            },
+            localSeqs =>
+            {
+                lock (listLock) result.AddRange(localSeqs);
+            });
+
+        return result;
+    }
+
+    private static double ComputeBadNegativeWeight(TrainingExample ex, double baseNegativeWeight)
+    {
+        double severity =
+            1.0 +
+            0.60 * Math.Clamp(ex.CurrentBeatVisionBlockRisk, 0.0, 1.0) +
+            0.50 * Math.Max(
+                Math.Clamp(ex.LeftParityBreakRate8, 0.0, 1.0),
+                Math.Clamp(ex.RightParityBreakRate8, 0.0, 1.0)) +
+            0.45 * Math.Clamp(ex.ResetPressure, 0.0, 1.0) +
+            0.35 * (1.0 - Math.Clamp(ex.RecentRestRatio8, 0.0, 1.0)) +
+            0.25 * Math.Clamp(ex.NotesAtCurrentBeatSoFar / 2.0, 0.0, 1.0) +
+            0.25 * Math.Clamp(ex.LocalNps / 8.0, 0.0, 1.0);
+
+        return Math.Clamp(baseNegativeWeight * severity, Math.Max(1.5, baseNegativeWeight), 8.5);
     }
 
     /// <summary>

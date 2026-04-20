@@ -112,6 +112,7 @@ rootCommand.Add(analyzeCmd);
 // -----------------------------------------------------------------------
 var trainCmd = new Command("train", "Train placement and attribute models from ingested corpus.");
 var trainDatasetOpt = new Option<string>("--dataset") { Description = "Path to dataset / library folder", Required = true };
+var trainBadLibOpt = new Option<string?>("--bad-lib") { Description = "Path to a separate library of explicitly bad maps used only for negative supervision" };
 var trainProfileOpt = new Option<string>("--profile") { Description = "Training profile name", DefaultValueFactory = _ => "baseline" };
 var trainArtifactsOpt = new Option<string>("--artifacts") { Description = "Artifacts output directory", DefaultValueFactory = _ => "artifacts" };
 var trainEpochsOpt = new Option<int>("--epochs") { Description = "Max training epochs", DefaultValueFactory = _ => 100 };
@@ -134,6 +135,7 @@ var trainCheckpointOpt = new Option<int>("--checkpoint-every") { Description = "
 var trainLrPatienceOpt = new Option<int>("--lr-patience") { Description = "Stagnation epochs before LR is reduced (0 = EarlyStopPatience / 5)", DefaultValueFactory = _ => 0 };
 var trainSeedOpt = new Option<long>("--seed") { Description = "Random seed for reproducible splits and shuffles", DefaultValueFactory = _ => 42L };
 trainCmd.Add(trainDatasetOpt);
+trainCmd.Add(trainBadLibOpt);
 trainCmd.Add(trainProfileOpt);
 trainCmd.Add(trainArtifactsOpt);
 trainCmd.Add(trainEpochsOpt);
@@ -163,6 +165,7 @@ trainCmd.SetAction((ParseResult pr) =>
         ConsoleStyler.Initialize(!pr.GetValue(noColorOpt));
         var options = new TrainingOptions(
             DatasetPath: pr.GetValue(trainDatasetOpt)!,
+            BadLibraryPath: pr.GetValue(trainBadLibOpt),
             ProfileName: pr.GetValue(trainProfileOpt)!,
             ArtifactsOutputPath: pr.GetValue(trainArtifactsOpt)!,
             Epochs: pr.GetValue(trainEpochsOpt),
