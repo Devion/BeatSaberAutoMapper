@@ -164,7 +164,10 @@ public sealed class TrainingPipeline : IDisposable
     {
         Guard.NotNull(options, nameof(options));
         Directory.CreateDirectory(options.ArtifactsOutputPath);
-        TrainingConsoleDashboard? dashboard = null;
+        TrainingConsoleDashboard? dashboard = TrainingConsoleDashboard.TryCreate();
+        _dashboard = dashboard;
+        _placementTrainer.Dashboard = dashboard;
+        dashboard?.OnStageStarted("startup", 1, "initializing training pipeline");
 
         // Warm-start from existing checkpoint
         var loadedCheckpointKind = _placementTrainer.TryLoadCheckpoint(options.ArtifactsOutputPath);
@@ -179,35 +182,46 @@ public sealed class TrainingPipeline : IDisposable
         // 1. Resolve map folders
         // ----------------------------------------------------------------
         string[] mapFolders;
+        dashboard?.OnStageStarted("dataset", 1, Path.GetFileName(options.DatasetPath));
 
         if (IsMapFolder(options.DatasetPath))
         {
             mapFolders = [options.DatasetPath];
-            Console.WriteLine($"[Training] Using single map folder '{options.DatasetPath}'.");
+            if (dashboard is not null) dashboard.AddNotice($"Dataset single folder {Path.GetFileName(options.DatasetPath)}");
+            else Console.WriteLine($"[Training] Using single map folder '{options.DatasetPath}'.");
         }
         else if (ContainsUnpackedMaps(options.DatasetPath))
         {
             mapFolders = Directory.GetDirectories(options.DatasetPath)
                 .Where(IsMapFolder).ToArray();
-            Console.WriteLine(
-                $"[Training] Found {mapFolders.Length} unpacked map folders in '{options.DatasetPath}'.");
+            if (dashboard is not null) dashboard.AddNotice($"Found {mapFolders.Length} unpacked map folders");
+            else
+                Console.WriteLine(
+                    $"[Training] Found {mapFolders.Length} unpacked map folders in '{options.DatasetPath}'.");
         }
         else
         {
             string libraryPath = Path.Combine(options.ArtifactsOutputPath, "library");
-            Console.WriteLine($"[Training] Ingesting corpus from '{options.DatasetPath}'...");
+            if (dashboard is not null) dashboard.OnStageStarted("ingest", 1, Path.GetFileName(options.DatasetPath));
+            else Console.WriteLine($"[Training] Ingesting corpus from '{options.DatasetPath}'...");
             var summary = _ingestion.IngestFolder(options.DatasetPath, libraryPath, options.DatasetPath);
-            Console.WriteLine(
-                $"[Training] Ingested {summary.Imported} maps, {summary.Skipped} skipped, " +
-                $"{summary.Malformed} malformed, {summary.Duplicate} duplicates.");
+            if (dashboard is not null)
+                dashboard.AddNotice(
+                    $"Ingested {summary.Imported} maps, skipped {summary.Skipped}, dup {summary.Duplicate}");
+            else
+                Console.WriteLine(
+                    $"[Training] Ingested {summary.Imported} maps, {summary.Skipped} skipped, " +
+                    $"{summary.Malformed} malformed, {summary.Duplicate} duplicates.");
 
             if (!Directory.Exists(libraryPath))
             {
-                Console.WriteLine("[Training] No maps found.");
+                if (dashboard is not null) dashboard.AddNotice("No maps found");
+                else Console.WriteLine("[Training] No maps found.");
                 return;
             }
             mapFolders = Directory.GetDirectories(libraryPath);
         }
+        dashboard?.OnStageProgress(1, 1, 0, $"{mapFolders.Length} map folder(s)");
 
         // ----------------------------------------------------------------
         // 2. Song-level train / val / test split
@@ -215,12 +229,14 @@ public sealed class TrainingPipeline : IDisposable
         //    one map folder and all its difficulties stay in exactly one split.
         // ----------------------------------------------------------------
         int totalSongs = mapFolders.Length;
-        var folderInfos = InspectSongFolders(mapFolders);
+        dashboard?.OnStageStarted("inspect", mapFolders.Length, "reading song difficulties");
+        var folderInfos = InspectSongFolders(mapFolders, dashboard);
         var splitPlan = ResolveSplitPlan(totalSongs, options);
 
         if (splitPlan.TrainSongs <= 0)
         {
-            Console.WriteLine("[Training] Not enough songs to split into train / val / test. Aborting.");
+            if (dashboard is not null) dashboard.AddNotice("Not enough songs to split train/val/test");
+            else Console.WriteLine("[Training] Not enough songs to split into train / val / test. Aborting.");
             return;
         }
 
@@ -235,26 +251,40 @@ public sealed class TrainingPipeline : IDisposable
             testFoldersRaw);
 
         foreach (string move in coverageMoves)
-            Console.WriteLine($"[Training] Coverage fix: {move}");
+            if (dashboard is not null) dashboard.AddNotice($"Coverage fix: {move}");
+            else Console.WriteLine($"[Training] Coverage fix: {move}");
 
-        Console.WriteLine(
-            $"[Training] Split: {trainFolders.Length} train / " +
-            $"{valFolders.Length} val / {testFolders.Length} test songs " +
-            $"(total {totalSongs}, val-songs/epoch={splitPlan.ValidationSongsPerEpoch}, " +
-            $"validation-cache-size={splitPlan.ValidationCachePoolSize}).");
+        if (dashboard is not null)
+        {
+            dashboard.AddNotice(
+                $"Split {trainFolders.Length} train / {valFolders.Length} val / {testFolders.Length} test");
+            dashboard.AddNotice(
+                $"Mix train[{FormatDifficultyMix(trainFolders)}] val[{FormatDifficultyMix(valFolders)}]");
+        }
+        else
+        {
+            Console.WriteLine(
+                $"[Training] Split: {trainFolders.Length} train / " +
+                $"{valFolders.Length} val / {testFolders.Length} test songs " +
+                $"(total {totalSongs}, val-songs/epoch={splitPlan.ValidationSongsPerEpoch}, " +
+                $"validation-cache-size={splitPlan.ValidationCachePoolSize}).");
 
-        Console.WriteLine(
-            $"[Training] Difficulty mix: train[{FormatDifficultyMix(trainFolders)}]  " +
-            $"val[{FormatDifficultyMix(valFolders)}]  " +
-            $"test[{FormatDifficultyMix(testFolders)}]");
+            Console.WriteLine(
+                $"[Training] Difficulty mix: train[{FormatDifficultyMix(trainFolders)}]  " +
+                $"val[{FormatDifficultyMix(valFolders)}]  " +
+                $"test[{FormatDifficultyMix(testFolders)}]");
+        }
 
         // ----------------------------------------------------------------
         // 3. Build training examples — parallel across trainFolders only
         // Each (folder, difficulty) pair becomes one sequence (beat-ordered).
         // ----------------------------------------------------------------
-        Console.WriteLine(
-            $"[Training] Analysing audio + building examples from {trainFolders.Length} train folders " +
-            $"using {Environment.ProcessorCount} threads (audio cached to disk)...");
+        if (dashboard is not null)
+            dashboard.OnStageStarted("train-audio", trainFolders.Length, "analysing audio + building examples");
+        else
+            Console.WriteLine(
+                $"[Training] Analysing audio + building examples from {trainFolders.Length} train folders " +
+                $"using {Environment.ProcessorCount} threads (audio cached to disk)...");
 
         var allSequences   = new List<List<TrainingExample>>();
         var printLock      = new object();
@@ -319,11 +349,20 @@ public sealed class TrainingPipeline : IDisposable
                     double eta     = n < trainFolders.Length && elapsed > 0
                         ? elapsed / n * (trainFolders.Length - n) : 0;
                     lock (printLock)
-                        Console.WriteLine(
-                            $"[Training]   {n}/{trainFolders.Length} folders " +
-                            $"({100.0 * n / trainFolders.Length:F0}%)" +
-                            $" — {elapsed:F0}s elapsed" +
-                            (eta > 1 ? $", ~{eta:F0}s remaining" : string.Empty));
+                    {
+                        if (dashboard is not null)
+                            dashboard.OnStageProgress(
+                                n,
+                                trainFolders.Length,
+                                elapsed,
+                                Path.GetFileName(folder));
+                        else
+                            Console.WriteLine(
+                                $"[Training]   {n}/{trainFolders.Length} folders " +
+                                $"({100.0 * n / trainFolders.Length:F0}%)" +
+                                $" — {elapsed:F0}s elapsed" +
+                                (eta > 1 ? $", ~{eta:F0}s remaining" : string.Empty));
+                    }
                 }
 
                 return localSeqs;
@@ -334,8 +373,11 @@ public sealed class TrainingPipeline : IDisposable
             });
 
         int totalExamples = allSequences.Sum(s => s.Count);
-        Console.WriteLine(
-            $"[Training] Built {totalExamples} training examples in {allSequences.Count} sequences.");
+        if (dashboard is not null)
+            dashboard.AddNotice($"Built {totalExamples} train examples in {allSequences.Count} sequences");
+        else
+            Console.WriteLine(
+                $"[Training] Built {totalExamples} training examples in {allSequences.Count} sequences.");
         if (allSequences.Count == 0) return;
 
         var trainSeqs = allSequences;
@@ -354,13 +396,17 @@ public sealed class TrainingPipeline : IDisposable
 
             if (badFolders.Length > 0)
             {
-                Console.WriteLine(
-                    $"[Training] Building explicit negative supervision from {badFolders.Length} bad-map folders...");
+                if (dashboard is not null)
+                    dashboard.OnStageStarted("bad-lib", badFolders.Length, "building negative supervision");
+                else
+                    Console.WriteLine(
+                        $"[Training] Building explicit negative supervision from {badFolders.Length} bad-map folders...");
                 badNegativeSeqs = BuildNegativeExamplesFromFolders(
                     badFolders,
                     printLock,
                     trainAudioCache,
-                    options.SelfSupervisedNegativeWeight).ToList();
+                    options.SelfSupervisedNegativeWeight,
+                    dashboard).ToList();
 
                 var badSnapshot = SummarizeSequences(badNegativeSeqs);
                 var badBudget = ComputeBadNegativeBudget(trainSeqs);
@@ -413,9 +459,12 @@ public sealed class TrainingPipeline : IDisposable
             int valDone     = 0;
             var valStopwatch = Stopwatch.StartNew();
 
-            Console.WriteLine(
-                $"[Training] Analysing {poolGroups.Count} validation songs " +
-                $"(cached in '{options.ArtifactsOutputPath}')...");
+            if (dashboard is not null)
+                dashboard.OnStageStarted("val-audio", poolGroups.Count, "warming validation audio cache");
+            else
+                Console.WriteLine(
+                    $"[Training] Analysing {poolGroups.Count} validation songs " +
+                    $"(cached in '{options.ArtifactsOutputPath}')...");
 
             Parallel.For(0, poolGroups.Count,
                 new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount },
@@ -455,12 +504,21 @@ public sealed class TrainingPipeline : IDisposable
                         double eta     = n < poolGroups.Count && elapsed > 0
                             ? elapsed / n * (poolGroups.Count - n) : 0;
                         lock (printLock)
-                            Console.WriteLine(
-                                $"[Training]   Val {n}/{poolGroups.Count}" +
-                                $" — {Path.GetFileName(group.AudioPath)}" +
-                                $" [{(hit ? "cache" : "fresh")}]" +
-                                $" {elapsed:F0}s elapsed" +
-                                (eta > 1 ? $" ~{eta:F0}s remaining" : string.Empty));
+                        {
+                            if (dashboard is not null)
+                                dashboard.OnStageProgress(
+                                    n,
+                                    poolGroups.Count,
+                                    elapsed,
+                                    $"{Path.GetFileName(group.AudioPath)} [{(hit ? "cache" : "fresh")}]");
+                            else
+                                Console.WriteLine(
+                                    $"[Training]   Val {n}/{poolGroups.Count}" +
+                                    $" — {Path.GetFileName(group.AudioPath)}" +
+                                    $" [{(hit ? "cache" : "fresh")}]" +
+                                    $" {elapsed:F0}s elapsed" +
+                                    (eta > 1 ? $" ~{eta:F0}s remaining" : string.Empty));
+                        }
                     }
                 });
 
@@ -492,9 +550,6 @@ public sealed class TrainingPipeline : IDisposable
         // ----------------------------------------------------------------
         // 5. Placement model — epoch loop with shuffle + parallel mini-batch GD
         // ----------------------------------------------------------------
-        dashboard = TrainingConsoleDashboard.TryCreate();
-        _dashboard = dashboard;
-        _placementTrainer.Dashboard = dashboard;
         double lr = loadedCheckpointKind switch
         {
             TorchPlacementTrainer.LoadedCheckpointKind.Current => options.InitialLearningRate,
@@ -1875,9 +1930,13 @@ public sealed class TrainingPipeline : IDisposable
             throw new InvalidOperationException("Training epoch contains no examples.");
     }
 
-    private static SongFolderInfo[] InspectSongFolders(IReadOnlyList<string> folders)
+    private static SongFolderInfo[] InspectSongFolders(
+        IReadOnlyList<string> folders,
+        TrainingConsoleDashboard? dashboard = null)
     {
         var result = new SongFolderInfo[folders.Count];
+        int done = 0;
+        var stopwatch = Stopwatch.StartNew();
 
         Parallel.For(0, folders.Count,
             new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount },
@@ -1897,6 +1956,19 @@ public sealed class TrainingPipeline : IDisposable
                 {
                     result[i] = new SongFolderInfo(folder, []);
                 }
+
+                if (dashboard is not null)
+                {
+                    int completed = Interlocked.Increment(ref done);
+                    if (completed % 25 == 0 || completed == folders.Count)
+                    {
+                        dashboard.OnStageProgress(
+                            completed,
+                            folders.Count,
+                            stopwatch.Elapsed.TotalSeconds,
+                            Path.GetFileName(folder));
+                    }
+                }
             });
 
         return result;
@@ -1909,7 +1981,8 @@ public sealed class TrainingPipeline : IDisposable
 
         if (IsMapFolder(path))
         {
-            Console.WriteLine($"{logPrefix} Using single map folder '{path}'.");
+            if (_dashboard is not null) _dashboard.AddNotice($"{logPrefix} single folder {Path.GetFileName(path)}");
+            else Console.WriteLine($"{logPrefix} Using single map folder '{path}'.");
             return [path];
         }
 
@@ -1918,15 +1991,21 @@ public sealed class TrainingPipeline : IDisposable
             var folders = Directory.GetDirectories(path)
                 .Where(IsMapFolder)
                 .ToArray();
-            Console.WriteLine($"{logPrefix} Found {folders.Length} unpacked map folders in '{path}'.");
+            if (_dashboard is not null) _dashboard.AddNotice($"{logPrefix} found {folders.Length} unpacked folders");
+            else Console.WriteLine($"{logPrefix} Found {folders.Length} unpacked map folders in '{path}'.");
             return folders;
         }
 
-        Console.WriteLine($"{logPrefix} Ingesting map archives from '{path}'...");
+        if (_dashboard is not null) _dashboard.OnStageStarted("ingest", 1, Path.GetFileName(path));
+        else Console.WriteLine($"{logPrefix} Ingesting map archives from '{path}'...");
         var summary = _ingestion.IngestFolder(path, ingestOutputPath, path);
-        Console.WriteLine(
-            $"{logPrefix} Ingested {summary.Imported} maps, {summary.Skipped} skipped, " +
-            $"{summary.Malformed} malformed, {summary.Duplicate} duplicates.");
+        if (_dashboard is not null)
+            _dashboard.AddNotice(
+                $"{logPrefix} ingested {summary.Imported}, skipped {summary.Skipped}, dup {summary.Duplicate}");
+        else
+            Console.WriteLine(
+                $"{logPrefix} Ingested {summary.Imported} maps, {summary.Skipped} skipped, " +
+                $"{summary.Malformed} malformed, {summary.Duplicate} duplicates.");
         return Directory.Exists(ingestOutputPath)
             ? Directory.GetDirectories(ingestOutputPath).Where(IsMapFolder).ToArray()
             : [];
@@ -2180,10 +2259,13 @@ public sealed class TrainingPipeline : IDisposable
         string[] folders,
         object printLock,
         ValidationAudioCache? audioCache,
-        double baseNegativeWeight)
+        double baseNegativeWeight,
+        TrainingConsoleDashboard? dashboard = null)
     {
         var result = new List<List<TrainingExample>>();
         var listLock = new object();
+        int done = 0;
+        var stopwatch = Stopwatch.StartNew();
 
         Parallel.ForEach(
             folders,
@@ -2237,7 +2319,22 @@ public sealed class TrainingPipeline : IDisposable
                 catch (Exception ex)
                 {
                     lock (printLock)
-                        Console.WriteLine($"[Training] Warning (bad-lib): '{folder}': {ex.Message}");
+                    {
+                        if (dashboard is null)
+                            Console.WriteLine($"[Training] Warning (bad-lib): '{folder}': {ex.Message}");
+                        else
+                            dashboard.AddNotice($"Bad-lib warning {Path.GetFileName(folder)}");
+                    }
+                }
+
+                int completed = Interlocked.Increment(ref done);
+                if (dashboard is not null && (completed % 25 == 0 || completed == folders.Length))
+                {
+                    dashboard.OnStageProgress(
+                        completed,
+                        folders.Length,
+                        stopwatch.Elapsed.TotalSeconds,
+                        Path.GetFileName(folder));
                 }
 
                 return localSeqs;
