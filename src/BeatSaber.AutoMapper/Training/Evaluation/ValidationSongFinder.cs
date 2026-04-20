@@ -55,6 +55,11 @@ public sealed class ValidationSongFinder
                 // maxSongs limits unique songs; total pairs may be 2-4× higher.
                 var diffs = maps
                     .Where(m => m.Notes.Count >= 20)
+                    .GroupBy(BuildDifficultyKey, StringComparer.OrdinalIgnoreCase)
+                    .Select(g => g
+                        .OrderByDescending(m => m.Notes.Count)
+                        .ThenByDescending(m => m.Obstacles.Count)
+                        .First())
                     .OrderByDescending(m => (int)m.Difficulty.Difficulty)
                     .ToList();
 
@@ -100,5 +105,13 @@ public sealed class ValidationSongFinder
         }
 
         return null;
+    }
+
+    private static string BuildDifficultyKey(CanonicalBeatmap map)
+    {
+        string customLabel = string.IsNullOrWhiteSpace(map.Difficulty.CustomLabel)
+            ? "-"
+            : map.Difficulty.CustomLabel.Trim();
+        return $"{map.Difficulty.Characteristic}|{map.Difficulty.Difficulty}|{customLabel}";
     }
 }

@@ -16,7 +16,9 @@ public sealed class MapGenerationService
         int CandidateCount,
         int ProposedCount,
         int DecodedNoteCount,
-        int RepairedNoteCount);
+        int RepairedNoteCount,
+        int RepairCount,
+        double RepairNoteDeltaRatio);
 
     private readonly AudioFeatureExtractor _audioExtractor = new();
     private readonly TimingGridBuilder     _gridBuilder    = new();
@@ -27,9 +29,11 @@ public sealed class MapGenerationService
     private readonly RepairEngine           _repair        = new();
 
     public sealed record GenerationResult(
+        CanonicalBeatmap RawBeatmap,
         CanonicalBeatmap Beatmap,
         AudioAnalysisResult AudioAnalysis,
         ValidationReport ValidationReport,
+        ValidationReport FinalValidationReport,
         RepairEngine.RepairResult RepairResult,
         GenerationTelemetry Telemetry
     );
@@ -157,7 +161,7 @@ public sealed class MapGenerationService
             NoteJumpStartBeatOffset:     0.0,
             CustomLabel:                 null);
 
-        var beatmap = new CanonicalBeatmap
+        var rawBeatmap = new CanonicalBeatmap
         {
             Song         = song,
             Difficulty   = difficulty,
@@ -168,18 +172,26 @@ public sealed class MapGenerationService
             Sections     = audio.Sections
         };
 
-        var validationReport = _validator.Validate(beatmap);
-        var repairResult     = _repair.Repair(beatmap);
+        var validationReport = _validator.Validate(rawBeatmap);
+        var repairResult     = _repair.Repair(rawBeatmap);
+        var finalValidationReport = repairResult.FinalReport;
+        double repairNoteDeltaRatio = notes.Count > 0
+            ? Math.Abs(repairResult.RepairedBeatmap.Notes.Count - notes.Count) / (double)notes.Count
+            : (repairResult.RepairedBeatmap.Notes.Count > 0 ? 1.0 : 0.0);
         var telemetry = new GenerationTelemetry(
             CandidateCount: grid.Length,
             ProposedCount: proposed.Count,
             DecodedNoteCount: notes.Count,
-            RepairedNoteCount: repairResult.RepairedBeatmap.Notes.Count);
+            RepairedNoteCount: repairResult.RepairedBeatmap.Notes.Count,
+            RepairCount: repairResult.AppliedRepairs.Count,
+            RepairNoteDeltaRatio: repairNoteDeltaRatio);
 
         return new GenerationResult(
+            rawBeatmap,
             repairResult.RepairedBeatmap,
             audio,
             validationReport,
+            finalValidationReport,
             repairResult,
             telemetry);
     }

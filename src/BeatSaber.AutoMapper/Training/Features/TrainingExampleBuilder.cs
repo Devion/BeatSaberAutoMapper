@@ -12,7 +12,7 @@ namespace BeatSaber.AutoMapper.Training.Features;
 ///   [20-27] Section type one-hot (Intro/Verse/Chorus/Bridge/Buildup/Drop/Outro/Unknown)
 ///   [28-30] Context (difficulty, local NPS, bar position)
 ///   [31-44] Previous placement (teacher-forced: has-note, hand, L lane/row/dir, R lane/row/dir, parity, beats-since)
-///   [45-67] Phrase, rhythm-history, geometry, and comfort features.
+///   [45-77] Phrase, rhythm-history, geometry, and comfort features.
 /// </summary>
 public sealed record TrainingExample(
     double Beat,
@@ -88,7 +88,17 @@ public sealed record TrainingExample(
     double LeftRecentTravel = 0,
     double RightRecentTravel = 0,
     double RecentLaneSpan4 = 0,
-    double RecentRowSpan4 = 0
+    double RecentRowSpan4 = 0,
+    double PhraseBeatPhase32 = 0,
+    double PhraseProgress32 = 0,
+    double BeatsSincePhraseStart32 = 0,
+    double BeatsToPhraseBoundary32 = 32,
+    double CurrentBeatVisionBlockRisk = 0,
+    double RecentVisionBlockRate8 = 0,
+    double LeftParityBreakRate8 = 0,
+    double RightParityBreakRate8 = 0,
+    double ResetPressure = 0,
+    double RecentRestRatio8 = 0
 );
 
 public sealed class TrainingExampleBuilder
@@ -188,6 +198,15 @@ public sealed class TrainingExampleBuilder
             double rightRecentTravel = MappingFeatureEngineering.RecentTravel(prev2Right, lastRight);
             double recentLaneSpan4 = MappingFeatureEngineering.RecentLaneSpan(history, beat, 4.0);
             double recentRowSpan4 = MappingFeatureEngineering.RecentRowSpan(history, beat, 4.0);
+            double phraseBeatPhase32 = beat % 32.0;
+            double phraseProgress32 = phraseBeatPhase32 / 32.0;
+            double beatsSincePhraseStart32 = phraseBeatPhase32;
+            double beatsToPhraseBoundary32 = 32.0 - phraseBeatPhase32;
+            double currentBeatVisionBlockRisk = MappingFeatureEngineering.CurrentBeatVisionBlockRisk(history, beat);
+            double recentVisionBlockRate8 = MappingFeatureEngineering.RecentVisionBlockRate(history, beat, 8.0);
+            double leftParityBreakRate8 = MappingFeatureEngineering.RecentParityBreakRate(history, NoteHand.Left, 8);
+            double rightParityBreakRate8 = MappingFeatureEngineering.RecentParityBreakRate(history, NoteHand.Right, 8);
+            double recentRestRatio8 = MappingFeatureEngineering.RecentRestRatio(history, beat, 8.0);
 
             var notesAtBeat = beatmap.Notes
                 .Where(n => Math.Abs(n.Beat - beat) < 0.13)
@@ -201,6 +220,9 @@ public sealed class TrainingExampleBuilder
                 double rightParity = ParityStateFromCutDir(lastRight?.CutDirection);
                 double beatsL = lastLeft  is not null ? beat - lastLeft.Beat  : 999;
                 double beatsR = lastRight is not null ? beat - lastRight.Beat : 999;
+                double resetPressure = Math.Max(
+                    MappingFeatureEngineering.ImmediateResetPressure(lastLeft, beat, beatmap.Difficulty.Difficulty),
+                    MappingFeatureEngineering.ImmediateResetPressure(lastRight, beat, beatmap.Difficulty.Difficulty));
 
                 examples.Add(new TrainingExample(
                     Beat:                   beat,
@@ -266,7 +288,17 @@ public sealed class TrainingExampleBuilder
                     LeftRecentTravel:       leftRecentTravel,
                     RightRecentTravel:      rightRecentTravel,
                     RecentLaneSpan4:        recentLaneSpan4,
-                    RecentRowSpan4:         recentRowSpan4
+                    RecentRowSpan4:         recentRowSpan4,
+                    PhraseBeatPhase32:      phraseBeatPhase32,
+                    PhraseProgress32:       phraseProgress32,
+                    BeatsSincePhraseStart32: beatsSincePhraseStart32,
+                    BeatsToPhraseBoundary32: beatsToPhraseBoundary32,
+                    CurrentBeatVisionBlockRisk: currentBeatVisionBlockRisk,
+                    RecentVisionBlockRate8: recentVisionBlockRate8,
+                    LeftParityBreakRate8: leftParityBreakRate8,
+                    RightParityBreakRate8: rightParityBreakRate8,
+                    ResetPressure: resetPressure,
+                    RecentRestRatio8: recentRestRatio8
                 ));
                 continue;
             }
@@ -277,6 +309,9 @@ public sealed class TrainingExampleBuilder
                 double rightParity = ParityStateFromCutDir(lastRight?.CutDirection);
                 double beatsL = lastLeft  is not null ? beat - lastLeft.Beat  : 999;
                 double beatsR = lastRight is not null ? beat - lastRight.Beat : 999;
+                double resetPressure = Math.Max(
+                    MappingFeatureEngineering.ImmediateResetPressure(lastLeft, beat, beatmap.Difficulty.Difficulty),
+                    MappingFeatureEngineering.ImmediateResetPressure(lastRight, beat, beatmap.Difficulty.Difficulty));
                 int noteHand = note.Hand == NoteHand.Left ? 0 : 1;
 
                 examples.Add(new TrainingExample(
@@ -343,7 +378,17 @@ public sealed class TrainingExampleBuilder
                     LeftRecentTravel:       leftRecentTravel,
                     RightRecentTravel:      rightRecentTravel,
                     RecentLaneSpan4:        recentLaneSpan4,
-                    RecentRowSpan4:         recentRowSpan4
+                    RecentRowSpan4:         recentRowSpan4,
+                    PhraseBeatPhase32:      phraseBeatPhase32,
+                    PhraseProgress32:       phraseProgress32,
+                    BeatsSincePhraseStart32: beatsSincePhraseStart32,
+                    BeatsToPhraseBoundary32: beatsToPhraseBoundary32,
+                    CurrentBeatVisionBlockRisk: currentBeatVisionBlockRisk,
+                    RecentVisionBlockRate8: recentVisionBlockRate8,
+                    LeftParityBreakRate8: leftParityBreakRate8,
+                    RightParityBreakRate8: rightParityBreakRate8,
+                    ResetPressure: resetPressure,
+                    RecentRestRatio8: recentRestRatio8
                 ));
 
                 history.Add(note);

@@ -133,5 +133,15 @@ public sealed class EvaluationRunner
         RightRecentTravel = ex.RightRecentTravel,
         RecentLaneSpan4 = ex.RecentLaneSpan4,
         RecentRowSpan4 = ex.RecentRowSpan4,
+        PhraseBeatPhase32 = ex.PhraseBeatPhase32,
+        PhraseProgress32 = ex.PhraseProgress32,
+        BeatsSincePhraseStart32 = ex.BeatsSincePhraseStart32,
+        BeatsToPhraseBoundary32 = ex.BeatsToPhraseBoundary32,
+        CurrentBeatVisionBlockRisk = ex.CurrentBeatVisionBlockRisk,
+        RecentVisionBlockRate8 = ex.RecentVisionBlockRate8,
+        LeftParityBreakRate8 = ex.LeftParityBreakRate8,
+        RightParityBreakRate8 = ex.RightParityBreakRate8,
+        ResetPressure = ex.ResetPressure,
+        RecentRestRatio8 = ex.RecentRestRatio8,
     };
 }

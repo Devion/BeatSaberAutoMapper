@@ -1,3 +1,4 @@
+using BeatSaber.AutoMapper.Canonical;
 using BeatSaber.AutoMapper.Beatmap.Raw;
 
 namespace BeatSaber.AutoMapper.Beatmap;
@@ -12,6 +13,8 @@ public sealed class BeatmapExporter
         WriteIndented = true,
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase
     };
+
+    private sealed record BasicLightEvent(double Beat, int EventType, int Value, int FloatValue = 1);
 
     // Info.dat uses v2 underscore keys; explicit attrs already set them – no naming policy needed.
     private static readonly JsonSerializerOptions _infoOpts = new() { WriteIndented = true };
@@ -108,10 +111,95 @@ public sealed class BeatmapExporter
             BpmEvents = beatmap.TimingPoints
                 .Where(tp => tp.Beat > 0)
                 .Select(tp => new V3BpmChange { Beat = tp.Beat, Bpm = tp.BeatsPerMinute })
-                .ToList()
+                .ToList(),
+            BasicBeatmapEvents = GenerateBasicLightEvents(beatmap),
+            UseNormalEventsAsCompatibleEvents = true
         };
 
         return JsonSerializer.Serialize(v3, _writeOpts);
+    }
+
+    private static List<JsonElement> GenerateBasicLightEvents(CanonicalBeatmap beatmap)
+    {
+        if (beatmap.Notes.Count == 0)
+            return [];
+
+        var events = new List<BasicLightEvent>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+
+        static bool IsNearInteger(double beat) => Math.Abs(beat - Math.Round(beat)) < 0.01;
+        static int ColorValueForBeat(double beat) => ((int)Math.Round(beat / 4.0) % 2 == 0) ? 1 : 5;
+
+        void AddPulse(double beat, int eventType, int colorValue, double durationBeats)
+        {
+            string onKey = $"{Math.Round(beat, 3):F3}|{eventType}|{colorValue}";
+            if (seen.Add(onKey))
+                events.Add(new BasicLightEvent(Math.Round(beat, 3), eventType, colorValue));
+
+            double offBeat = Math.Round(beat + durationBeats, 3);
+            string offKey = $"{offBeat:F3}|{eventType}|0";
+            if (seen.Add(offKey))
+                events.Add(new BasicLightEvent(offBeat, eventType, 0));
+        }
+
+        foreach (var section in beatmap.Sections)
+        {
+            double beat = Math.Round(beatmap.SecondsToBeat(section.TimeSeconds));
+            if (beat < 0)
+                continue;
+
+            int colorValue = ColorValueForBeat(beat);
+            AddPulse(beat, eventType: 4, colorValue, durationBeats: 1.0);
+            AddPulse(beat, eventType: 0, colorValue, durationBeats: 0.75);
+        }
+
+        double lastSideAccentBeat = double.NegativeInfinity;
+        foreach (var group in beatmap.Notes
+                     .GroupBy(n => Math.Round(n.Beat, 2))
+                     .OrderBy(g => g.Key))
+        {
+            double beat = group.Key;
+            int noteCount = group.Count();
+            bool integerBeat = IsNearInteger(beat);
+            bool downbeat = integerBeat && ((int)Math.Round(beat) % 4 == 0);
+            bool phraseStart = integerBeat && ((int)Math.Round(beat) % 32 == 0);
+            int colorValue = ColorValueForBeat(beat);
+
+            if (phraseStart)
+            {
+                AddPulse(beat, eventType: 4, colorValue, durationBeats: 1.0);
+                AddPulse(beat, eventType: 1, colorValue, durationBeats: 0.75);
+            }
+            else if (downbeat)
+            {
+                AddPulse(beat, eventType: 0, colorValue, durationBeats: 0.5);
+                AddPulse(beat, eventType: 1, colorValue, durationBeats: 0.5);
+            }
+            else if (integerBeat && ((int)Math.Round(beat) % 2 == 0) && noteCount > 0)
+            {
+                AddPulse(beat, eventType: 0, colorValue, durationBeats: 0.35);
+            }
+
+            bool denseAccent = noteCount >= 2 || group.Any(n => n.CutDirection == CutDirection.Dot);
+            if (denseAccent && beat - lastSideAccentBeat >= 1.0)
+            {
+                bool preferLeft = group.Count(n => n.Hand == NoteHand.Left) >= group.Count(n => n.Hand == NoteHand.Right);
+                AddPulse(beat, eventType: preferLeft ? 2 : 3, colorValue, durationBeats: 0.35);
+                lastSideAccentBeat = beat;
+            }
+        }
+
+        return events
+            .OrderBy(e => e.Beat)
+            .ThenBy(e => e.EventType)
+            .Select(e => JsonSerializer.SerializeToElement(new
+            {
+                b = e.Beat,
+                et = e.EventType,
+                i = e.Value,
+                f = e.FloatValue
+            }))
+            .ToList();
     }
 
     private static int DifficultyToRank(DifficultyLevel d) => d switch

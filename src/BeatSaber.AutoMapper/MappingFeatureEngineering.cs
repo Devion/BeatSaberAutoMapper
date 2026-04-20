@@ -101,6 +101,25 @@ internal static class MappingFeatureEngineering
     public static double BeatsSinceLastAny(IReadOnlyList<CanonicalNote> history, double beat) =>
         history.Count == 0 ? 999 : Math.Max(0, beat - history[^1].Beat);
 
+    public static double RecentRestRatio(IReadOnlyList<CanonicalNote> history, double beat, double windowBeats, double stepBeats = 0.25)
+    {
+        if (windowBeats <= 0 || stepBeats <= 0)
+            return 0.0;
+
+        int totalSlots = 0;
+        int emptySlots = 0;
+        double start = Math.Max(0.0, beat - windowBeats);
+        for (double b = start; b < beat; b += stepBeats)
+        {
+            totalSlots++;
+            bool hasNote = history.Any(n => Math.Abs(n.Beat - b) < 0.001);
+            if (!hasNote)
+                emptySlots++;
+        }
+
+        return totalSlots > 0 ? Math.Clamp(emptySlots / (double)totalSlots, 0.0, 1.0) : 0.0;
+    }
+
     public static double NotesAtCurrentBeatSoFar(IReadOnlyList<CanonicalNote> history, double beat) =>
         history.Count(n => Math.Abs(n.Beat - beat) < 0.001);
 
@@ -131,6 +150,96 @@ internal static class MappingFeatureEngineering
         var recent = history.Where(n => n.Beat >= beat - windowBeats && n.Beat < beat).ToList();
         if (recent.Count == 0) return 0;
         return recent.Max(n => n.Row) - recent.Min(n => n.Row);
+    }
+
+    public static double CurrentBeatVisionBlockRisk(IReadOnlyList<CanonicalNote> history, double beat)
+    {
+        var notesAtBeat = history
+            .Where(n => Math.Abs(n.Beat - beat) < 0.001)
+            .ToList();
+        if (notesAtBeat.Count == 0)
+            return 0.0;
+
+        bool centerOccupied = notesAtBeat.Any(n => n.Lane is 1 or 2);
+        bool stackedCenter = notesAtBeat
+            .GroupBy(n => n.Lane)
+            .Any(g => (g.Key is 1 or 2) && g.Select(n => n.Row).Distinct().Count() > 1);
+
+        if (stackedCenter)
+            return 1.0;
+        if (centerOccupied)
+            return 0.6;
+        return 0.2;
+    }
+
+    public static double RecentVisionBlockRate(IReadOnlyList<CanonicalNote> history, double beat, double windowBeats)
+    {
+        var recent = history.Where(n => n.Beat >= beat - windowBeats && n.Beat < beat).ToList();
+        if (recent.Count < 2)
+            return 0.0;
+
+        int blockedBeats = recent
+            .GroupBy(n => Math.Round(n.Beat, 3))
+            .Count(g =>
+            {
+                var notes = g.ToList();
+                for (int i = 0; i < notes.Count; i++)
+                for (int j = i + 1; j < notes.Count; j++)
+                    if (Validation.PlayabilityHeuristics.IsVisionBlock(notes[i], notes[j]))
+                        return true;
+                return false;
+            });
+
+        return Math.Clamp(blockedBeats / Math.Max(1.0, windowBeats), 0.0, 1.0);
+    }
+
+    public static double RecentParityBreakRate(IReadOnlyList<CanonicalNote> history, NoteHand hand, int recentTransitions)
+    {
+        var notes = history
+            .Where(n => n.Hand == hand)
+            .OrderBy(n => n.Beat)
+            .ToList();
+        if (notes.Count < 2)
+            return 0.0;
+
+        int start = Math.Max(1, notes.Count - recentTransitions);
+        int total = 0;
+        int bad = 0;
+        var ctx = new Canonical.Derived.SwingContext(hand);
+        ctx.Update(notes[0]);
+
+        for (int i = 1; i < notes.Count; i++)
+        {
+            var result = Canonical.Derived.ParityAnalyzer.ClassifyTransition(notes[i - 1], notes[i], ctx);
+            if (i >= start)
+            {
+                total++;
+                if (result.Transition is ParityTransition.AwkwardReset or ParityTransition.ParityBreak or ParityTransition.Invalid)
+                    bad++;
+            }
+            ctx.Update(notes[i]);
+        }
+
+        return total > 0 ? Math.Clamp(bad / (double)total, 0.0, 1.0) : 0.0;
+    }
+
+    public static double ImmediateResetPressure(CanonicalNote? last, double beat, DifficultyLevel difficulty)
+    {
+        if (last is null)
+            return 0.0;
+
+        double gap = Math.Max(0.0, beat - last.Beat);
+        double comfortableGap = difficulty switch
+        {
+            DifficultyLevel.Easy => 1.5,
+            DifficultyLevel.Normal => 1.25,
+            DifficultyLevel.Hard => 1.0,
+            DifficultyLevel.Expert => 0.75,
+            DifficultyLevel.ExpertPlus => 0.5,
+            _ => 1.0
+        };
+
+        return Math.Clamp(1.0 - (gap / comfortableGap), 0.0, 1.0);
     }
 
     private static bool IsOnQuarterBeat(double beat)

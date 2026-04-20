@@ -10,6 +10,9 @@ public sealed record TrainingOptions(
     double TestFraction,
     long RandomSeed,
     int ValidationSongsPerEpoch,
+    int ValidationEveryNEpochs,
+    int ValidationWorkers,
+    bool ValidationUseGpuInference,
     /// <summary>
     /// How many songs to pre-analyse and cache. Must be ≥ ValidationSongsPerEpoch.
     /// Each training run randomly picks ValidationSongsPerEpoch from this pool.
@@ -25,6 +28,8 @@ public sealed record TrainingOptions(
     double SelfSupervisedNegativeWeight,
     bool EnableSyntheticTraining,
     double SyntheticUnlockCoreQ,
+    int PlateauRestartCount,
+    double PlateauRestartLrScale,
     // Periodic checkpoint
     int CheckpointEveryNEpochs = 10,
     /// <summary>
@@ -44,6 +49,9 @@ public sealed record TrainingOptions(
         TestFraction: 0.1,
         RandomSeed: 42,
         ValidationSongsPerEpoch: 0,
+        ValidationEveryNEpochs: 1,
+        ValidationWorkers: 0,
+        ValidationUseGpuInference: false,
         ValidationCachePoolSize: 0,
         InitialLearningRate: 0.001,
         EarlyStopPatience: 50,
@@ -53,6 +61,8 @@ public sealed record TrainingOptions(
         SelfSupervisedNegativeWeight: 3.0,
         EnableSyntheticTraining: false,
         SyntheticUnlockCoreQ: 0.70,
+        PlateauRestartCount: 1,
+        PlateauRestartLrScale: 0.5,
         CheckpointEveryNEpochs: 10,
         LrPatience: 0
     );

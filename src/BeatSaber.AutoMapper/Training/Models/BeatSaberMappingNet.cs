@@ -8,7 +8,7 @@ namespace BeatSaber.AutoMapper.Training.Models;
 /// <summary>
 /// GRU-based multi-task neural network for Beat Saber note generation.
 ///
-/// Architecture: GRU(input=68, hidden=320, layers=2, causal) → MLP(320→160) → 6 heads
+/// Architecture: GRU(input=78, hidden=320, layers=2, causal) → MLP(320→160) → 6 heads
 ///
 /// Training: forward(x=[B, SeqLen, D]) → [B*SeqLen, OutDim]  (BPTT over W=16 windows)
 /// Inference: ForwardStep(x=[1,1,D], h=[L,1,H]) → ([1, OutDim], [L,1,H])
@@ -26,7 +26,7 @@ namespace BeatSaber.AutoMapper.Training.Models;
 /// </summary>
 internal sealed class BeatSaberMappingNet : Module<Tensor, Tensor>
 {
-    internal const int InputDim    = 68;
+    internal const int InputDim    = 78;
     internal const int GruHiddenDim = 320;
     internal const int GruLayers   = 2;
     internal const int MlpHidden   = 160;

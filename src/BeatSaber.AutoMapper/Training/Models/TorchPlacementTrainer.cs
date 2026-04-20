@@ -1,4 +1,6 @@
+using System.Diagnostics;
 using BeatSaber.AutoMapper.Generation;
+using BeatSaber.AutoMapper.Diagnostics;
 using BeatSaber.AutoMapper.Training.Features;
 using TorchSharp;
 using static TorchSharp.torch;
@@ -14,6 +16,29 @@ namespace BeatSaber.AutoMapper.Training.Models;
 /// </summary>
 public sealed class TorchPlacementTrainer : IBatchedMultiTaskPlacementModel, IDisposable
 {
+    private sealed class CpuInferenceModelProxy : IBatchedMultiTaskPlacementModel
+    {
+        private readonly TorchPlacementTrainer _owner;
+
+        public CpuInferenceModelProxy(TorchPlacementTrainer owner)
+        {
+            _owner = owner;
+        }
+
+        public double ScorePlacement(in NeuralPlacementContext ctx)
+            => _owner.ScorePlacementCpu(in ctx);
+
+        public double ScorePlacement(double onset, double energy, double subdiv, double localNps, double beatStrength,
+            int measureBeat, int difficultyLevel)
+            => _owner.ScorePlacement(onset, energy, subdiv, localNps, beatStrength, measureBeat, difficultyLevel);
+
+        public NeuralMapPrediction PredictAll(in NeuralPlacementContext ctx)
+            => _owner.PredictAllCpu(in ctx);
+
+        public IReadOnlyList<NeuralMapPrediction> PredictAllBatch(IReadOnlyList<NeuralPlacementContext> contexts)
+            => _owner.PredictAllBatchCpu(contexts);
+    }
+
     public enum LoadedCheckpointKind
     {
         None,
@@ -27,32 +52,54 @@ public sealed class TorchPlacementTrainer : IBatchedMultiTaskPlacementModel, IDi
     private readonly Device              _device;
     private readonly bool                _useGpuInference;
     private readonly object              _gpuInferenceLock = new();
+    private readonly object              _gpuBatchQueueLock = new();
+    private readonly IBatchedMultiTaskPlacementModel _cpuInferenceModel;
     private          optim.Optimizer?    _optimizer;
     private          double              _optimizerLr = -1;
     private          string?             _bestWeightsTmp;
+    private          bool                _gpuBatchProcessing;
+    private readonly List<PendingGpuBatchRequest> _pendingGpuBatchRequests = [];
 
     // Larger windows reduce host-side tensor/setup overhead and keep the GPU busier.
     private const int WindowSize  = 256;
     private const int WindowStride = 256;
     private const int BatchSize   = 32;
+    private const int GpuBatchCoalesceDelayMs = 2;
+
+    private sealed class PendingGpuBatchRequest
+    {
+        public NeuralPlacementContext[] Contexts { get; }
+        public TaskCompletionSource<NeuralMapPrediction[]> Completion { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public PendingGpuBatchRequest(IReadOnlyList<NeuralPlacementContext> contexts)
+        {
+            Contexts = contexts as NeuralPlacementContext[] ?? contexts.ToArray();
+        }
+    }
 
     public TorchPlacementTrainer()
     {
         _useGpuInference = cuda.is_available();
         _device = _useGpuInference ? CUDA : CPU;
         string deviceInfo = _useGpuInference
-            ? $"CUDA ({cuda.device_count()} device(s))"
-            : "CPU";
+            ? ConsoleStyler.Colorize($"CUDA ({cuda.device_count()} device(s))", ConsoleColor.Green)
+            : ConsoleStyler.Colorize("CPU", ConsoleColor.Yellow);
         Console.WriteLine($"[TorchSharp] Device: {deviceInfo}");
-        Console.WriteLine($"[TorchSharp] Validation inference: {(_useGpuInference ? "GPU" : "CPU")}");
+        string validationDevice = _useGpuInference
+            ? ConsoleStyler.Colorize("GPU", ConsoleColor.Green)
+            : ConsoleStyler.Colorize("CPU", ConsoleColor.Yellow);
+        Console.WriteLine($"[TorchSharp] Validation inference default: {validationDevice}");
 
         _gpu = new BeatSaberMappingNet();
         _gpu.to(_device);
         _cpu = new BeatSaberMappingNet();
         _cpu.eval();
+        _cpuInferenceModel = new CpuInferenceModelProxy(this);
     }
 
     public bool UsesGpuInference => _useGpuInference;
+    public IBatchedMultiTaskPlacementModel CpuInferenceModel => _cpuInferenceModel;
 
     // ── Checkpoint ────────────────────────────────────────────────────────────
 
@@ -121,9 +168,18 @@ public sealed class TorchPlacementTrainer : IBatchedMultiTaskPlacementModel, IDi
         const int D = BeatSaberMappingNet.InputDim;
         double totalLoss = 0, totalPlaceBce = 0;
         int totalChunks = 0;
+        var batches = BuildSequenceBatches(sequences, BatchSize);
+        int totalBatches = batches.Count;
+        var epochStopwatch = Stopwatch.StartNew();
+        double lastProgressLogSeconds = 0;
 
-        foreach (var batch in BuildSequenceBatches(sequences, BatchSize))
+        Console.WriteLine(
+            $"[TorchSharp] TrainEpoch start: seqs={sequences.Count}  batches={totalBatches}  " +
+            $"window={WindowSize}/{WindowStride}  batchSize={BatchSize}");
+
+        for (int batchIndex = 0; batchIndex < totalBatches; batchIndex++)
         {
+            var batch = batches[batchIndex];
             int batchCount = batch.Count;
             if (batchCount == 0) continue;
 
@@ -306,6 +362,19 @@ public sealed class TorchPlacementTrainer : IBatchedMultiTaskPlacementModel, IDi
                 loss.Dispose();
             }
             hidden?.Dispose();
+
+            double elapsed = epochStopwatch.Elapsed.TotalSeconds;
+            bool shouldLogProgress =
+                batchIndex == totalBatches - 1 ||
+                elapsed - lastProgressLogSeconds >= 15.0;
+            if (shouldLogProgress)
+            {
+                lastProgressLogSeconds = elapsed;
+                double pct = totalBatches > 0 ? 100.0 * (batchIndex + 1) / totalBatches : 100.0;
+                Console.WriteLine(
+                    $"[TorchSharp] TrainEpoch progress: {batchIndex + 1}/{totalBatches} batches " +
+                    $"({pct:F0}%)  chunks={totalChunks}  elapsed={elapsed:F0}s");
+            }
         }
 
         SyncCpuShadow();
@@ -461,61 +530,83 @@ public sealed class TorchPlacementTrainer : IBatchedMultiTaskPlacementModel, IDi
 
     private NeuralMapPrediction PredictAllGpu(in NeuralPlacementContext ctx)
     {
-        lock (_gpuInferenceLock)
-        {
-            using var noGrad = no_grad();
-            _gpu.eval();
-
-            var f = new float[BeatSaberMappingNet.InputDim];
-            ctx.FillFeaturesFloat(f);
-
-            using var xT = tensor(
-                f,
-                new long[] { 1, 1, BeatSaberMappingNet.InputDim },
-                device: _device);
-
-            using var h0 = ctx.GruHiddenState is not null
-                ? tensor(
-                    ctx.GruHiddenState.H,
-                    new long[] { BeatSaberMappingNet.GruLayers, 1, BeatSaberMappingNet.GruHiddenDim },
-                    device: _device)
-                : zeros(
-                    new long[] { BeatSaberMappingNet.GruLayers, 1, BeatSaberMappingNet.GruHiddenDim },
-                    device: _device);
-
-            var (outT, hn) = _gpu.ForwardStep(xT, h0);
-
-            if (ctx.GruHiddenState is not null)
-            {
-                var hnData = hn.data<float>();
-                for (int i = 0; i < ctx.GruHiddenState.H.Length; i++)
-                    ctx.GruHiddenState.H[i] = hnData[i];
-            }
-            hn.Dispose();
-
-            using var plProb = sigmoid(outT.select(1, 0));
-            using var haProb = sigmoid(outT.select(1, 1));
-            using var cdSm   = softmax(outT.narrow(1, 2,  9), dim: 1);
-            using var lnSm   = softmax(outT.narrow(1, 11, 4), dim: 1);
-            using var rwSm   = softmax(outT.narrow(1, 15, 3), dim: 1);
-            using var hlSm   = softmax(outT.narrow(1, 18, 8), dim: 1);
-            using var ptSm   = softmax(outT.narrow(1, 26, 6), dim: 1);
-            outT.Dispose();
-
-            return new NeuralMapPrediction
-            {
-                PlacementScore = plProb.item<float>(),
-                HandScore      = haProb.item<float>(),
-                CutDirProbs    = ToDoubleArray(cdSm.squeeze(0)),
-                LaneProbs      = ToDoubleArray(lnSm.squeeze(0)),
-                RowProbs       = ToDoubleArray(rwSm.squeeze(0)),
-                HandLaneProbs  = ToDoubleArray(hlSm.squeeze(0)),
-                PatternTypeProbs = ToDoubleArray(ptSm.squeeze(0)),
-            };
-        }
+        NeuralPlacementContext boxed = ctx;
+        return PredictAllBatchGpu([boxed])[0];
     }
 
     private IReadOnlyList<NeuralMapPrediction> PredictAllBatchGpu(IReadOnlyList<NeuralPlacementContext> contexts)
+    {
+        var request = new PendingGpuBatchRequest(contexts);
+        bool shouldProcess = false;
+
+        lock (_gpuBatchQueueLock)
+        {
+            _pendingGpuBatchRequests.Add(request);
+            if (!_gpuBatchProcessing)
+            {
+                _gpuBatchProcessing = true;
+                shouldProcess = true;
+            }
+        }
+
+        if (shouldProcess)
+            ProcessPendingGpuBatchRequests();
+
+        return request.Completion.Task.GetAwaiter().GetResult();
+    }
+
+    private void ProcessPendingGpuBatchRequests()
+    {
+        while (true)
+        {
+            Thread.Sleep(GpuBatchCoalesceDelayMs);
+
+            List<PendingGpuBatchRequest> requests;
+            lock (_gpuBatchQueueLock)
+            {
+                if (_pendingGpuBatchRequests.Count == 0)
+                {
+                    _gpuBatchProcessing = false;
+                    return;
+                }
+
+                requests = [.. _pendingGpuBatchRequests];
+                _pendingGpuBatchRequests.Clear();
+            }
+
+            try
+            {
+                int totalContexts = requests.Sum(r => r.Contexts.Length);
+                var flatContexts = new NeuralPlacementContext[totalContexts];
+                var offsets = new int[requests.Count];
+
+                int offset = 0;
+                for (int i = 0; i < requests.Count; i++)
+                {
+                    offsets[i] = offset;
+                    Array.Copy(requests[i].Contexts, 0, flatContexts, offset, requests[i].Contexts.Length);
+                    offset += requests[i].Contexts.Length;
+                }
+
+                var flatResults = PredictAllBatchGpuCore(flatContexts);
+
+                for (int i = 0; i < requests.Count; i++)
+                {
+                    var req = requests[i];
+                    var resultSlice = new NeuralMapPrediction[req.Contexts.Length];
+                    Array.Copy(flatResults, offsets[i], resultSlice, 0, req.Contexts.Length);
+                    req.Completion.TrySetResult(resultSlice);
+                }
+            }
+            catch (Exception ex)
+            {
+                foreach (var request in requests)
+                    request.Completion.TrySetException(ex);
+            }
+        }
+    }
+
+    private NeuralMapPrediction[] PredictAllBatchGpuCore(IReadOnlyList<NeuralPlacementContext> contexts)
     {
         lock (_gpuInferenceLock)
         {
@@ -766,7 +857,7 @@ public sealed class TorchPlacementTrainer : IBatchedMultiTaskPlacementModel, IDi
         arr[offset + 42] = (float)Math.Clamp(ex.BeatsSinceLastRight / 8.0, 0.0, 1.0);
         arr[offset + 43] = (ex.PreviousLeftCutDir >= 0 || ex.PreviousRightCutDir >= 0) ? 1f : 0f;
         arr[offset + 44] = 0.5f;
-        // Phrase / history / geometry [45-67]
+        // Phrase / history / geometry [45-77]
         arr[offset + 45] = (float)Math.Clamp(ex.FutureEnergy4, 0.0, 1.0);
         arr[offset + 46] = (float)Math.Clamp(ex.FutureEnergy8, 0.0, 1.0);
         arr[offset + 47] = (float)Math.Clamp(ex.FutureEnergy16, 0.0, 1.0);
@@ -790,6 +881,16 @@ public sealed class TorchPlacementTrainer : IBatchedMultiTaskPlacementModel, IDi
         arr[offset + 65] = (float)Math.Clamp(ex.RightRecentTravel / 5.0, 0.0, 1.0);
         arr[offset + 66] = (float)Math.Clamp(ex.RecentLaneSpan4 / 3.0, 0.0, 1.0);
         arr[offset + 67] = (float)Math.Clamp(ex.RecentRowSpan4 / 2.0, 0.0, 1.0);
+        arr[offset + 68] = (float)Math.Clamp(ex.PhraseBeatPhase32 / 32.0, 0.0, 1.0);
+        arr[offset + 69] = (float)Math.Clamp(ex.PhraseProgress32, 0.0, 1.0);
+        arr[offset + 70] = (float)Math.Clamp(ex.BeatsSincePhraseStart32 / 32.0, 0.0, 1.0);
+        arr[offset + 71] = (float)Math.Clamp(ex.BeatsToPhraseBoundary32 / 32.0, 0.0, 1.0);
+        arr[offset + 72] = (float)Math.Clamp(ex.CurrentBeatVisionBlockRisk, 0.0, 1.0);
+        arr[offset + 73] = (float)Math.Clamp(ex.RecentVisionBlockRate8, 0.0, 1.0);
+        arr[offset + 74] = (float)Math.Clamp(ex.LeftParityBreakRate8, 0.0, 1.0);
+        arr[offset + 75] = (float)Math.Clamp(ex.RightParityBreakRate8, 0.0, 1.0);
+        arr[offset + 76] = (float)Math.Clamp(ex.ResetPressure, 0.0, 1.0);
+        arr[offset + 77] = (float)Math.Clamp(ex.RecentRestRatio8, 0.0, 1.0);
     }
 
     public void Dispose()

@@ -39,6 +39,7 @@ internal static class PlayabilityHeuristics
         next.Beat - previous.Beat <= 1.0;
 
     public static bool IsHitboxPath(CanonicalNote previous, CanonicalNote next) =>
+        previous.Hand == next.Hand &&
         next.Beat > previous.Beat &&
         next.Beat - previous.Beat <= 0.5 &&
         Math.Abs(next.Lane - previous.Lane) <= 1 &&

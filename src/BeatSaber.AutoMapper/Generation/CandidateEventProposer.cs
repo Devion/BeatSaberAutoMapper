@@ -43,12 +43,8 @@ public sealed class CandidateEventProposer
             }
             : 0.15;
 
-        if (ctx.MultiTaskModel is IBatchedMultiTaskPlacementModel batchedModel)
-            return ApplyDensityControl(
-                ProposeEventsBatched(ctx, batchedModel, lastLeft, lastRight, baseThreshold),
-                ctx);
-
         var scored = new List<ProposedEvent>(ctx.CandidateGrid.Length);
+        var proposalHidden = ctx.GruHiddenState?.Clone();
         foreach (var candidate in ctx.CandidateGrid)
         {
             double score = ScoreCandidate(
@@ -58,7 +54,7 @@ public sealed class CandidateEventProposer
                 lastRight,
                 ctx.LeftHandContext,
                 ctx.RightHandContext,
-                ctx.GruHiddenState?.Clone(),
+                proposalHidden,
                 out var neuralPred);
             var hand = ChooseSuggestedHand(neuralPred, ctx);
             scored.Add(new ProposedEvent(candidate, score, hand, neuralPred?.HandScore ?? score, neuralPred));
@@ -74,60 +70,6 @@ public sealed class CandidateEventProposer
         }
 
         return ApplyDensityControl(proposed, ctx);
-    }
-
-    private List<ProposedEvent> ProposeEventsBatched(
-        GenerationContext ctx,
-        IBatchedMultiTaskPlacementModel batchedModel,
-        CanonicalNote? lastLeft,
-        CanonicalNote? lastRight,
-        double baseThreshold)
-    {
-        var contexts = new NeuralPlacementContext[ctx.CandidateGrid.Length];
-        for (int i = 0; i < ctx.CandidateGrid.Length; i++)
-        {
-            contexts[i] = BuildNeuralContext(
-                ctx.CandidateGrid[i],
-                ctx,
-                lastLeft,
-                lastRight,
-                ctx.LeftHandContext,
-                ctx.RightHandContext,
-                ctx.GruHiddenState?.Clone());
-        }
-
-        var predictions = batchedModel.PredictAllBatch(contexts);
-        var scored = new List<ProposedEvent>(predictions.Count);
-
-        for (int i = 0; i < predictions.Count; i++)
-        {
-            var candidate = ctx.CandidateGrid[i];
-            var prediction = predictions[i];
-            var nctx = contexts[i];
-            double score = ApplyMusicalityPrior(prediction.PlacementScore, in nctx, ctx);
-            double localNps = nctx.LocalNps;
-            double targetNps = ctx.Profile.TargetNps;
-
-            if (localNps > targetNps)
-                score *= Math.Max(0.1, 1.0 - (localNps - targetNps) / targetNps * 0.3);
-
-            scored.Add(new ProposedEvent(
-                candidate,
-                score,
-                ChooseSuggestedHand(prediction, ctx),
-                prediction.HandScore,
-                prediction));
-        }
-
-        double threshold = DetermineAdaptiveThreshold(scored, ctx, baseThreshold);
-        var proposed = new List<ProposedEvent>(scored.Count);
-        foreach (var ev in scored)
-        {
-            if (ev.PlacementScore >= threshold)
-                proposed.Add(ev);
-        }
-
-        return proposed;
     }
 
     private static double DetermineAdaptiveThreshold(
@@ -223,6 +165,18 @@ public sealed class CandidateEventProposer
         double rightRecentTravel = MappingFeatureEngineering.RecentTravel(prev2Right, lastRight);
         double recentLaneSpan4 = MappingFeatureEngineering.RecentLaneSpan(ctx.PlacedNotes, candidate.Beat, 4.0);
         double recentRowSpan4 = MappingFeatureEngineering.RecentRowSpan(ctx.PlacedNotes, candidate.Beat, 4.0);
+        double phraseBeatPhase32 = candidate.Beat % 32.0;
+        double phraseProgress32 = phraseBeatPhase32 / 32.0;
+        double beatsSincePhraseStart32 = phraseBeatPhase32;
+        double beatsToPhraseBoundary32 = 32.0 - phraseBeatPhase32;
+        double currentBeatVisionBlockRisk = MappingFeatureEngineering.CurrentBeatVisionBlockRisk(ctx.PlacedNotes, candidate.Beat);
+        double recentVisionBlockRate8 = MappingFeatureEngineering.RecentVisionBlockRate(ctx.PlacedNotes, candidate.Beat, 8.0);
+        double leftParityBreakRate8 = MappingFeatureEngineering.RecentParityBreakRate(ctx.PlacedNotes, NoteHand.Left, 8);
+        double rightParityBreakRate8 = MappingFeatureEngineering.RecentParityBreakRate(ctx.PlacedNotes, NoteHand.Right, 8);
+        double resetPressure = Math.Max(
+            MappingFeatureEngineering.ImmediateResetPressure(lastLeft, candidate.Beat, ctx.Profile.Difficulty),
+            MappingFeatureEngineering.ImmediateResetPressure(lastRight, candidate.Beat, ctx.Profile.Difficulty));
+        double recentRestRatio8 = MappingFeatureEngineering.RecentRestRatio(ctx.PlacedNotes, candidate.Beat, 8.0);
 
         return new NeuralPlacementContext
         {
@@ -284,6 +238,16 @@ public sealed class CandidateEventProposer
             RightRecentTravel = rightRecentTravel,
             RecentLaneSpan4 = recentLaneSpan4,
             RecentRowSpan4 = recentRowSpan4,
+            PhraseBeatPhase32 = phraseBeatPhase32,
+            PhraseProgress32 = phraseProgress32,
+            BeatsSincePhraseStart32 = beatsSincePhraseStart32,
+            BeatsToPhraseBoundary32 = beatsToPhraseBoundary32,
+            CurrentBeatVisionBlockRisk = currentBeatVisionBlockRisk,
+            RecentVisionBlockRate8 = recentVisionBlockRate8,
+            LeftParityBreakRate8 = leftParityBreakRate8,
+            RightParityBreakRate8 = rightParityBreakRate8,
+            ResetPressure = resetPressure,
+            RecentRestRatio8 = recentRestRatio8,
             GruHiddenState   = gruState,
         };
     }

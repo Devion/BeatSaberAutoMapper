@@ -241,6 +241,18 @@ public sealed class SelfSupervisedExampleGenerator
         double rightRecentTravel = MappingFeatureEngineering.RecentTravel(prev2Right, lastRight);
         double recentLaneSpan4 = MappingFeatureEngineering.RecentLaneSpan(history, beat, 4.0);
         double recentRowSpan4 = MappingFeatureEngineering.RecentRowSpan(history, beat, 4.0);
+        double phraseBeatPhase32 = beat % 32.0;
+        double phraseProgress32 = phraseBeatPhase32 / 32.0;
+        double beatsSincePhraseStart32 = phraseBeatPhase32;
+        double beatsToPhraseBoundary32 = 32.0 - phraseBeatPhase32;
+        double currentBeatVisionBlockRisk = MappingFeatureEngineering.CurrentBeatVisionBlockRisk(history, beat);
+        double recentVisionBlockRate8 = MappingFeatureEngineering.RecentVisionBlockRate(history, beat, 8.0);
+        double leftParityBreakRate8 = MappingFeatureEngineering.RecentParityBreakRate(history, NoteHand.Left, 8);
+        double rightParityBreakRate8 = MappingFeatureEngineering.RecentParityBreakRate(history, NoteHand.Right, 8);
+        double resetPressure = Math.Max(
+            MappingFeatureEngineering.ImmediateResetPressure(lastLeft, beat, (DifficultyLevel)difficultyLevel),
+            MappingFeatureEngineering.ImmediateResetPressure(lastRight, beat, (DifficultyLevel)difficultyLevel));
+        double recentRestRatio8 = MappingFeatureEngineering.RecentRestRatio(history, beat, 8.0);
         int patternTypeId = hasNote
             ? (int)PatternModeling.DerivePatternType(
                 beat,
@@ -318,7 +330,17 @@ public sealed class SelfSupervisedExampleGenerator
             LeftRecentTravel:       leftRecentTravel,
             RightRecentTravel:      rightRecentTravel,
             RecentLaneSpan4:        recentLaneSpan4,
-            RecentRowSpan4:         recentRowSpan4);
+            RecentRowSpan4:         recentRowSpan4,
+            PhraseBeatPhase32:      phraseBeatPhase32,
+            PhraseProgress32:       phraseProgress32,
+            BeatsSincePhraseStart32: beatsSincePhraseStart32,
+            BeatsToPhraseBoundary32: beatsToPhraseBoundary32,
+            CurrentBeatVisionBlockRisk: currentBeatVisionBlockRisk,
+            RecentVisionBlockRate8: recentVisionBlockRate8,
+            LeftParityBreakRate8: leftParityBreakRate8,
+            RightParityBreakRate8: rightParityBreakRate8,
+            ResetPressure:         resetPressure,
+            RecentRestRatio8:      recentRestRatio8);
     }
 
     private static List<CanonicalNote> HistoryBeforeBeat(IReadOnlyList<CanonicalNote> orderedNotes, double beat) =>

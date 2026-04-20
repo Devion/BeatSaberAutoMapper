@@ -1,5 +1,6 @@
 using System.IO.Compression;
 using System.Text.Json;
+using NVorbis;
 using BeatSaber.AutoMapper.Utilities;
 
 namespace BeatSaber.AutoMapper.Web;
@@ -34,6 +35,7 @@ internal static class MapPreviewService
             double bpm = infoRoot.GetProperty("_beatsPerMinute").GetDouble();
             if (bpm <= 0) bpm = 120;
 
+            double audioDuration = TryReadAudioDurationSeconds(archive);
             var diffs  = new List<object>();
             double maxDuration = 0;
 
@@ -63,14 +65,20 @@ internal static class MapPreviewService
                     double diffDuration = EstimateDurationSeconds(notes, timingPoints);
                     maxDuration = Math.Max(maxDuration, diffDuration);
 
-                    diffs.Add(new { name = diffName, duration = diffDuration, timingPoints, notes });
+                    diffs.Add(new
+                    {
+                        name = diffName,
+                        duration = Math.Max(diffDuration, audioDuration),
+                        timingPoints,
+                        notes
+                    });
                 }
             }
 
             if (diffs.Count == 0)
                 return Results.Problem("No Standard difficulties found.");
 
-            double duration = maxDuration > 0 ? maxDuration : 60.0;
+            double duration = Math.Max(audioDuration, maxDuration > 0 ? maxDuration : 60.0);
 
             return Results.Json(new { bpm, duration, difficulties = diffs });
         }
@@ -141,6 +149,45 @@ internal static class MapPreviewService
             return 60.0;
 
         return BeatToSeconds(notes[^1].b + 8.0, timingPoints);
+    }
+
+    private static double TryReadAudioDurationSeconds(ZipArchive archive)
+    {
+        var audioEntry = archive.Entries.FirstOrDefault(e =>
+            e.Name.Equals("song.egg", StringComparison.OrdinalIgnoreCase) ||
+            e.Name.Equals("song.ogg", StringComparison.OrdinalIgnoreCase));
+
+        if (audioEntry is null || audioEntry.Length <= 0)
+            return 0.0;
+
+        string tempPath = Path.Combine(
+            Path.GetTempPath(),
+            $"bsam_preview_{Guid.NewGuid():N}{Path.GetExtension(audioEntry.Name)}");
+
+        try
+        {
+            using (var entryStream = audioEntry.Open())
+            using (var fileStream = File.Create(tempPath))
+                entryStream.CopyTo(fileStream);
+
+            using var reader = new VorbisReader(tempPath);
+            return reader.TotalTime.TotalSeconds > 0 ? reader.TotalTime.TotalSeconds : 0.0;
+        }
+        catch
+        {
+            return 0.0;
+        }
+        finally
+        {
+            try
+            {
+                if (File.Exists(tempPath))
+                    File.Delete(tempPath);
+            }
+            catch
+            {
+            }
+        }
     }
 
     private static double BeatToSeconds(double beat, TimingPointDto[] timingPoints)

@@ -116,6 +116,9 @@ var trainProfileOpt = new Option<string>("--profile") { Description = "Training 
 var trainArtifactsOpt = new Option<string>("--artifacts") { Description = "Artifacts output directory", DefaultValueFactory = _ => "artifacts" };
 var trainEpochsOpt = new Option<int>("--epochs") { Description = "Max training epochs", DefaultValueFactory = _ => 100 };
 var trainValSongsOpt = new Option<int>("--validation-songs") { Description = "Validation songs to use per epoch (0 = auto from dataset size)", DefaultValueFactory = _ => 0 };
+var trainValEveryOpt = new Option<int>("--validation-every") { Description = "Run generation validation every N epochs (1 = every epoch)", DefaultValueFactory = _ => 1 };
+var trainValWorkersOpt = new Option<int>("--validation-workers") { Description = "Validation worker count (0 = auto)", DefaultValueFactory = _ => 0 };
+var trainValUseGpuOpt = new Option<bool>("--validation-use-gpu") { Description = "Use GPU inference during generation validation", DefaultValueFactory = _ => false };
 var trainValCacheSizeOpt = new Option<int>("--validation-cache-size") { Description = "Max validation songs to pre-analyse and cache (0 = auto from dataset size, always ≥ --validation-songs)", DefaultValueFactory = _ => 0 };
 var trainLrOpt = new Option<double>("--learning-rate") { Description = "Adam initial learning rate", DefaultValueFactory = _ => 0.001 };
 var trainEarlyStopOpt = new Option<int>("--early-stop") { Description = "Stop after N epochs without improvement (0 = disabled)", DefaultValueFactory = _ => 50 };
@@ -125,6 +128,8 @@ var trainSsPosWOpt = new Option<double>("--ss-pos-weight") { Description = "Weig
 var trainSsNegWOpt = new Option<double>("--ss-neg-weight") { Description = "Weight multiplier for penalised negative synthetic examples", DefaultValueFactory = _ => 3.0 };
 var trainEnableSyntheticOpt = new Option<bool>("--enable-synthetic-training") { Description = "Allow validated synthetic examples to be merged into training after unlock conditions are met", DefaultValueFactory = _ => false };
 var trainSyntheticUnlockCoreQOpt = new Option<double>("--synthetic-unlock-coreq") { Description = "Minimum coreQ required before synthetic training may unlock", DefaultValueFactory = _ => 0.70 };
+var trainPlateauRestartsOpt = new Option<int>("--plateau-restarts") { Description = "Automatic hot restarts after plateau-triggered early stop (0 = disabled)", DefaultValueFactory = _ => 1 };
+var trainPlateauRestartLrScaleOpt = new Option<double>("--plateau-restart-lr-scale") { Description = "LR multiplier applied on each hot restart", DefaultValueFactory = _ => 0.5 };
 var trainCheckpointOpt = new Option<int>("--checkpoint-every") { Description = "Save model to artifacts every N epochs (0 = disabled, default 10)", DefaultValueFactory = _ => 10 };
 var trainLrPatienceOpt = new Option<int>("--lr-patience") { Description = "Stagnation epochs before LR is reduced (0 = EarlyStopPatience / 5)", DefaultValueFactory = _ => 0 };
 var trainSeedOpt = new Option<long>("--seed") { Description = "Random seed for reproducible splits and shuffles", DefaultValueFactory = _ => 42L };
@@ -133,6 +138,9 @@ trainCmd.Add(trainProfileOpt);
 trainCmd.Add(trainArtifactsOpt);
 trainCmd.Add(trainEpochsOpt);
 trainCmd.Add(trainValSongsOpt);
+trainCmd.Add(trainValEveryOpt);
+trainCmd.Add(trainValWorkersOpt);
+trainCmd.Add(trainValUseGpuOpt);
 trainCmd.Add(trainValCacheSizeOpt);
 trainCmd.Add(trainLrOpt);
 trainCmd.Add(trainEarlyStopOpt);
@@ -142,6 +150,8 @@ trainCmd.Add(trainSsPosWOpt);
 trainCmd.Add(trainSsNegWOpt);
 trainCmd.Add(trainEnableSyntheticOpt);
 trainCmd.Add(trainSyntheticUnlockCoreQOpt);
+trainCmd.Add(trainPlateauRestartsOpt);
+trainCmd.Add(trainPlateauRestartLrScaleOpt);
 trainCmd.Add(trainCheckpointOpt);
 trainCmd.Add(trainLrPatienceOpt);
 trainCmd.Add(trainSeedOpt);
@@ -150,6 +160,7 @@ trainCmd.SetAction((ParseResult pr) =>
 {
     try
     {
+        ConsoleStyler.Initialize(!pr.GetValue(noColorOpt));
         var options = new TrainingOptions(
             DatasetPath: pr.GetValue(trainDatasetOpt)!,
             ProfileName: pr.GetValue(trainProfileOpt)!,
@@ -160,6 +171,9 @@ trainCmd.SetAction((ParseResult pr) =>
             TestFraction: 0.1,
             RandomSeed: pr.GetValue(trainSeedOpt),
             ValidationSongsPerEpoch: pr.GetValue(trainValSongsOpt),
+            ValidationEveryNEpochs: pr.GetValue(trainValEveryOpt),
+            ValidationWorkers: pr.GetValue(trainValWorkersOpt),
+            ValidationUseGpuInference: pr.GetValue(trainValUseGpuOpt),
             ValidationCachePoolSize: pr.GetValue(trainValCacheSizeOpt),
             InitialLearningRate: pr.GetValue(trainLrOpt),
             EarlyStopPatience: pr.GetValue(trainEarlyStopOpt),
@@ -169,6 +183,8 @@ trainCmd.SetAction((ParseResult pr) =>
             SelfSupervisedNegativeWeight: pr.GetValue(trainSsNegWOpt),
             EnableSyntheticTraining: pr.GetValue(trainEnableSyntheticOpt),
             SyntheticUnlockCoreQ: pr.GetValue(trainSyntheticUnlockCoreQOpt),
+            PlateauRestartCount: pr.GetValue(trainPlateauRestartsOpt),
+            PlateauRestartLrScale: pr.GetValue(trainPlateauRestartLrScaleOpt),
             CheckpointEveryNEpochs: pr.GetValue(trainCheckpointOpt),
             LrPatience: pr.GetValue(trainLrPatienceOpt)
         );
@@ -285,14 +301,16 @@ generateCmd.SetAction((ParseResult pr) =>
         foreach (var result in results)
         {
             var diff = result.Beatmap.Difficulty.Difficulty;
+            var finalReport = result.FinalValidationReport;
             Console.WriteLine($"[{diff}] {result.Beatmap.Notes.Count} notes  " +
                               $"{result.AudioAnalysis.EstimatedBpm:F1} BPM  " +
-                              $"score={result.ValidationReport.Score:F1}/100 " +
-                              $"(errors={result.ValidationReport.ErrorCount}, " +
-                              $"warnings={result.ValidationReport.WarningCount})  " +
+                              $"final={finalReport.Score:F1}/100 " +
+                              $"(errors={finalReport.ErrorCount}, " +
+                              $"warnings={finalReport.WarningCount})  " +
+                              $"raw={result.ValidationReport.Score:F1}/100  " +
                               $"repairs={result.RepairResult.AppliedRepairs.Count}");
 
-            if (!result.ValidationReport.IsValid) exitCode = ExitValidationFailure;
+            if (!finalReport.IsValid) exitCode = ExitValidationFailure;
 
             if (!dryRun)
             {

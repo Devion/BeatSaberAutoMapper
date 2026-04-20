@@ -62,7 +62,7 @@ public sealed class ConstrainedDecoder
                         var prediction = batchedPredictions[beamPredictionIndex++];
                         beamPred = prediction.Prediction;
                         updatedHidden = prediction.Hidden;
-                        placementScore = prediction.Prediction.PlacementScore;
+                        placementScore = CalibrateBeamPlacement(candidate.PlacementScore, prediction.Prediction.PlacementScore);
                     }
                     else
                     {
@@ -75,7 +75,7 @@ public sealed class ConstrainedDecoder
                             state.RightCtx,
                             updatedHidden);
                         beamPred = ctx.MultiTaskModel.PredictAll(in nctx);
-                        placementScore = beamPred.Value.PlacementScore;
+                        placementScore = CalibrateBeamPlacement(candidate.PlacementScore, beamPred.Value.PlacementScore);
                     }
                 }
 
@@ -248,7 +248,7 @@ public sealed class ConstrainedDecoder
         double propensity = 0.38 * placement
             + 0.20 * onset
             + 0.12 * energy
-            + 0.16 * recentChordRate
+            + 0.10 * Math.Max(0.0, 0.12 - recentChordRate)
             + 0.14 * handAmbiguity;
 
         if (strongBeat)
@@ -285,10 +285,16 @@ public sealed class ConstrainedDecoder
         double phase = candidate.Timing.Beat - Math.Floor(candidate.Timing.Beat);
         bool strongBeat = phase < 0.01 || Math.Abs(phase - 0.5) < 0.01;
 
-        double bonus = 0.12 + 0.20 * onset + 0.12 * recentChordRate;
+        double bonus = 0.12 + 0.20 * onset + 0.08 * Math.Max(0.0, 0.12 - recentChordRate);
         if (strongBeat)
             bonus += 0.08;
         return bonus;
+    }
+
+    private static double CalibrateBeamPlacement(double proposalScore, double beamScore)
+    {
+        double blended = 0.72 * proposalScore + 0.28 * beamScore;
+        return Math.Clamp(blended, 0.0, 1.0);
     }
 
     private static GenerationContext CloneContextWith(GenerationContext original, BeamState state)

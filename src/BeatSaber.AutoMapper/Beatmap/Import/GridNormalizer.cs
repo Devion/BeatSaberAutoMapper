@@ -54,6 +54,8 @@ internal readonly record struct GridNormalizer(
     {
         if (targetSize <= 1)
             return 0;
+        if (min >= 0 && max < targetSize)
+            return Math.Clamp(value, 0, targetSize - 1);
         if (max <= min)
             return targetSize / 2;
 

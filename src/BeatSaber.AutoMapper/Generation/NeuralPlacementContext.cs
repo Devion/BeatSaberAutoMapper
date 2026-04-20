@@ -9,7 +9,7 @@ namespace BeatSaber.AutoMapper.Generation;
 ///   [21-28] Section type one-hot (8 classes)
 ///   [29-30] Context (difficulty, local NPS)
 ///   [31-44] Previous placement (14 dims)
-///   [45-67] Phrase, rhythm-history, geometry, and comfort features
+///   [45-77] Phrase, rhythm-history, geometry, and comfort features
 /// </summary>
 public readonly struct NeuralPlacementContext
 {
@@ -61,7 +61,7 @@ public readonly struct NeuralPlacementContext
     // slot 44: NoteHandHint
     public double NoteHandHint { get; init; } = 0.5;
 
-    // Extended phrase / history / geometry features [45-67]
+    // Extended phrase / history / geometry features [45-77]
     public double FutureEnergy4          { get; init; }
     public double FutureEnergy8          { get; init; }
     public double FutureEnergy16         { get; init; }
@@ -85,6 +85,16 @@ public readonly struct NeuralPlacementContext
     public double RightRecentTravel      { get; init; }
     public double RecentLaneSpan4        { get; init; }
     public double RecentRowSpan4         { get; init; }
+    public double PhraseBeatPhase32      { get; init; }
+    public double PhraseProgress32       { get; init; }
+    public double BeatsSincePhraseStart32 { get; init; }
+    public double BeatsToPhraseBoundary32 { get; init; } = 32;
+    public double CurrentBeatVisionBlockRisk { get; init; }
+    public double RecentVisionBlockRate8 { get; init; }
+    public double LeftParityBreakRate8 { get; init; }
+    public double RightParityBreakRate8 { get; init; }
+    public double ResetPressure { get; init; }
+    public double RecentRestRatio8 { get; init; }
 
     // GRU hidden state (not part of feature vector)
     public GruState? GruHiddenState { get; init; }
@@ -161,5 +171,15 @@ public readonly struct NeuralPlacementContext
         f[65] = (float)Math.Clamp(RightRecentTravel / 5.0, 0.0, 1.0);
         f[66] = (float)Math.Clamp(RecentLaneSpan4 / 3.0, 0.0, 1.0);
         f[67] = (float)Math.Clamp(RecentRowSpan4 / 2.0, 0.0, 1.0);
+        f[68] = (float)Math.Clamp(PhraseBeatPhase32 / 32.0, 0.0, 1.0);
+        f[69] = (float)Math.Clamp(PhraseProgress32, 0.0, 1.0);
+        f[70] = (float)Math.Clamp(BeatsSincePhraseStart32 / 32.0, 0.0, 1.0);
+        f[71] = (float)Math.Clamp(BeatsToPhraseBoundary32 / 32.0, 0.0, 1.0);
+        f[72] = (float)Math.Clamp(CurrentBeatVisionBlockRisk, 0.0, 1.0);
+        f[73] = (float)Math.Clamp(RecentVisionBlockRate8, 0.0, 1.0);
+        f[74] = (float)Math.Clamp(LeftParityBreakRate8, 0.0, 1.0);
+        f[75] = (float)Math.Clamp(RightParityBreakRate8, 0.0, 1.0);
+        f[76] = (float)Math.Clamp(ResetPressure, 0.0, 1.0);
+        f[77] = (float)Math.Clamp(RecentRestRatio8, 0.0, 1.0);
     }
 }

@@ -26,7 +26,7 @@ public sealed class RepairEngine
             if (report.IsValid) break;
 
             bool anyRepaired = false;
-            foreach (var issue in report.Issues.Where(i => i.Severity == IssueSeverity.Error))
+            foreach (var issue in report.Issues.Where(IsRepairCandidate))
             {
                 CanonicalBeatmap? repaired = null;
                 if (issue.RuleName == "Parity")
@@ -63,6 +63,11 @@ public sealed class RepairEngine
 
         return new RepairResult(current, applied, _validator.Validate(current));
     }
+
+    private static bool IsRepairCandidate(ValidationIssue issue) =>
+        issue.Severity == IssueSeverity.Error ||
+        issue.RuleName is "DoubleDirectional" or "SwingSpeed" or "HitboxPath" or
+                           "ExcessiveDouble" or "Handclap" or "VisionBlock";
 
     private CanonicalBeatmap? TryRepairParityBreak(
         CanonicalBeatmap beatmap, ValidationIssue issue, out string? description)
