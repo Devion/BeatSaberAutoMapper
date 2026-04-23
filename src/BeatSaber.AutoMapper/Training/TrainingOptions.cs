@@ -62,7 +62,7 @@ public sealed record TrainingOptions(
         SelfSupervisedPositiveWeight: 4.0,
         SelfSupervisedNegativeWeight: 3.0,
         EnableSyntheticTraining: false,
-        SyntheticUnlockCoreQ: 0.70,
+        SyntheticUnlockCoreQ: 0.35,
         PlateauRestartCount: 1,
         PlateauRestartLrScale: 0.5,
         CheckpointEveryNEpochs: 10,

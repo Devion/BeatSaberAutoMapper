@@ -8,9 +8,9 @@ namespace BeatSaber.AutoMapper.Training.Models;
 /// <summary>
 /// GRU-based multi-task neural network for Beat Saber note generation.
 ///
-/// Architecture: GRU(input=78, hidden=320, layers=2, causal) → MLP(320→160) → 6 heads
+/// Architecture: GRU(input=78, hidden=512, layers=2, causal) → MLP(512→256) → 6 heads
 ///
-/// Training: forward(x=[B, SeqLen, D]) → [B*SeqLen, OutDim]  (BPTT over W=16 windows)
+/// Training: forward(x=[B, SeqLen, D]) → [B*SeqLen, OutDim]  (BPTT over W=256 windows)
 /// Inference: ForwardStep(x=[1,1,D], h=[L,1,H]) → ([1, OutDim], [L,1,H])
 ///
 /// Output layout [B*SeqLen, 32]:
@@ -22,14 +22,14 @@ namespace BeatSaber.AutoMapper.Training.Models;
 ///   [18..25] hand+lane logits (softmax → 8 classes: L0..L3,R0..R3)
 ///   [26..31] pattern logits   (softmax → 6 classes)
 ///
-/// ~540K parameters; float32 .pt file ~2.1 MB.
+/// ~2.6M parameters; float32 .pt file ~10 MB.
 /// </summary>
 internal sealed class BeatSaberMappingNet : Module<Tensor, Tensor>
 {
     internal const int InputDim    = 78;
-    internal const int GruHiddenDim = 320;
+    internal const int GruHiddenDim = 512;
     internal const int GruLayers   = 2;
-    internal const int MlpHidden   = 160;
+    internal const int MlpHidden   = 256;
     internal const int OutDim      = 32;   // 1+1+9+4+3+8+6
 
     private readonly GRU     _gru;
@@ -40,11 +40,12 @@ internal sealed class BeatSaberMappingNet : Module<Tensor, Tensor>
 
     internal BeatSaberMappingNet() : base(nameof(BeatSaberMappingNet))
     {
+        // dropout applies between GRU layers (layer 1→2 only, requires numLayers>1)
         _gru     = GRU(InputDim, GruHiddenDim, numLayers: GruLayers,
-                       batchFirst: false, dropout: 0.10);
+                       batchFirst: false, dropout: 0.15);
         _mlpLin  = Linear(GruHiddenDim, MlpHidden, hasBias: false);
         _mlpLn   = LayerNorm(MlpHidden);
-        _mlpDrop = Dropout(0.15);
+        _mlpDrop = Dropout(0.20);
         _headPl  = Linear(MlpHidden, 1);
         _headHa  = Linear(MlpHidden, 1);
         _headCd  = Linear(MlpHidden, 9);

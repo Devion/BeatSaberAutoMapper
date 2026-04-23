@@ -37,6 +37,7 @@ public sealed class TrainingPipeline : IDisposable
     private readonly TorchPlacementTrainer   _placementTrainer = new();
     private readonly EvaluationRunner       _evaluator        = new();
     private TrainingConsoleDashboard? _dashboard;
+    private TrainingFileLogger? _logger;
 
     public void Dispose() => _placementTrainer.Dispose();
 
@@ -80,6 +81,20 @@ public sealed class TrainingPipeline : IDisposable
         int LastCompletedEpoch,
         string[] CoreFolderPaths,
         string[] FullFolderPaths);
+
+    /// <summary>
+    /// Survives a process restart so warm-start resumes with the correct
+    /// best-quality gate, stagnation counters, and learning rate.
+    /// </summary>
+    private sealed record PersistedTrainingState(
+        double BestQuality,
+        int    BestEpochNumber,
+        int    StagnationEpochs,
+        int    LrReductions,
+        int    PlateauRestartsUsed,
+        double SmoothedQuality,
+        double CurrentLr,
+        int    TotalEpochsCompleted);
 
     private sealed record SequenceDifficultySnapshot(
         int SequenceCount,
@@ -164,6 +179,8 @@ public sealed class TrainingPipeline : IDisposable
     {
         Guard.NotNull(options, nameof(options));
         Directory.CreateDirectory(options.ArtifactsOutputPath);
+        using var logger = new TrainingFileLogger(options.ArtifactsOutputPath);
+        _logger = logger;
         TrainingConsoleDashboard? dashboard = TrainingConsoleDashboard.TryCreate();
         _dashboard = dashboard;
         _placementTrainer.Dashboard = dashboard;
@@ -176,6 +193,25 @@ public sealed class TrainingPipeline : IDisposable
         {
             if (dashboard is not null) dashboard.AddNotice($"Warm-start from {loadedCheckpointKind}");
             else Console.WriteLine($"[Training] Warm-start: loaded {loadedCheckpointKind} checkpoint.");
+        }
+
+        // Load persisted counters (bestQ, stagnation, LR) so warm restarts never
+        // mistake a lower first-epoch quality for a new best and overwrite the checkpoint.
+        string trainingStatePath = Path.Combine(options.ArtifactsOutputPath, "training_state.json");
+        PersistedTrainingState? persistedTrainingState =
+            warmStarted ? TryLoadTrainingState(trainingStatePath) : null;
+        if (persistedTrainingState is not null)
+        {
+            string msg =
+                $"bestQ={persistedTrainingState.BestQuality:F3}  bestEp={persistedTrainingState.BestEpochNumber}" +
+                $"  stag={persistedTrainingState.StagnationEpochs}  lr={persistedTrainingState.CurrentLr:G4}" +
+                $"  lrReductions={persistedTrainingState.LrReductions}  plateauRestarts={persistedTrainingState.PlateauRestartsUsed}";
+            logger.Log("RESTORE", msg);
+            if (dashboard is not null)
+                dashboard.AddNotice(
+                    $"State: bestQ={persistedTrainingState.BestQuality:F3} @ep{persistedTrainingState.BestEpochNumber}  lr={persistedTrainingState.CurrentLr:G4}");
+            else
+                Console.WriteLine($"[Training] Restored training state: {msg}");
         }
 
         // ----------------------------------------------------------------
@@ -385,6 +421,8 @@ public sealed class TrainingPipeline : IDisposable
         Console.WriteLine(
             $"[Training] Real train mix: seq={realTrainSnapshot.SequenceCount}  ex={realTrainSnapshot.ExampleCount}  " +
             $"{realTrainSnapshot.Mix}");
+        logger.Log("CORPUS",
+            $"train seq={realTrainSnapshot.SequenceCount}  ex={realTrainSnapshot.ExampleCount}  {realTrainSnapshot.Mix}");
 
         var badNegativeSeqs = new List<List<TrainingExample>>();
         if (!string.IsNullOrWhiteSpace(options.BadLibraryPath))
@@ -401,18 +439,28 @@ public sealed class TrainingPipeline : IDisposable
                 else
                     Console.WriteLine(
                         $"[Training] Building explicit negative supervision from {badFolders.Length} bad-map folders...");
-                badNegativeSeqs = BuildNegativeExamplesFromFolders(
+                var (badSeqs, badFilteredSeqs, badFallbackSeqs) = BuildNegativeExamplesFromFolders(
                     badFolders,
                     printLock,
                     trainAudioCache,
                     options.SelfSupervisedNegativeWeight,
-                    dashboard).ToList();
+                    dashboard);
+                badNegativeSeqs = badSeqs.ToList();
 
                 var badSnapshot = SummarizeSequences(badNegativeSeqs);
                 var badBudget = ComputeBadNegativeBudget(trainSeqs);
+                double badFilteredPct = badNegativeSeqs.Count > 0
+                    ? 100.0 * badFilteredSeqs / badNegativeSeqs.Count : 0;
+                string badLibMsg =
+                    $"neg pool: seq={badSnapshot.SequenceCount}  ex={badSnapshot.ExampleCount}  {badSnapshot.Mix}" +
+                    $"  filtered={badFilteredSeqs}/{badNegativeSeqs.Count} ({badFilteredPct:F0}%)  fallback={badFallbackSeqs}" +
+                    $"  cap/epoch seq={badBudget.MaxSequenceCount} ex={badBudget.MaxExampleCount}" +
+                    $"  frac={badBudget.FractionOfRealExamples:F3}";
                 Console.WriteLine(
                     $"[Training] Bad negative pool: seq={badSnapshot.SequenceCount}  ex={badSnapshot.ExampleCount}  " +
-                    $"{badSnapshot.Mix}  cap/epoch={badBudget.MaxSequenceCount} seq {badBudget.MaxExampleCount} ex");
+                    $"{badSnapshot.Mix}  filtered={badFilteredSeqs}/{badNegativeSeqs.Count} ({badFilteredPct:F0}%)  " +
+                    $"fallback={badFallbackSeqs}  cap/epoch={badBudget.MaxSequenceCount} seq {badBudget.MaxExampleCount} ex");
+                logger.Log("BADLIB", badLibMsg);
             }
             else
             {
@@ -550,18 +598,21 @@ public sealed class TrainingPipeline : IDisposable
         // ----------------------------------------------------------------
         // 5. Placement model — epoch loop with shuffle + parallel mini-batch GD
         // ----------------------------------------------------------------
-        double lr = loadedCheckpointKind switch
-        {
-            TorchPlacementTrainer.LoadedCheckpointKind.Current => options.InitialLearningRate,
-            TorchPlacementTrainer.LoadedCheckpointKind.Best => options.InitialLearningRate * 0.5,
-            TorchPlacementTrainer.LoadedCheckpointKind.Legacy => options.InitialLearningRate * 0.5,
-            _ => options.InitialLearningRate
-        };
+        double lr = persistedTrainingState?.CurrentLr > 0
+            ? persistedTrainingState.CurrentLr
+            : loadedCheckpointKind switch
+            {
+                TorchPlacementTrainer.LoadedCheckpointKind.Current => options.InitialLearningRate,
+                TorchPlacementTrainer.LoadedCheckpointKind.Best => options.InitialLearningRate * 0.5,
+                TorchPlacementTrainer.LoadedCheckpointKind.Legacy => options.InitialLearningRate * 0.5,
+                _ => options.InitialLearningRate
+            };
         if (dashboard is null)
             Console.WriteLine(
                 $"[Training] LR setup: requested={ConsoleStyler.Colorize(options.InitialLearningRate.ToString("G4"), ConsoleColor.Cyan)}  " +
                 $"effective={ConsoleStyler.Colorize(lr.ToString("G4"), ConsoleColor.Cyan)}  " +
                 $"checkpoint={FormatCheckpointKind(loadedCheckpointKind)}");
+        logger.Log("LR", $"Initial effective lr={lr:G4}  requestedLr={options.InitialLearningRate:G4}  checkpoint={loadedCheckpointKind}  fromState={persistedTrainingState is not null && persistedTrainingState.CurrentLr > 0}");
         const double MinLr   = 1e-5;
         const double LrDecay = 0.5;
         // Reduce LR after this many consecutive stagnation epochs.
@@ -607,12 +658,14 @@ public sealed class TrainingPipeline : IDisposable
                 $"unlockCoreQ={options.SyntheticUnlockCoreQ:F3}  warmup={options.SelfSupervisedWarmupEpochs}");
         }
 
-        double bestQuality     = -1.0;
-        double smoothedQuality = -1.0;
+        double bestQuality     = persistedTrainingState?.BestQuality ?? -1.0;
+        double smoothedQuality = persistedTrainingState is not null && persistedTrainingState.SmoothedQuality > 0
+            ? persistedTrainingState.SmoothedQuality
+            : -1.0;
         const double EmaAlpha  = 0.4;
-        int    stagnationEpochs = 0;
-        int    lrReductions     = 0;
-        int    plateauRestartsUsed = 0;
+        int    stagnationEpochs = persistedTrainingState?.StagnationEpochs ?? 0;
+        int    lrReductions     = persistedTrainingState?.LrReductions ?? 0;
+        int    plateauRestartsUsed = persistedTrainingState?.PlateauRestartsUsed ?? 0;
 
         const int SlopeWindow = 10;
         var lossHistory = new List<double>(SlopeWindow + 1);
@@ -623,13 +676,20 @@ public sealed class TrainingPipeline : IDisposable
         double? previousCoreQuality = null;
         double? previousFullQuality = null;
         double? previousValidationSeconds = null;
-        int bestEpochNumber = 0;
+        int bestEpochNumber = persistedTrainingState?.BestEpochNumber ?? 0;
 
         if (dashboard is not null) dashboard.AddNotice("Saving initial best snapshot");
         else Console.WriteLine("[Training] Saving initial best-weight snapshot...");
         _placementTrainer.SaveBestWeights();
         if (dashboard is not null) dashboard.AddNotice("Initial best snapshot ready");
         else Console.WriteLine("[Training] Initial best-weight snapshot ready.");
+
+        // Restore dashboard Best panel from persisted state so it is never blank on warm restart
+        if (persistedTrainingState is not null && bestQuality >= 0)
+        {
+            dashboard?.SetRestoredBestEpoch(bestEpochNumber, bestQuality, 0);
+            logger.Log("RESTORE", $"Best quality gate restored: {bestQuality:F3} at epoch {bestEpochNumber}");
+        }
         int stableSyntheticRefreshes = 0;
 
         var epochRng = new Random((int)(options.RandomSeed & int.MaxValue));
@@ -683,6 +743,15 @@ public sealed class TrainingPipeline : IDisposable
 
             var epochMix = SummarizeSequences(shuffledSeqs);
             ValidateDifficultyCoverageOrThrow(epochMix);
+
+            // Log class balance so we can diagnose posWt and bad-neg coverage per epoch
+            int epochPosCount  = shuffledSeqs.Sum(s => s.Count(ex => ex.HasNote));
+            int epochRealNeg   = shuffledSeqs.Sum(s => s.Count(ex => !ex.HasNote && !ex.IsNegativeSupervision));
+            int epochBadNeg    = shuffledSeqs.Sum(s => s.Count(ex => ex.IsNegativeSupervision));
+            logger.Log("BALANCE",
+                $"ep={epoch + 1}  pos={epochPosCount}  realNeg={epochRealNeg}  badNeg={epochBadNeg}" +
+                $"  posRatio={epochRealNeg / (double)Math.Max(1, epochPosCount):F2}x" +
+                $"  badNeg%={100.0 * epochBadNeg / Math.Max(1, epochPosCount + epochRealNeg + epochBadNeg):F1}");
 
             var trainStopwatch = Stopwatch.StartNew();
             var (loss, plBce) = _placementTrainer.TrainEpoch(shuffledSeqs, lr);
@@ -797,6 +866,7 @@ public sealed class TrainingPipeline : IDisposable
                 _placementTrainer.SaveBestArtifact(options.ArtifactsOutputPath);
                 _placementTrainer.SaveWeights(options.ArtifactsOutputPath);
                 dashboard?.AddNotice($"New best epoch {bestEpochNumber} coreQ {bestQuality:F3}");
+                logger.Log("BEST", $"New best: epoch={bestEpochNumber}  coreQ={bestQuality:F3}  fullQ={fullQualityScore:F3}");
             }
 
             _placementTrainer.SaveCurrentWeights(options.ArtifactsOutputPath);
@@ -822,10 +892,11 @@ public sealed class TrainingPipeline : IDisposable
             double genQSlope = ComputeLinearSlope(genQHistory);  // positive = quality improving
 
             // Stagnation: neither loss nor quality is trending in the right direction.
-            // lossSlope < -0.003 → loss still declining >0.003/epoch (cold-start / active learning)
-            // genQSlope > 0.001  → quality genuinely trending upward
-            bool isLossImproving = lossSlope < -0.003;
-            bool isGenQImproving = genQSlope > 0.001;
+            // Thresholds are intentionally lenient: loss slope < -0.001/epoch and
+            // quality slope > 0.0005/epoch represent genuine slow-but-real learning
+            // that should NOT trigger stagnation (especially near the 0.4xx plateau).
+            bool isLossImproving = lossSlope < -0.001;
+            bool isGenQImproving = genQSlope > 0.0005;
             bool isStagnating    = shouldRunValidation && !isLossImproving && !isGenQImproving;
 
             if (shouldRunValidation)
@@ -982,6 +1053,36 @@ public sealed class TrainingPipeline : IDisposable
                 DiffScores: diffLine,
                 Status: isNewBest ? $"NEW BEST #{bestEpochNumber}" : (stagnationEpochs > 0 ? $"stagnation {stagnationEpochs}/{options.EarlyStopPatience}" : "running")));
 
+            // ── File log: unified epoch summary (always written, regardless of dashboard) ─
+            logger.Log("EPOCH",
+                $"ep={epoch + 1}/{options.Epochs}" +
+                $"  loss={loss:F4}  plBCE={plBce:F4}" +
+                $"  coreQ={coreQualityScore:F3}  fullQ={fullQualityScore:F3}  bestQ={bestQuality:F3}" +
+                $"  sm={smoothedQuality:F3}  lr={lr:G4}" +
+                $"  lSlp={lossSlope:+0.0000;-0.0000}  qSlp={genQSlope:+0.0000;-0.0000}" +
+                $"  stag={stagnationEpochs}  train={trainSeconds:F1}s  val={validationSeconds:F1}s" +
+                (isNewBest ? "  *** NEW BEST ***" : string.Empty));
+            if (shouldRunValidation && diagnostics is not null)
+            {
+                logger.Log("VALID",
+                    $"ep={epoch + 1}  ok={diagnostics.SuccessfulPairs}/{diagnostics.TotalPairs}" +
+                    $"  rawQ={diagnostics.AvgRawScore:F3}  repQ={diagnostics.AvgRepairedScore:F3}" +
+                    $"  cand={diagnostics.AvgCandidateSurvival:F3}  decode={diagnostics.AvgDecodeRate:F3}" +
+                    $"  rawNotes={diagnostics.AvgRawNotes:F1}  repairedNotes={diagnostics.AvgRepairedNotes:F1}" +
+                    $"  repairs={diagnostics.AvgRepairCount:F1}  noteDelta={diagnostics.AvgRepairNoteDeltaRatio:F3}" +
+                    $"  synth={diagnostics.TotalSyntheticExamples}  right={diagnostics.AvgRightHandFraction:F3}");
+                if (diagnostics.DiffScores.Count > 0)
+                    logger.Log("VALID",
+                        $"ep={epoch + 1}  diffScores: " +
+                        string.Join("  ", diagnostics.DiffScores.OrderBy(kv => (int)kv.Key)
+                            .Select(kv => $"{kv.Key}={kv.Value:F3}")));
+                if (diagnostics.RawIssueCounts.Count > 0)
+                    logger.Log("VALID",
+                        $"ep={epoch + 1}  topIssues: " +
+                        string.Join("  ", diagnostics.RawIssueCounts.OrderByDescending(kv => kv.Value)
+                            .Take(8).Select(kv => $"{kv.Key}={kv.Value}")));
+            }
+
             // ── Stagnation-driven LR reduction and early stop ────────────────────
             if (stagnationEpochs > 0)
             {
@@ -1004,6 +1105,8 @@ public sealed class TrainingPipeline : IDisposable
                     else
                         Console.WriteLine(
                             $"[Training] Stagnation plateau — reducing lr to {lr:G4} (reduction #{lrReductions})");
+                    logger.Log("LR",
+                        $"Reduced to {lr:G4} (reduction #{lrReductions})  stagnation={stagnationEpochs}  epoch={epoch + 1}");
                 }
 
                 if (options.EarlyStopPatience > 0 && stagnationEpochs >= options.EarlyStopPatience)
@@ -1019,6 +1122,9 @@ public sealed class TrainingPipeline : IDisposable
                             Console.WriteLine(
                                 $"[Training] Plateau detected at epoch {epoch + 1} — hot restart {plateauRestartsUsed}/{options.PlateauRestartCount} " +
                                 $"from best weights, lr {lr:G4} -> {restartedLr:G4}.");
+                        logger.Log("RESTART",
+                            $"Hot restart #{plateauRestartsUsed}/{options.PlateauRestartCount}" +
+                            $"  lr={lr:G4} -> {restartedLr:G4}  bestQ={bestQuality:F3}  epoch={epoch + 1}");
 
                         _placementTrainer.RestoreBestWeights();
                         _placementTrainer.SaveCurrentWeights(options.ArtifactsOutputPath);
@@ -1037,6 +1143,15 @@ public sealed class TrainingPipeline : IDisposable
 
                         if (validationPlan is not null)
                             SaveValidationSchedule(validationStatePath, options.RandomSeed, validationPlan, resumeEpochOffset + epoch + 1);
+                        SaveTrainingState(trainingStatePath, new PersistedTrainingState(
+                            BestQuality:         bestQuality,
+                            BestEpochNumber:     bestEpochNumber,
+                            StagnationEpochs:    0,
+                            LrReductions:        lrReductions,
+                            PlateauRestartsUsed: plateauRestartsUsed,
+                            SmoothedQuality:     smoothedQuality >= 0 ? smoothedQuality : bestQuality,
+                            CurrentLr:           lr,
+                            TotalEpochsCompleted: resumeEpochOffset + epoch + 1));
                         continue;
                     }
 
@@ -1046,12 +1161,24 @@ public sealed class TrainingPipeline : IDisposable
                             $"[Training] Early stopping at epoch {epoch + 1} " +
                             $"(stagnation for {options.EarlyStopPatience} epochs). " +
                             $"Best genQuality={bestQuality:F3}");
+                    logger.Log("STOP",
+                        $"Early stop: epoch={epoch + 1}  stagnation={stagnationEpochs}  bestQ={bestQuality:F3}  bestEpoch={bestEpochNumber}");
                     break;
                 }
             }
 
             if (validationPlan is not null)
                 SaveValidationSchedule(validationStatePath, options.RandomSeed, validationPlan, resumeEpochOffset + epoch + 1);
+
+            SaveTrainingState(trainingStatePath, new PersistedTrainingState(
+                BestQuality:         bestQuality,
+                BestEpochNumber:     bestEpochNumber,
+                StagnationEpochs:    stagnationEpochs,
+                LrReductions:        lrReductions,
+                PlateauRestartsUsed: plateauRestartsUsed,
+                SmoothedQuality:     smoothedQuality >= 0 ? smoothedQuality : bestQuality,
+                CurrentLr:           lr,
+                TotalEpochsCompleted: resumeEpochOffset + epoch + 1));
 
             previousLoss = loss;
             previousPlBce = plBce;
@@ -1082,7 +1209,12 @@ public sealed class TrainingPipeline : IDisposable
                 $"[Training] F1={metrics.PlacementF1:F3}  " +
                 $"Precision={metrics.PlacementPrecision:F3}  " +
                 $"Recall={metrics.PlacementRecall:F3}");
+            logger.Log("TEST",
+                $"F1={metrics.PlacementF1:F3}  Precision={metrics.PlacementPrecision:F3}  Recall={metrics.PlacementRecall:F3}");
         }
+
+        logger.Log("DONE",
+            $"bestQ={bestQuality:F3}  bestEpoch={bestEpochNumber}  lrReductions={lrReductions}  plateauRestarts={plateauRestartsUsed}");
 
         if (dashboard is not null)
             dashboard.MarkComplete($"Done. Best generation quality={bestQuality:F3}");
@@ -1093,6 +1225,8 @@ public sealed class TrainingPipeline : IDisposable
         dashboard?.Dispose();
         _dashboard = null;
         _placementTrainer.Dashboard = null;
+        _logger = null;
+        // logger disposed by 'using' — writes the session-end marker
     }
 
     // ----------------------------------------------------------------
@@ -1413,8 +1547,11 @@ public sealed class TrainingPipeline : IDisposable
         int repairCount,
         double repairNoteDeltaRatio)
     {
-        double repairCountPenalty = Math.Min(0.10, repairCount * 0.01);
-        double repairVolumePenalty = Math.Min(0.15, repairNoteDeltaRatio * 0.20);
+        // Repair penalties are intentionally light: a model that generates decent maps
+        // but needs some post-processing should not be scored the same as a model that
+        // generates unplayable maps. Max combined penalty: 0.05 + 0.08 = 0.13.
+        double repairCountPenalty  = Math.Min(0.05, repairCount * 0.005);
+        double repairVolumePenalty = Math.Min(0.08, repairNoteDeltaRatio * 0.10);
         double effective = 0.75 * rawScore + 0.25 * repairedScore - repairCountPenalty - repairVolumePenalty;
         return Math.Clamp(effective, 0.0, 1.0);
     }
@@ -1664,6 +1801,31 @@ public sealed class TrainingPipeline : IDisposable
         }
     }
 
+    private static PersistedTrainingState? TryLoadTrainingState(string path)
+    {
+        try
+        {
+            if (!File.Exists(path))
+                return null;
+            return JsonSerializer.Deserialize<PersistedTrainingState>(File.ReadAllText(path));
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static void SaveTrainingState(string path, PersistedTrainingState state)
+    {
+        try
+        {
+            File.WriteAllText(
+                path,
+                JsonSerializer.Serialize(state, new JsonSerializerOptions { WriteIndented = true }));
+        }
+        catch { }
+    }
+
     private static void SaveValidationSchedule(
         string path,
         long randomSeed,
@@ -1884,7 +2046,9 @@ public sealed class TrainingPipeline : IDisposable
     {
         int realSeqCount = realTrainSequences.Count;
         int realExampleCount = realTrainSequences.Sum(s => s.Count);
-        double fraction = 0.12;
+        // Reduced from 12% to 8%: after filtering to only clearly-bad positions, the
+        // pool is smaller but cleaner, so a modest budget is appropriate.
+        double fraction = 0.08;
         int seqCap = Math.Max(8, realSeqCount / 10);
         int exampleCap = Math.Max(256, (int)Math.Round(realExampleCount * fraction));
         return new NegativeSupervisionBudget(seqCap, exampleCap, fraction);
@@ -2255,7 +2419,8 @@ public sealed class TrainingPipeline : IDisposable
         return result;
     }
 
-    private static IReadOnlyList<List<TrainingExample>> BuildNegativeExamplesFromFolders(
+    private static (IReadOnlyList<List<TrainingExample>> Sequences, int FilteredSeqs, int FallbackSeqs)
+        BuildNegativeExamplesFromFolders(
         string[] folders,
         object printLock,
         ValidationAudioCache? audioCache,
@@ -2265,6 +2430,8 @@ public sealed class TrainingPipeline : IDisposable
         var result = new List<List<TrainingExample>>();
         var listLock = new object();
         int done = 0;
+        int filteredSeqs = 0;   // sequences where ≥1 note passed IsObviouslyBadPlacement
+        int fallbackSeqs = 0;   // sequences that used the all-notes-at-half-weight fallback
         var stopwatch = Stopwatch.StartNew();
 
         Parallel.ForEach(
@@ -2299,7 +2466,7 @@ public sealed class TrainingPipeline : IDisposable
                             continue;
 
                         var negativeSeq = built
-                            .Where(ex => ex.HasNote)
+                            .Where(ex => ex.HasNote && IsObviouslyBadPlacement(ex))
                             .Select(ex => ex with
                             {
                                 HasNote = false,
@@ -2307,13 +2474,42 @@ public sealed class TrainingPipeline : IDisposable
                                 NoteLane = -1,
                                 NoteRow = -1,
                                 NoteCutDir = -1,
-                                Weight = ComputeBadNegativeWeight(ex, baseNegativeWeight)
+                                Weight = ComputeBadNegativeWeight(ex, baseNegativeWeight),
+                                IsNegativeSupervision = true,
                             })
                             .OrderBy(ex => ex.Beat)
                             .ToList();
 
+                        bool usedFallback = false;
+                        if (negativeSeq.Count == 0)
+                        {
+                            // Fallback: if no note in this map triggered a measurable
+                            // violation, include all note positions at half weight so the
+                            // map isn't silently dropped. Reduced weight signals lower
+                            // confidence (we know the map is bad but can't identify why).
+                            negativeSeq = built
+                                .Where(ex => ex.HasNote)
+                                .Select(ex => ex with
+                                {
+                                    HasNote = false,
+                                    NoteHand = -1,
+                                    NoteLane = -1,
+                                    NoteRow = -1,
+                                    NoteCutDir = -1,
+                                    Weight = Math.Max(1.0, baseNegativeWeight * 0.5),
+                                    IsNegativeSupervision = true,
+                                })
+                                .OrderBy(ex => ex.Beat)
+                                .ToList();
+                            usedFallback = true;
+                        }
+
                         if (negativeSeq.Count > 0)
+                        {
                             localSeqs.Add(negativeSeq);
+                            if (usedFallback) Interlocked.Increment(ref fallbackSeqs);
+                            else              Interlocked.Increment(ref filteredSeqs);
+                        }
                     }
                 }
                 catch (Exception ex)
@@ -2344,8 +2540,29 @@ public sealed class TrainingPipeline : IDisposable
                 lock (listLock) result.AddRange(localSeqs);
             });
 
-        return result;
+        return (result, filteredSeqs, fallbackSeqs);
     }
+
+    /// <summary>
+    /// Returns true if this note position in a bad-lib map has a clear, measurable quality
+    /// violation that makes it a useful negative training example.
+    ///
+    /// Priority 1 — Audio weakness (most transferable): bad mappers often place notes
+    ///   at positions with no real musical event. Audio features are identical at training
+    ///   and inference time, so this signal transfers perfectly.
+    ///
+    /// Priority 2 — Geometric/playability violations: vision blocks, broken parity chains,
+    ///   or reset pressure. Thresholds are intentionally lenient (0.30) to capture early-
+    ///   sequence notes before the sliding-window history has fully built up.
+    /// </summary>
+    private static bool IsObviouslyBadPlacement(TrainingExample ex) =>
+        // Audio-weak position: note placed with no real onset and low energy.
+        // This transfers directly — the model won't have onset/energy at inference either.
+        (ex.OnsetStrength < 0.25 && ex.EnergyLevel < 0.30) ||
+        // Geometric violations (lenient thresholds to catch early-sequence notes)
+        ex.CurrentBeatVisionBlockRisk > 0.30 ||
+        Math.Max(ex.LeftParityBreakRate8, ex.RightParityBreakRate8) > 0.30 ||
+        ex.ResetPressure > 0.30;
 
     private static double ComputeBadNegativeWeight(TrainingExample ex, double baseNegativeWeight)
     {

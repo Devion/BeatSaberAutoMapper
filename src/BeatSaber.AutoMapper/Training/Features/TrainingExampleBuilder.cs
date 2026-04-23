@@ -98,7 +98,14 @@ public sealed record TrainingExample(
     double LeftParityBreakRate8 = 0,
     double RightParityBreakRate8 = 0,
     double ResetPressure = 0,
-    double RecentRestRatio8 = 0
+    double RecentRestRatio8 = 0,
+    /// <summary>
+    /// True for examples derived from the bad-library (--bad-lib).
+    /// These are excluded from the positive-class weight (<c>posWt</c>) computation
+    /// in <see cref="TorchPlacementTrainer"/> so they do not artificially inflate
+    /// class-imbalance weighting on top of their already elevated per-example weight.
+    /// </summary>
+    bool IsNegativeSupervision = false
 );
 
 public sealed class TrainingExampleBuilder

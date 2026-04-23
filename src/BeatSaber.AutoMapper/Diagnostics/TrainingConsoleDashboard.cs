@@ -259,6 +259,46 @@ public sealed class TrainingConsoleDashboard : IDisposable
         }
     }
 
+    /// <summary>
+    /// Populates the Best panel from persisted state on warm-restart so the
+    /// dashboard never shows "Best epoch unavailable" after a resume.
+    /// </summary>
+    public void SetRestoredBestEpoch(int epoch, double coreQ, double fullQ)
+    {
+        lock (_lock)
+        {
+            if (_bestEpoch is not null && _bestEpoch.CoreQ >= coreQ)
+                return; // live training has already set a better (or equal) best
+
+            _bestEpoch = new EpochSummary(
+                Epoch: epoch,
+                Epochs: _totalEpochs,
+                ValidationRan: true,
+                Loss: 0,
+                PlaceBce: 0,
+                CoreQ: coreQ,
+                FullQ: fullQ,
+                BestQ: coreQ,
+                SmoothedQ: coreQ,
+                LearningRate: 0,
+                LossSlope: 0,
+                QualitySlope: 0,
+                TrainSeconds: 0,
+                ValidationSeconds: 0,
+                EpochSeconds: 0,
+                ValidationPairs: 0,
+                SyntheticExamples: 0,
+                StagnationEpochs: 0,
+                EarlyStopPatience: 0,
+                TrainMix: string.Empty,
+                ValidationInfo: "restored from checkpoint",
+                ValidationDelta: string.Empty,
+                DiffScores: string.Empty,
+                Status: $"restored (epoch {epoch})");
+            Render();
+        }
+    }
+
     public void MarkComplete(string message) => AddNotice(message);
 
     public void Dispose()

@@ -161,10 +161,19 @@ public sealed class TorchPlacementTrainer : IBatchedMultiTaskPlacementModel, IDi
             _optimizerLr = lr;
         }
 
-        // Class-balance weight from all examples in all sequences
-        int posCount = 0, totalCount = 0;
-        foreach (var seq in sequences) foreach (var ex in seq) { totalCount++; if (ex.HasNote) posCount++; }
-        float posWt = posCount > 0 ? Math.Min((float)(totalCount - posCount) / posCount, 10f) : 1f;
+        // Class-balance weight from real (non-negative-supervision) examples only.
+        // Bad-lib negatives are excluded here because they already carry elevated
+        // per-example weights; including them would double-inflate posWt and create
+        // conflicting gradient pressure that contributes to the quality plateau.
+        int posCount = 0, realNegCount = 0;
+        foreach (var seq in sequences)
+            foreach (var ex in seq)
+            {
+                if (ex.IsNegativeSupervision) continue;
+                if (ex.HasNote) posCount++;
+                else realNegCount++;
+            }
+        float posWt = posCount > 0 ? Math.Min((float)realNegCount / posCount, 25f) : 1f;
 
         const int D = BeatSaberMappingNet.InputDim;
         double totalLoss = 0, totalPlaceBce = 0;
@@ -330,7 +339,7 @@ public sealed class TorchPlacementTrainer : IBatchedMultiTaskPlacementModel, IDi
                     using var hlSelLgt = hlLgt.index_select(0, hlMaskIdx);
                     using var hlSelY   = yHlT.index_select(0, hlMaskIdx);
                     using var hlSelW   = exWtT.index_select(0, hlMaskIdx);
-                    var hlLoss         = 1.5 * WeightedCrossEntropy(hlSelLgt, hlSelY, hlSelW);
+                    var hlLoss         = 1.0 * WeightedCrossEntropy(hlSelLgt, hlSelY, hlSelW);
                     lossTerms.Add(hlLoss);
                 }
 
